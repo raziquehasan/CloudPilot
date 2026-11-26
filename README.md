@@ -13,7 +13,7 @@
 [![Redis](https://img.shields.io/badge/Redis-7-DC382D?logo=redis)](https://redis.io/)
 [![BullMQ](https://img.shields.io/badge/BullMQ-6.7.9-red)](https://docs.bullmq.io/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker)](https://www.docker.com/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/raziquehasan/CloudPilot/blob/main/package.json)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 CloudPilot is a monorepo platform for building secure, observable, and recoverable DevOps
 automation. It combines a Next.js control-plane dashboard, an Express API, PostgreSQL data
@@ -393,4 +393,6 @@ Repository: <https://github.com/raziquehasan/CloudPilot>
 - GitHub: <https://github.com/raziquehasan>
 - Repository: <https://github.com/raziquehasan/CloudPilot>
 
-Released under the MIT License (see `package.json`).
+## License
+
+CloudPilot is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
