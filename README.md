@@ -63,9 +63,9 @@ coordination only — Redis job state never replaces authoritative deployment st
 
 **Vision vs. today:** The long-term vision includes container deployment, real-time logs,
 health checks, automatic rollback, webhooks, monitoring, and cloud provisioning. **Today**, the
-platform implements the deployment foundation, orchestration, secure source retrieval, and a
-Docker build engine that is **present in code but disabled by default**. Container execution,
-monitoring, and cloud integration are **not** implemented.
+platform implements the deployment foundation, orchestration, secure source retrieval, a
+Docker build engine, and a container runtime engine that are **present in code but disabled by
+default**. Monitoring and cloud integration are **not** implemented.
 
 ---
 
@@ -77,7 +77,7 @@ monitoring, and cloud integration are **not** implemented.
 | 5.2 | Deployment Orchestration | Implemented |
 | 5.3 | Secure GitHub Source Retrieval | Implemented |
 | 5.4 | Docker Build Engine | Implemented, disabled by default |
-| 5.5 | Container Deployment Engine | Planned |
+| 5.5 | Container Deployment Engine | Implemented, disabled by default |
 | 5.6 | Real-time Deployment Logs | Planned |
 | 5.7 | Health Checks and Rollback | Planned |
 | 5.8 | GitHub Webhooks and Auto Deployment | Planned |
@@ -329,7 +329,8 @@ Important limitations to understand before running:
 - **Untrusted repository builds must remain disabled** without strong isolation.
 - **The local Docker driver is not a secure multi-tenant sandbox.** It does not enforce per-build network or resource policies; the builder reports `supportsStrongIsolation=false`.
 - **Build engine implementation does not imply production readiness.** Phase 5.4 has not been verified end-to-end through the worker pipeline.
-- **Container deployment is not implemented yet** (Phase 5.5). No application container is started.
+- **`RUNTIME_ENABLED=false` by default.** The container runtime engine is implemented but not enabled. No application container is started.
+- **The local Docker driver is not a secure multi-tenant sandbox.** Runtime containers are hardened (read-only, cap-dropped, resource-capped, loopback-only) but strong multi-tenant isolation is not established.
 - **Worker-orchestrated end-to-end build verification remains pending.** Real BuildKit execution was verified with a controlled fixture, not a full READY-source worker run.
 - **Workspace storage readiness needs verification** for distributed/remote builders; local filesystem storage does not automatically support them.
 - **The existing Prisma/Effect dependency advisory is unresolved** (`GHSA-7589-6fvf-x4pw`). Do not run forced `npm audit fix` or introduce unverified overrides. See [`docs/security.md`](docs/security.md).
@@ -340,6 +341,7 @@ Additional security references:
 - [`docs/security.md`](docs/security.md) — security model and dependency advisory.
 - [`docs/phase-5-architecture.md`](docs/phase-5-architecture.md) — trust boundaries and isolation requirements.
 - [`docs/phase-5.4-docker-build-engine.md`](docs/phase-5.4-docker-build-engine.md) — build isolation model and limitations.
+- [`docs/phase-5.5-container-deployment-engine.md`](docs/phase-5.5-container-deployment-engine.md) — container runtime model, hardening, and lifecycle.
 
 ---
 

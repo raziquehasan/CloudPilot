@@ -1,6 +1,7 @@
 export const QUEUE_NAMES = Object.freeze({
   deployment: "deployment",
   build: "build",
+  runtime: "runtime",
   rollback: "rollback",
   diagnostic: "diagnostic",
 });

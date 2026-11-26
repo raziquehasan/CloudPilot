@@ -587,6 +587,88 @@ const envSchema = z
       7 * 86_400,
       86_400,
     ),
+
+    // ==============================================
+    // Container runtime engine configuration
+    // ==============================================
+    //
+    // Container execution is disabled by default. The
+    // local Docker driver does not provide strong
+    // multi-tenant isolation; untrusted workloads
+    // remain unsupported.
+    // ==============================================
+
+    RUNTIME_ENABLED: booleanEnv(false),
+
+    RUNTIME_TRUSTED_LOCAL_ONLY: booleanEnv(true),
+
+    RUNTIME_BIND_HOST: z
+      .string()
+      .trim()
+      .min(1)
+      .max(64)
+      .default("127.0.0.1"),
+
+    RUNTIME_CONTAINER_PORT: integerEnv(1, 65_535, 3_000),
+
+    RUNTIME_CPU_LIMIT: integerEnv(1, 64, 1),
+
+    RUNTIME_MEMORY_LIMIT_MB: integerEnv(128, 65_536, 512),
+
+    RUNTIME_PIDS_LIMIT: integerEnv(16, 4_096, 128),
+
+    RUNTIME_STARTUP_TIMEOUT_MS: integerEnv(
+      SECOND,
+      10 * MINUTE,
+      MINUTE,
+    ),
+
+    RUNTIME_HEALTH_CHECK_INTERVAL_MS: integerEnv(
+      SECOND,
+      MINUTE,
+      2 * SECOND,
+    ),
+
+    RUNTIME_STOP_TIMEOUT_MS: integerEnv(
+      SECOND,
+      2 * MINUTE,
+      10 * SECOND,
+    ),
+
+    RUNTIME_MAX_CONCURRENCY: integerEnv(1, 20, 1),
+
+    RUNTIME_MAX_RETRIES: integerEnv(0, 10, 1),
+
+    RUNTIME_NETWORK_PREFIX: z
+      .string()
+      .trim()
+      .min(1)
+      .max(32)
+      .regex(
+        /^[A-Za-z0-9][A-Za-z0-9_.-]*$/u,
+        "Must be a valid network name prefix.",
+      )
+      .default("cloudpilot"),
+
+    // ==============================================
+    // Runtime secret injection
+    // ==============================================
+    //
+    // The worker decrypts environment variables only
+    // inside the authorized execution boundary using
+    // the same key as the API. Missing configuration
+    // disables secret injection.
+    // ==============================================
+
+    ENVIRONMENT_VARIABLE_ENCRYPTION_KEY:
+      z.preprocess(
+        (value) =>
+          value === "" ? undefined : value,
+        z
+          .string()
+          .regex(/^[a-f0-9]{64}$/i)
+          .optional(),
+      ),
   })
 
   // ==================================================
@@ -913,6 +995,72 @@ const envSchema = z
             "Trusted build repositories must use owner/name format.",
         });
       }
+    }
+
+    // ==============================================
+    // Container runtime configuration
+    // ==============================================
+
+    for (const timer of [
+      {
+        name: "RUNTIME_STARTUP_TIMEOUT_MS",
+        value: value.RUNTIME_STARTUP_TIMEOUT_MS,
+      },
+
+      {
+        name: "RUNTIME_HEALTH_CHECK_INTERVAL_MS",
+        value:
+          value.RUNTIME_HEALTH_CHECK_INTERVAL_MS,
+      },
+
+      {
+        name: "RUNTIME_STOP_TIMEOUT_MS",
+        value: value.RUNTIME_STOP_TIMEOUT_MS,
+      },
+    ]) {
+      if (
+        !Number.isSafeInteger(timer.value) ||
+        timer.value <= 0 ||
+        timer.value > MAX_TIMER_MS
+      ) {
+        context.addIssue({
+          code: "custom",
+
+          path: [timer.name],
+
+          message:
+            "Configured runtime duration exceeds supported timer limits.",
+        });
+      }
+    }
+
+    if (
+      value.RUNTIME_HEALTH_CHECK_INTERVAL_MS >=
+      value.RUNTIME_STARTUP_TIMEOUT_MS
+    ) {
+      context.addIssue({
+        code: "custom",
+
+        path: ["RUNTIME_HEALTH_CHECK_INTERVAL_MS"],
+
+        message:
+          "Runtime health check interval must be shorter than the startup timeout.",
+      });
+    }
+
+    if (
+      value.RUNTIME_BIND_HOST !== "127.0.0.1" &&
+      value.RUNTIME_BIND_HOST !== "localhost" &&
+      value.RUNTIME_BIND_HOST !== "::1"
+    ) {
+      context.addIssue({
+        code: "custom",
+
+        path: ["RUNTIME_BIND_HOST"],
+
+        message:
+          "Runtime ports must bind to a loopback address in this phase.",
+      });
     }
   });
 

@@ -1,5 +1,7 @@
 import { prisma } from "@cloudpilot/database";
 
+import { randomUUID } from "node:crypto";
+
 import { Router } from "express";
 import type { Request, Response } from "express";
 
@@ -40,6 +42,7 @@ import {
 
 import {
   removeQueuedDeploymentJob,
+  enqueueRuntimeLifecycleJob,
 } from "../services/queue-producer.js";
 
 import { logger } from "../config/logger.js";
@@ -102,6 +105,30 @@ const deploymentSelect = {
     orderBy: { buildAttempt: "desc" },
     take: 1,
   },
+  deploymentRuntimeInstances: {
+    select: {
+      id: true,
+      runtimeAttempt: true,
+      status: true,
+      containerName: true,
+      imageId: true,
+      imageTag: true,
+      containerPort: true,
+      hostPort: true,
+      hostBindingAddress: true,
+      cpuLimit: true,
+      memoryLimitMb: true,
+      pidsLimit: true,
+      restartCount: true,
+      failureCode: true,
+      failureMessage: true,
+      startedAt: true,
+      readyAt: true,
+      stoppedAt: true,
+    },
+    orderBy: { runtimeAttempt: "desc" },
+    take: 1,
+  },
 } as const;
 
 // ==================================================
@@ -127,12 +154,34 @@ type DeploymentRow = {
     completedAt: Date | null;
     durationMs: number | null;
   }>;
+  deploymentRuntimeInstances: Array<{
+    id: string;
+    runtimeAttempt: number;
+    status: string;
+    containerName: string | null;
+    imageId: string | null;
+    imageTag: string | null;
+    containerPort: number | null;
+    hostPort: number | null;
+    hostBindingAddress: string | null;
+    cpuLimit: number | null;
+    memoryLimitMb: number | null;
+    pidsLimit: number | null;
+    restartCount: number;
+    failureCode: string | null;
+    failureMessage: string | null;
+    startedAt: Date | null;
+    readyAt: Date | null;
+    stoppedAt: Date | null;
+  }>;
 };
 
 function serializeDeployment(row: DeploymentRow) {
-  const { deploymentBuilds, ...rest } = row;
+  const { deploymentBuilds, deploymentRuntimeInstances, ...rest } = row;
 
   const latest = deploymentBuilds[0] ?? null;
+
+  const runtime = deploymentRuntimeInstances[0] ?? null;
 
   return {
     ...rest,
@@ -158,6 +207,33 @@ function serializeDeployment(row: DeploymentRow) {
           startedAt: latest.startedAt,
           completedAt: latest.completedAt,
           durationMs: latest.durationMs,
+        }
+      : null,
+
+    runtime: runtime
+      ? {
+          id: runtime.id,
+          runtimeAttempt: runtime.runtimeAttempt,
+          status: runtime.status,
+          containerName: runtime.containerName,
+          imageId: runtime.imageId,
+          imageTag: runtime.imageTag,
+          containerPort: runtime.containerPort,
+          hostPort: runtime.hostPort,
+          hostBindingAddress: runtime.hostBindingAddress,
+          cpuLimit: runtime.cpuLimit,
+          memoryLimitMb: runtime.memoryLimitMb,
+          pidsLimit: runtime.pidsLimit,
+          restartCount: runtime.restartCount,
+          failureCode: runtime.failureCode,
+          failureMessage: runtime.failureMessage,
+          startedAt: runtime.startedAt,
+          readyAt: runtime.readyAt,
+          stoppedAt: runtime.stoppedAt,
+          applicationUrl:
+            runtime.hostPort && runtime.hostBindingAddress
+              ? `http://${runtime.hostBindingAddress}:${runtime.hostPort}`
+              : null,
         }
       : null,
   };
@@ -1759,6 +1835,135 @@ async function getBuildLogs(
 }
 
 // ==================================================
+// Runtime lifecycle (start/stop/restart)
+// ==================================================
+
+async function runtimeLifecycle(
+  action: "start" | "stop" | "restart",
+  req: Request,
+  res: Response,
+): Promise<void> {
+  disableResponseCaching(res);
+
+  const scope = await resolveProject(req, res);
+
+  if (!scope) {
+    return;
+  }
+
+  const actorId = req.userId;
+
+  if (!actorId) {
+    sendError(res, 401, "UNAUTHORIZED", "Authentication is required.");
+    return;
+  }
+
+  if (!canManage(scope.role)) {
+    sendError(
+      res,
+      403,
+      "FORBIDDEN",
+      "Workspace administrator access required for runtime lifecycle operations.",
+    );
+    return;
+  }
+
+  const deploymentId = deploymentIdSchema.safeParse(
+    req.params.deploymentId,
+  );
+
+  if (!deploymentId.success) {
+    sendError(res, 404, "DEPLOYMENT_NOT_FOUND", "Deployment not found in this project.");
+    return;
+  }
+
+  const deploymentScope = {
+    id: deploymentId.data,
+    workspaceId: scope.workspaceId,
+    projectId: scope.projectId,
+  };
+
+  try {
+    const instance =
+      await prisma.deploymentRuntimeInstance.findFirst({
+        where: deploymentScope,
+        orderBy: { runtimeAttempt: "desc" },
+        select: { id: true, buildId: true, status: true },
+      });
+
+    if (!instance) {
+      sendError(
+        res,
+        409,
+        "RUNTIME_INSTANCE_UNAVAILABLE",
+        "This deployment has no runtime instance to manage.",
+      );
+      return;
+    }
+
+    const readiness = await getDeploymentReadiness(
+      scope.workspaceId,
+      scope.projectId,
+    );
+
+    if (!readiness.runtime.available) {
+      sendError(
+        res,
+        503,
+        "RUNTIME_DISABLED",
+        "Container execution is disabled or unavailable.",
+      );
+      return;
+    }
+
+    const jobId = `runtime-lifecycle-${randomUUID()}`;
+
+    await enqueueRuntimeLifecycleJob({
+      workspaceId: scope.workspaceId,
+      projectId: scope.projectId,
+      deploymentId: deploymentId.data,
+      runtimeInstanceId: instance.id,
+      buildId: instance.buildId,
+      action,
+      jobId,
+    });
+
+    await prisma.auditLog.create({
+      data: {
+        workspaceId: scope.workspaceId,
+        actorId,
+        action: `DEPLOYMENT_RUNTIME_${action.toUpperCase()}_REQUESTED`,
+        entityType: "Deployment",
+        entityId: deploymentId.data,
+        metadata: { runtimeInstanceId: instance.id, action },
+      },
+    });
+
+    res.status(202).json({
+      success: true,
+      data: { accepted: true, action, runtimeInstanceId: instance.id },
+    });
+  } catch (error) {
+    logger.error(
+      {
+        projectId: scope.projectId,
+        deploymentId: deploymentId.data,
+        ...sanitizedError(error),
+      },
+
+      "Runtime lifecycle request failed",
+    );
+
+    sendError(
+      res,
+      503,
+      "RUNTIME_LIFECYCLE_FAILED",
+      "The runtime lifecycle operation could not be accepted.",
+    );
+  }
+}
+
+// ==================================================
 // Project deployment router
 // ==================================================
 
@@ -1811,4 +2016,28 @@ projectDeploymentRouter.post(
   "/:projectId/deployments/:deploymentId/cancel",
   requireCsrf,
   cancelDeployment,
+);
+
+// Runtime lifecycle: start.
+
+projectDeploymentRouter.post(
+  "/:projectId/deployments/:deploymentId/runtime/start",
+  requireCsrf,
+  (req, res) => runtimeLifecycle("start", req, res),
+);
+
+// Runtime lifecycle: stop.
+
+projectDeploymentRouter.post(
+  "/:projectId/deployments/:deploymentId/runtime/stop",
+  requireCsrf,
+  (req, res) => runtimeLifecycle("stop", req, res),
+);
+
+// Runtime lifecycle: restart.
+
+projectDeploymentRouter.post(
+  "/:projectId/deployments/:deploymentId/runtime/restart",
+  requireCsrf,
+  (req, res) => runtimeLifecycle("restart", req, res),
 );

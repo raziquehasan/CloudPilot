@@ -1,3 +1,4 @@
+
 /**
  * CloudPilot — Build Processor
  *
@@ -6,9 +7,11 @@
  *   verify outbox + source -> claim build (fenced) -> execute
  *   -> verify artifact -> publish BUILD_SUCCEEDED
  *
- * Build execution is tenant-scoped, idempotent, fenced by an
- * execution lease, and fail-closed. Untrusted repository builds
- * are rejected unless an isolated builder is available.
+ * Build execution is tenant-scoped, idempotent and fenced
+ * by an execution lease.
+ *
+ * Local builds are restricted to explicitly trusted repositories.
+ * Uncertain execution outcomes must not trigger automatic rebuilds.
  */
 
 import { randomUUID } from "node:crypto";
@@ -18,6 +21,7 @@ import { prisma } from "@cloudpilot/database";
 import {
   BuildError,
   TransientJobError,
+  QueueManager,
   buildFailureMessage,
   getBuildFailureCode,
   isRetryableBuildFailure,
@@ -40,8 +44,6 @@ import { runBuild } from "../build/build-engine.js";
 
 import type { BuildExecutor } from "../build/build-executor.js";
 
-
-
 import type { BuildLogEntry } from "../build/build-logs.js";
 
 // ==================================================
@@ -50,6 +52,8 @@ import type { BuildLogEntry } from "../build/build-logs.js";
 
 const SHA_PATTERN = /^[0-9a-f]{40}$/u;
 
+const IMAGE_ID_PATTERN = /^sha256:[0-9a-f]{64}$/u;
+
 const BUILD_TERMINAL_DEPLOYMENT_STATUSES = new Set<string>([
   "FAILED",
   "CANCELLED",
@@ -57,6 +61,9 @@ const BUILD_TERMINAL_DEPLOYMENT_STATUSES = new Set<string>([
   "STOPPED",
   "ROLLED_BACK",
   "BUILD_SUCCEEDED",
+  "DEPLOYING",
+  "HEALTH_CHECKING",
+  "RUNNING",
 ]);
 
 // ==================================================
@@ -105,6 +112,16 @@ interface BuildSourceContext {
   dockerfilePath: string | null;
   buildContextPath: string | null;
   repositoryFullName: string;
+  trustedRepository: boolean;
+}
+
+interface VerifiedBuildArtifact {
+  imageTag: string;
+  imageId: string | null;
+  imageDigest: string | null;
+  imageSizeBytes: number | null;
+  platform: string;
+  durationMs: number;
 }
 
 type ExecutionState =
@@ -120,6 +137,37 @@ type SettlementResult =
   | "retry"
   | "stale";
 
+type ClaimResult =
+  | {
+      status: "claimed";
+      claim: ExecutionClaim;
+    }
+  | {
+      status: "skipped" | "busy" | "uncertain";
+    };
+
+// ==================================================
+// Internal errors
+// ==================================================
+
+/**
+ * Throwing this error inside a transaction guarantees
+ * rollback instead of committing a partial settlement.
+ */
+class StaleBuildOwnershipError extends Error {
+  constructor() {
+    super("Build execution ownership is stale.");
+    this.name = "StaleBuildOwnershipError";
+  }
+}
+
+class InvalidBuildIdentityError extends Error {
+  constructor() {
+    super("Build execution identity is invalid.");
+    this.name = "InvalidBuildIdentityError";
+  }
+}
+
 // ==================================================
 // Scopes
 // ==================================================
@@ -132,14 +180,78 @@ function buildScope(payload: BuildJob): BuildScope {
   };
 }
 
-function fencedBuildScope(claim: ExecutionClaim, now: Date) {
+function fencedBuildScope(
+  claim: ExecutionClaim,
+  now: Date,
+) {
   return {
     ...buildScope(claim.payload),
+
     id: claim.buildId,
+
+    status: "RUNNING" as const,
+
     executionLeaseToken: claim.leaseToken,
+
     buildAttempt: claim.buildAttempt,
-    executionLeaseExpiresAt: { gt: now },
+
+    executionLeaseExpiresAt: {
+      gt: now,
+    },
   };
+}
+
+function assertSingleUpdate(count: number): void {
+  if (count !== 1) {
+    throw new StaleBuildOwnershipError();
+  }
+}
+
+// ==================================================
+// Retry policy
+// ==================================================
+
+function getMaximumBuildAttempts(
+  job: Job<QueueJob>,
+): number {
+  const queueAttempts =
+    job.opts.attempts ??
+    workerEnv.QUEUE_JOB_ATTEMPTS;
+
+  const configuredRetries =
+    workerEnv.BUILD_MAX_RETRIES;
+
+  if (
+    !Number.isSafeInteger(queueAttempts) ||
+    queueAttempts < 1 ||
+    !Number.isSafeInteger(configuredRetries) ||
+    configuredRetries < 0
+  ) {
+    throw new UnrecoverableError(
+      "Build retry configuration is invalid.",
+    );
+  }
+
+  return Math.min(
+    queueAttempts,
+    configuredRetries + 1,
+  );
+}
+
+function hasBuildRetryBudget(
+  job: Job<QueueJob>,
+  buildAttempt: number,
+): boolean {
+  const maxAttempts = getMaximumBuildAttempts(job);
+
+  const queueAttempts =
+    job.opts.attempts ??
+    workerEnv.QUEUE_JOB_ATTEMPTS;
+
+  return (
+    job.attemptsMade + 1 < queueAttempts &&
+    buildAttempt < maxAttempts
+  );
 }
 
 // ==================================================
@@ -150,22 +262,46 @@ async function validateBuildOutbox(
   job: Job<QueueJob>,
   payload: BuildJob,
 ): Promise<boolean> {
+  if (
+    !job.id ||
+    payload.buildId !== payload.correlationId
+  ) {
+    return false;
+  }
+
   const event =
     await prisma.deploymentOutboxEvent.findFirst({
       where: {
         id: payload.correlationId,
+
         ...buildScope(payload),
+
         eventType: "BUILD_REQUESTED",
       },
 
-      select: { id: true, jobId: true },
+      select: {
+        id: true,
+        jobId: true,
+        status: true,
+      },
     });
 
-  if (!event || event.jobId !== job.id) {
+  if (
+    !event ||
+    event.id !== payload.buildId ||
+    event.jobId !== job.id
+  ) {
     return false;
   }
 
-  return true;
+  /**
+   * A worker can receive a job before the publisher
+   * finishes marking the outbox event as PUBLISHED.
+   */
+  return (
+    event.status === "PUBLISHING" ||
+    event.status === "PUBLISHED"
+  );
 }
 
 // ==================================================
@@ -175,115 +311,447 @@ async function validateBuildOutbox(
 async function claimBuild(
   payload: BuildJob,
   maxAttempts: number,
-): Promise<ExecutionClaim | null> {
-  const now = new Date();
+): Promise<ClaimResult> {
+  const scope = buildScope(payload);
 
-  const leaseToken = randomUUID();
+  try {
+    return await prisma.$transaction(
+      async (tx): Promise<ClaimResult> => {
+        /**
+         * Serialize claim and settlement operations by
+         * locking the authoritative deployment row first.
+         *
+         * Parameterized SQL prevents query injection.
+         */
+        const locked = await tx.$queryRaw<
+          Array<{ id: string }>
+        >`
+          SELECT "id"
+          FROM "deployments"
+          WHERE "id" = ${payload.deploymentId}::uuid
+            AND "workspaceId" = ${payload.workspaceId}::uuid
+            AND "projectId" = ${payload.projectId}::uuid
+          FOR UPDATE
+        `;
 
-  const leaseExpiresAt = new Date(
-    now.getTime() +
-      workerEnv.DEPLOYMENT_EXECUTION_LEASE_MS,
-  );
+        if (locked.length !== 1) {
+          return { status: "skipped" };
+        }
 
-  return prisma.$transaction(async (tx) => {
-    // Transition the deployment into BUILDING first,
-    // fenced by the absence of an active build lease.
-    const transitioned =
-      await tx.deployment.updateMany({
-        where: {
-          ...buildScope(payload),
+        const now = new Date();
 
-          status: "SOURCE_PREPARED",
-        },
+        const leaseToken = randomUUID();
 
-        data: {
-          status: "BUILDING",
+        const leaseExpiresAt = new Date(
+          now.getTime() +
+            workerEnv.DEPLOYMENT_EXECUTION_LEASE_MS,
+        );
 
-          updatedAt: now,
-        },
-      });
+        const deployment =
+          await tx.deployment.findFirst({
+            where: scope,
 
-    if (transitioned.count !== 1) {
-      return null;
+            select: {
+              status: true,
+              commitSha: true,
+            },
+          });
+
+        if (!deployment) {
+          return { status: "skipped" };
+        }
+
+        if (
+          BUILD_TERMINAL_DEPLOYMENT_STATUSES.has(
+            deployment.status,
+          )
+        ) {
+          return { status: "skipped" };
+        }
+
+        if (
+          deployment.status === "CANCELLING"
+        ) {
+          return { status: "skipped" };
+        }
+
+        if (
+          deployment.commitSha !==
+          payload.resolvedCommitSha
+        ) {
+          throw new InvalidBuildIdentityError();
+        }
+
+        if (
+          deployment.status !== "SOURCE_PREPARED" &&
+          deployment.status !== "BUILDING"
+        ) {
+          return { status: "busy" };
+        }
+
+        const source =
+          await tx.deploymentSourcePreparation.findFirst({
+            where: {
+              ...scope,
+
+              id: payload.sourcePreparationId,
+
+              resolvedCommitSha:
+                payload.resolvedCommitSha,
+
+              status: "READY",
+            },
+
+            select: {
+              id: true,
+            },
+          });
+
+        if (!source) {
+          throw new InvalidBuildIdentityError();
+        }
+
+        const existing =
+          await tx.deploymentBuild.findFirst({
+            where: {
+              ...scope,
+
+              id: payload.buildId,
+            },
+
+            select: {
+              id: true,
+              status: true,
+              buildAttempt: true,
+              sourcePreparationId: true,
+              resolvedCommitSha: true,
+              executionLeaseToken: true,
+              executionLeaseExpiresAt: true,
+            },
+          });
+
+        const conflictingBuild =
+          await tx.deploymentBuild.findFirst({
+            where: {
+              ...scope,
+
+              id: {
+                not: payload.buildId,
+              },
+
+              status: {
+                in: [
+                  "QUEUED",
+                  "RUNNING",
+                  "SUCCEEDED",
+                ],
+              },
+            },
+
+            select: {
+              id: true,
+            },
+          });
+
+        if (conflictingBuild) {
+          return { status: "uncertain" };
+        }
+
+        let buildAttempt = 1;
+
+        if (existing) {
+          if (
+            existing.sourcePreparationId !==
+              payload.sourcePreparationId ||
+            existing.resolvedCommitSha !==
+              payload.resolvedCommitSha
+          ) {
+            throw new InvalidBuildIdentityError();
+          }
+
+          if (
+            existing.status === "SUCCEEDED" ||
+            existing.status === "CANCELLED" ||
+            existing.status === "FAILED"
+          ) {
+            return { status: "skipped" };
+          }
+
+          if (existing.status === "RUNNING") {
+            const leaseActive =
+              existing.executionLeaseToken !== null &&
+              existing.executionLeaseExpiresAt !== null &&
+              existing.executionLeaseExpiresAt.getTime() >
+                now.getTime();
+
+            /**
+             * An expired lease does not prove that
+             * Docker has stopped executing the build.
+             *
+             * Never automatically take over an
+             * uncertain RUNNING build.
+             */
+            return {
+              status: leaseActive
+                ? "busy"
+                : "uncertain",
+            };
+          }
+
+          if (
+            existing.status !== "QUEUED" ||
+            existing.executionLeaseToken !== null ||
+            existing.executionLeaseExpiresAt !== null
+          ) {
+            return { status: "uncertain" };
+          }
+
+          buildAttempt =
+            existing.buildAttempt + 1;
+        } else {
+          /**
+           * A BUILDING deployment without the expected
+           * build record indicates an inconsistent or
+           * legacy execution state.
+           */
+          if (
+            deployment.status !== "SOURCE_PREPARED"
+          ) {
+            return { status: "uncertain" };
+          }
+
+          const previousBuild =
+            await tx.deploymentBuild.findFirst({
+              where: scope,
+
+              orderBy: {
+                buildAttempt: "desc",
+              },
+
+              select: {
+                buildAttempt: true,
+              },
+            });
+
+          if (previousBuild) {
+            return { status: "uncertain" };
+          }
+        }
+
+        if (
+          !Number.isSafeInteger(buildAttempt) ||
+          buildAttempt < 1 ||
+          buildAttempt > maxAttempts
+        ) {
+          if (existing) {
+            const exhausted =
+              await tx.deploymentBuild.updateMany({
+                where: {
+                  ...scope,
+
+                  id: payload.buildId,
+
+                  status: "QUEUED",
+
+                  executionLeaseToken: null,
+
+                  executionLeaseExpiresAt: null,
+                },
+
+                data: {
+                  status: "FAILED",
+
+                  failureCode:
+                    "BUILDER_UNAVAILABLE",
+
+                  failureMessage:
+                    buildFailureMessage(
+                      "BUILDER_UNAVAILABLE",
+                    ),
+
+                  completedAt: now,
+                },
+              });
+
+            assertSingleUpdate(exhausted.count);
+
+            const failed =
+              await tx.deployment.updateMany({
+                where: {
+                  ...scope,
+
+                  status: deployment.status,
+                },
+
+                data: {
+                  status: "FAILED",
+
+                  failureCode: "BUILD_FAILED",
+
+                  failureMessage:
+                    "Build retry budget exhausted.",
+
+                  finishedAt: now,
+                },
+              });
+
+            assertSingleUpdate(failed.count);
+          }
+
+          return { status: "skipped" };
+        }
+
+        const transitioned =
+          await tx.deployment.updateMany({
+            where: {
+              ...scope,
+
+              status: deployment.status,
+
+              commitSha:
+                payload.resolvedCommitSha,
+            },
+
+            data: {
+              status: "BUILDING",
+
+              updatedAt: now,
+            },
+          });
+
+        assertSingleUpdate(transitioned.count);
+
+        if (existing) {
+          const updated =
+            await tx.deploymentBuild.updateMany({
+              where: {
+                ...scope,
+
+                id: payload.buildId,
+
+                status: "QUEUED",
+
+                buildAttempt:
+                  existing.buildAttempt,
+
+                executionLeaseToken: null,
+
+                executionLeaseExpiresAt: null,
+              },
+
+              data: {
+                status: "RUNNING",
+
+                buildAttempt,
+
+                executionLeaseToken:
+                  leaseToken,
+
+                executionLeaseExpiresAt:
+                  leaseExpiresAt,
+
+                startedAt: now,
+
+                completedAt: null,
+
+                durationMs: null,
+
+                failureCode: null,
+
+                failureMessage: null,
+              },
+            });
+
+          assertSingleUpdate(updated.count);
+        } else {
+          /**
+           * The API outbox publisher uses event.id as
+           * payload.buildId. Preserve that exact identity.
+           */
+          await tx.deploymentBuild.create({
+            data: {
+              ...scope,
+
+              id: payload.buildId,
+
+              sourcePreparationId:
+                payload.sourcePreparationId,
+
+              resolvedCommitSha:
+                payload.resolvedCommitSha,
+
+              buildAttempt,
+
+              status: "RUNNING",
+
+              executionLeaseToken:
+                leaseToken,
+
+              executionLeaseExpiresAt:
+                leaseExpiresAt,
+
+              startedAt: now,
+            },
+          });
+        }
+
+        await tx.auditLog.create({
+          data: {
+            workspaceId:
+              payload.workspaceId,
+
+            action:
+              "DEPLOYMENT_BUILD_CLAIMED",
+
+            entityType: "Deployment",
+
+            entityId:
+              payload.deploymentId,
+
+            metadata: {
+              buildId: payload.buildId,
+
+              buildAttempt,
+            },
+          },
+        });
+
+        return {
+          status: "claimed",
+
+          claim: {
+            payload,
+
+            buildId: payload.buildId,
+
+            leaseToken,
+
+            buildAttempt,
+
+            startedAt: now,
+          },
+        };
+      },
+    );
+  } catch (error) {
+    if (
+      error instanceof
+      StaleBuildOwnershipError
+    ) {
+      return { status: "busy" };
     }
 
-    // Upsert the build record and claim it atomically.
-    const build = await tx.deploymentBuild.upsert({
-      where: {
-        workspaceId_projectId_deploymentId_buildAttempt: {
-          ...buildScope(payload),
-          buildAttempt: 1,
-        },
-      },
+    if (
+      error instanceof
+      InvalidBuildIdentityError
+    ) {
+      throw new UnrecoverableError(
+        "Build source or execution identity is invalid.",
+      );
+    }
 
-      create: {
-        ...buildScope(payload),
-
-        sourcePreparationId:
-          payload.sourcePreparationId,
-
-        resolvedCommitSha: payload.resolvedCommitSha,
-
-        buildAttempt: 1,
-
-        status: "RUNNING",
-
-        executionLeaseToken: leaseToken,
-
-        executionLeaseExpiresAt: leaseExpiresAt,
-
-        startedAt: now,
-      },
-
-      update: {
-        status: "RUNNING",
-
-        executionLeaseToken: leaseToken,
-
-        executionLeaseExpiresAt: leaseExpiresAt,
-
-        startedAt: now,
-
-        completedAt: null,
-
-        durationMs: null,
-
-        failureCode: null,
-
-        failureMessage: null,
-      },
-    });
-
-    await tx.auditLog.create({
-      data: {
-        workspaceId: payload.workspaceId,
-
-        action: "DEPLOYMENT_BUILD_CLAIMED",
-
-        entityType: "Deployment",
-
-        entityId: payload.deploymentId,
-
-        metadata: {
-          buildId: build.id,
-
-          buildAttempt: build.buildAttempt,
-        },
-      },
-    });
-
-    return {
-      payload,
-
-      buildId: build.id,
-
-      leaseToken,
-
-      buildAttempt: build.buildAttempt,
-
-      startedAt: now,
-    };
-  });
+    throw error;
+  }
 }
 
 // ==================================================
@@ -293,57 +761,80 @@ async function claimBuild(
 async function renewBuildLease(
   claim: ExecutionClaim,
 ): Promise<ExecutionState> {
-  const now = new Date();
+  const scope = buildScope(claim.payload);
 
-  const expiresAt = new Date(
-    now.getTime() +
-      workerEnv.DEPLOYMENT_EXECUTION_LEASE_MS,
-  );
+  return prisma.$transaction(async (tx) => {
+    const locked = await tx.$queryRaw<
+      Array<{ id: string }>
+    >`
+      SELECT "id"
+      FROM "deployments"
+      WHERE "id" = ${scope.deploymentId}::uuid
+        AND "workspaceId" = ${scope.workspaceId}::uuid
+        AND "projectId" = ${scope.projectId}::uuid
+      FOR UPDATE
+    `;
 
-  const renewed =
-    await prisma.deploymentBuild.updateMany({
-      where: fencedBuildScope(claim, now),
+    if (locked.length !== 1) {
+      return "lost";
+    }
 
-      data: { executionLeaseExpiresAt: expiresAt },
-    });
+    const now = new Date();
 
-  if (renewed.count === 1) {
+    const deployment =
+      await tx.deployment.findFirst({
+        where: scope,
+
+        select: {
+          status: true,
+        },
+      });
+
+    if (!deployment) {
+      return "lost";
+    }
+
+    if (
+      deployment.status !== "BUILDING" &&
+      deployment.status !== "CANCELLING"
+    ) {
+      return "lost";
+    }
+
+    const expiresAt = new Date(
+      now.getTime() +
+        workerEnv.DEPLOYMENT_EXECUTION_LEASE_MS,
+    );
+
+    const renewed =
+      await tx.deploymentBuild.updateMany({
+        where: fencedBuildScope(
+          claim,
+          now,
+        ),
+
+        data: {
+          executionLeaseExpiresAt:
+            expiresAt,
+        },
+      });
+
+    if (renewed.count !== 1) {
+      return "lost";
+    }
+
+    /**
+     * Cancellation is checked even when lease
+     * renewal succeeds.
+     */
+    if (
+      deployment.status === "CANCELLING"
+    ) {
+      return "cancelling";
+    }
+
     return "active";
-  }
-
-  const current = await prisma.deploymentBuild.findFirst({
-    where: {
-      ...buildScope(claim.payload),
-      id: claim.buildId,
-    },
-
-    select: {
-      executionLeaseToken: true,
-      buildAttempt: true,
-      executionLeaseExpiresAt: true,
-    },
   });
-
-  if (
-    !current ||
-    current.executionLeaseToken !== claim.leaseToken ||
-    current.buildAttempt !== claim.buildAttempt ||
-    !current.executionLeaseExpiresAt ||
-    current.executionLeaseExpiresAt.getTime() <= Date.now()
-  ) {
-    return "lost";
-  }
-
-  const deployment = await prisma.deployment.findFirst({
-    where: buildScope(claim.payload),
-    select: { status: true },
-  });
-
-  if (deployment?.status === "CANCELLING") {
-    return "cancelling";
-  }
-
-  return "lost";
 }
 
 // ==================================================
@@ -354,7 +845,8 @@ function createBuildMonitor(
   claim: ExecutionClaim,
   externalSignal: AbortSignal,
 ) {
-  const controller = new AbortController();
+  const controller =
+    new AbortController();
 
   const signal = AbortSignal.any([
     externalSignal,
@@ -366,7 +858,8 @@ function createBuildMonitor(
     Math.min(
       2_000,
       Math.floor(
-        workerEnv.DEPLOYMENT_EXECUTION_LEASE_MS / 3,
+        workerEnv.DEPLOYMENT_EXECUTION_LEASE_MS /
+          3,
       ),
     ),
   );
@@ -375,25 +868,41 @@ function createBuildMonitor(
 
   let stopped = false;
 
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timer:
+    | ReturnType<typeof setTimeout>
+    | undefined;
 
-  let pending: Promise<void> | undefined;
+  let pending:
+    | Promise<void>
+    | undefined;
 
-  const abort = (next: ExecutionState): void => {
+  const abort = (
+    next: ExecutionState,
+  ): void => {
     state = next;
 
     if (!controller.signal.aborted) {
-      controller.abort();
+      controller.abort(
+        new BuildError(
+          next === "cancelling"
+            ? "BUILD_CANCELLED"
+            : "BUILD_LEASE_LOST",
+        ),
+      );
     }
   };
 
   const poll = async (): Promise<void> => {
-    if (stopped || signal.aborted) {
+    if (
+      stopped ||
+      signal.aborted
+    ) {
       return;
     }
 
     try {
-      const next = await renewBuildLease(claim);
+      const next =
+        await renewBuildLease(claim);
 
       if (next !== "active") {
         abort(next);
@@ -404,13 +913,17 @@ function createBuildMonitor(
   };
 
   const schedule = (): void => {
-    if (stopped || signal.aborted) {
+    if (
+      stopped ||
+      signal.aborted
+    ) {
       return;
     }
 
     timer = setTimeout(() => {
       pending = poll().finally(() => {
         pending = undefined;
+
         schedule();
       });
     }, intervalMs);
@@ -436,6 +949,7 @@ function createBuildMonitor(
 
       if (timer) {
         clearTimeout(timer);
+
         timer = undefined;
       }
 
@@ -454,32 +968,39 @@ async function resolveBuildSource(
   payload: BuildJob,
   workspace: WorkspaceManager,
 ): Promise<BuildSourceContext> {
-  const deployment = await prisma.deployment.findFirst({
-    where: buildScope(payload),
+  const deployment =
+    await prisma.deployment.findFirst({
+      where: buildScope(payload),
 
-    select: {
-      commitSha: true,
+      select: {
+        status: true,
 
-      project: {
-        select: {
-          repository: {
-            select: { fullName: true },
-          },
+        commitSha: true,
 
-          buildConfiguration: {
-            select: {
-              dockerfilePath: true,
-              rootDirectory: true,
+        project: {
+          select: {
+            repository: {
+              select: {
+                fullName: true,
+              },
+            },
+
+            buildConfiguration: {
+              select: {
+                dockerfilePath: true,
+
+                rootDirectory: true,
+              },
             },
           },
         },
       },
-    },
-  });
+    });
 
   if (
     !deployment ||
-    deployment.commitSha !== payload.resolvedCommitSha
+    deployment.commitSha !==
+      payload.resolvedCommitSha
   ) {
     throw new BuildError(
       "SOURCE_INTEGRITY_FAILED",
@@ -487,56 +1008,117 @@ async function resolveBuildSource(
     );
   }
 
+  if (
+    deployment.status === "CANCELLING"
+  ) {
+    throw new BuildError(
+      "BUILD_CANCELLED",
+    );
+  }
+
+  if (
+    deployment.status !== "BUILDING"
+  ) {
+    throw new BuildError(
+      "BUILD_LEASE_LOST",
+    );
+  }
+
   const repositoryFullName =
     deployment.project.repository?.fullName;
 
-  if (!repositoryFullName) {
+  if (
+    !repositoryFullName ||
+    repositoryFullName.trim().length === 0
+  ) {
     throw new BuildError(
       "SOURCE_WORKSPACE_UNAVAILABLE",
       "Deployment repository is unavailable.",
     );
   }
 
-  // Enforce trusted-repository policy for local builds.
-  if (workerEnv.BUILD_TRUSTED_LOCAL_ONLY) {
-    const trusted =
-      workerEnv.BUILD_TRUSTED_REPOSITORIES.some(
-        (entry) =>
-          entry.toLowerCase() ===
-          repositoryFullName.toLowerCase(),
-      );
-
-    if (!trusted) {
-      throw new BuildError(
-        "BUILD_POLICY_VIOLATION",
-        "Repository is not authorized for local builds.",
-      );
-    }
+  /**
+   * Local Docker is not a strong multi-tenant
+   * isolation boundary.
+   *
+   * Disabling the trusted-only flag must not
+   * silently authorize untrusted builds.
+   */
+  if (
+    !workerEnv.BUILD_TRUSTED_LOCAL_ONLY
+  ) {
+    throw new BuildError(
+      "BUILD_POLICY_VIOLATION",
+      "Unrestricted local builds are not supported.",
+    );
   }
 
-  const preparation = await prisma.deploymentSourcePreparation.findFirst({
-    where: {
-      ...buildScope(payload),
-      status: "READY",
-    },
+  const trustedRepository =
+    workerEnv.BUILD_TRUSTED_REPOSITORIES.some(
+      (entry) =>
+        entry.trim().toLowerCase() ===
+        repositoryFullName.toLowerCase(),
+    );
 
-    select: { sourceWorkspaceKey: true },
-  });
+  if (!trustedRepository) {
+    throw new BuildError(
+      "BUILD_POLICY_VIOLATION",
+      "Repository is not authorized for local builds.",
+    );
+  }
 
-  if (!preparation?.sourceWorkspaceKey) {
+  const preparation =
+    await prisma.deploymentSourcePreparation.findFirst({
+      where: {
+        ...buildScope(payload),
+
+        id: payload.sourcePreparationId,
+
+        resolvedCommitSha:
+          payload.resolvedCommitSha,
+
+        status: "READY",
+      },
+
+      select: {
+        id: true,
+
+        sourceWorkspaceKey: true,
+
+        resolvedCommitSha: true,
+      },
+    });
+
+  if (
+    !preparation ||
+    !preparation.sourceWorkspaceKey
+  ) {
     throw new BuildError(
       "SOURCE_WORKSPACE_UNAVAILABLE",
       "Prepared source workspace is unavailable.",
     );
   }
 
+  if (
+    preparation.id !==
+      payload.sourcePreparationId ||
+    preparation.resolvedCommitSha !==
+      payload.resolvedCommitSha
+  ) {
+    throw new BuildError(
+      "SOURCE_INTEGRITY_FAILED",
+    );
+  }
+
   let sourceDir: string;
 
   try {
-    sourceDir = await workspace.resolvePreparedSourceDir(
-      payload.deploymentId,
-      preparation.sourceWorkspaceKey,
-    );
+    sourceDir =
+      await workspace.resolvePreparedSourceDir(
+        payload.deploymentId,
+
+        preparation.sourceWorkspaceKey,
+      );
   } catch {
     throw new BuildError(
       "SOURCE_WORKSPACE_UNAVAILABLE",
@@ -546,14 +1128,79 @@ async function resolveBuildSource(
 
   return {
     sourceDir,
+
     dockerfilePath:
-      deployment.project.buildConfiguration?.dockerfilePath ??
-      null,
+      deployment.project.buildConfiguration
+        ?.dockerfilePath ?? null,
+
     buildContextPath:
-      deployment.project.buildConfiguration?.rootDirectory ??
-      null,
+      deployment.project.buildConfiguration
+        ?.rootDirectory ?? null,
+
     repositoryFullName,
+
+    trustedRepository,
   };
+}
+
+// ==================================================
+// Artifact verification
+// ==================================================
+
+function assertVerifiedArtifact(
+  artifact: VerifiedBuildArtifact,
+): void {
+  if (
+    typeof artifact.imageTag !== "string" ||
+    artifact.imageTag.length === 0 ||
+    artifact.imageTag.length > 255 ||
+    /[\u0000-\u001f\u007f-\u009f]/u.test(
+      artifact.imageTag,
+    )
+  ) {
+    throw new BuildError(
+      "IMAGE_VERIFICATION_FAILED",
+    );
+  }
+
+  if (
+    !artifact.imageId ||
+    artifact.imageId.length !== 71 ||
+    !IMAGE_ID_PATTERN.test(
+      artifact.imageId,
+    )
+  ) {
+    throw new BuildError(
+      "IMAGE_VERIFICATION_FAILED",
+    );
+  }
+
+  if (
+    artifact.imageSizeBytes !== null &&
+    (
+      !Number.isSafeInteger(
+        artifact.imageSizeBytes,
+      ) ||
+      artifact.imageSizeBytes < 0
+    )
+  ) {
+    throw new BuildError(
+      "IMAGE_VERIFICATION_FAILED",
+    );
+  }
+
+  if (
+    artifact.platform !==
+      workerEnv.BUILD_PLATFORM ||
+    !Number.isSafeInteger(
+      artifact.durationMs,
+    ) ||
+    artifact.durationMs < 0
+  ) {
+    throw new BuildError(
+      "IMAGE_VERIFICATION_FAILED",
+    );
+  }
 }
 
 // ==================================================
@@ -562,127 +1209,276 @@ async function resolveBuildSource(
 
 async function settleSuccess(
   claim: ExecutionClaim,
-  artifact: {
-    imageTag: string;
-    imageId: string | null;
-    imageDigest: string | null;
-    imageSizeBytes: number | null;
-    platform: string;
-    durationMs: number;
-  },
+  artifact: VerifiedBuildArtifact,
   logs: BuildLogEntry[],
 ): Promise<SettlementResult> {
-  return prisma.$transaction(async (tx) => {
-    const now = new Date();
+  assertVerifiedArtifact(artifact);
 
-    const fence = fencedBuildScope(claim, now);
+  try {
+    return await prisma.$transaction(
+      async (tx): Promise<SettlementResult> => {
+        const scope =
+          buildScope(claim.payload);
 
-    // Cancellation takes precedence over success.
-    const cancelled = await tx.deployment.updateMany({
-      where: {
-        ...buildScope(claim.payload),
-        status: "CANCELLING",
+        const locked =
+          await tx.$queryRaw<
+            Array<{ id: string }>
+          >`
+            SELECT "id"
+            FROM "deployments"
+            WHERE "id" = ${scope.deploymentId}::uuid
+              AND "workspaceId" = ${scope.workspaceId}::uuid
+              AND "projectId" = ${scope.projectId}::uuid
+            FOR UPDATE
+          `;
+
+        if (locked.length !== 1) {
+          throw new StaleBuildOwnershipError();
+        }
+
+        const now = new Date();
+
+        const fence =
+          fencedBuildScope(claim, now);
+
+        const deployment =
+          await tx.deployment.findFirst({
+            where: scope,
+
+            select: {
+              status: true,
+
+              commitSha: true,
+            },
+          });
+
+        if (
+          !deployment ||
+          deployment.commitSha !==
+            claim.payload.resolvedCommitSha
+        ) {
+          throw new StaleBuildOwnershipError();
+        }
+
+        const cancelling =
+          deployment.status === "CANCELLING";
+
+        if (
+          !cancelling &&
+          deployment.status !== "BUILDING"
+        ) {
+          throw new StaleBuildOwnershipError();
+        }
+
+        const updated =
+          await tx.deploymentBuild.updateMany({
+            where: fence,
+
+            data: {
+              status: cancelling
+                ? "CANCELLED"
+                : "SUCCEEDED",
+
+              imageTag:
+                artifact.imageTag,
+
+              imageId:
+                artifact.imageId,
+
+              imageDigest:
+                artifact.imageDigest,
+
+              artifactType:
+                "DOCKER_IMAGE_STORE",
+
+              artifactLocation:
+                artifact.imageTag,
+
+              platform:
+                artifact.platform,
+
+              imageSizeBytes:
+                artifact.imageSizeBytes === null
+                  ? null
+                  : BigInt(
+                      artifact.imageSizeBytes,
+                    ),
+
+              durationMs:
+                artifact.durationMs,
+
+              executionLeaseToken: null,
+
+              executionLeaseExpiresAt: null,
+
+              completedAt: now,
+
+              failureCode: cancelling
+                ? "BUILD_CANCELLED"
+                : null,
+
+              failureMessage: cancelling
+                ? buildFailureMessage(
+                    "BUILD_CANCELLED",
+                  )
+                : null,
+            },
+          });
+
+        assertSingleUpdate(updated.count);
+
+        const transitioned =
+          await tx.deployment.updateMany({
+            where: {
+              ...scope,
+
+              status:
+                deployment.status,
+            },
+
+            data: cancelling
+              ? {
+                  status: "CANCELLED",
+
+                  failureCode: "CANCELLED",
+
+                  failureMessage:
+                    "Deployment cancellation was acknowledged after build completion.",
+
+                  finishedAt: now,
+                }
+              : {
+                  status: "BUILD_SUCCEEDED",
+
+                  updatedAt: now,
+                },
+          });
+
+        assertSingleUpdate(
+          transitioned.count,
+        );
+
+        // ==============================================
+        // Schedule the runtime deployment atomically
+        // ==============================================
+        //
+        // The runtime outbox event is committed in the
+        // same transaction as BUILD_SUCCEEDED.
+        //
+        // Preserve the existing API publisher contract.
+        // The runtime publisher must subsequently be
+        // updated to consume the exact reserved record.
+        // ==============================================
+
+        if (
+          !cancelling &&
+          workerEnv.RUNTIME_ENABLED
+        ) {
+          const runtimeInstanceId =
+            randomUUID();
+
+          await tx.deploymentRuntimeInstance.create({
+            data: {
+              ...scope,
+
+              id: runtimeInstanceId,
+
+              buildId: claim.buildId,
+
+              runtimeAttempt: 1,
+
+              status: "QUEUED",
+
+              imageId: artifact.imageId,
+
+              imageTag: artifact.imageTag,
+            },
+          });
+
+          await tx.deploymentOutboxEvent.create({
+            data: {
+              ...scope,
+
+              id: runtimeInstanceId,
+
+              eventType:
+                "RUNTIME_REQUESTED",
+
+              jobId:
+                QueueManager.deterministicJobId(
+                  "runtime",
+                  [
+                    claim.payload.deploymentId,
+                  ],
+                ),
+            },
+          });
+        }
+
+        if (logs.length > 0) {
+          await tx.deploymentBuildLog.createMany({
+            data: logs.map((entry) => ({
+              ...scope,
+
+              buildId: claim.buildId,
+
+              sequence:
+                BigInt(entry.sequence),
+
+              stream: entry.stream,
+
+              message: entry.message,
+            })),
+          });
+        }
+
+        await tx.auditLog.create({
+          data: {
+            workspaceId:
+              claim.payload.workspaceId,
+
+            action: cancelling
+              ? "DEPLOYMENT_BUILD_CANCELLED"
+              : "DEPLOYMENT_BUILD_SUCCEEDED",
+
+            entityType: "Deployment",
+
+            entityId:
+              claim.payload.deploymentId,
+
+            metadata: {
+              buildId: claim.buildId,
+
+              buildAttempt:
+                claim.buildAttempt,
+
+              imageTag:
+                artifact.imageTag,
+
+              durationMs:
+                artifact.durationMs,
+
+              artifactCleanupRequired:
+                cancelling,
+            },
+          },
+        });
+
+        return cancelling
+          ? "cancelled"
+          : "succeeded";
       },
-
-      data: {
-        status: "CANCELLED",
-        failureCode: "CANCELLED",
-        failureMessage:
-          "Deployment cancellation was acknowledged by the build worker.",
-        finishedAt: now,
-      },
-    });
-
-    if (cancelled.count === 1) {
-      await tx.deploymentBuild.updateMany({
-        where: fence,
-        data: {
-          status: "CANCELLED",
-          executionLeaseToken: null,
-          executionLeaseExpiresAt: null,
-          completedAt: now,
-        },
-      });
-
-      return "cancelled";
-    }
-
-    const updated = await tx.deploymentBuild.updateMany({
-      where: fence,
-
-      data: {
-        status: "SUCCEEDED",
-        imageTag: artifact.imageTag,
-        imageId: artifact.imageId,
-        imageDigest: artifact.imageDigest,
-        artifactType: "DOCKER_IMAGE_STORE",
-        artifactLocation: artifact.imageTag,
-        platform: artifact.platform,
-        imageSizeBytes:
-          artifact.imageSizeBytes === null
-            ? null
-            : BigInt(artifact.imageSizeBytes),
-        durationMs: artifact.durationMs,
-        executionLeaseToken: null,
-        executionLeaseExpiresAt: null,
-        completedAt: now,
-        failureCode: null,
-        failureMessage: null,
-      },
-    });
-
-    if (updated.count !== 1) {
+    );
+  } catch (error) {
+    if (
+      error instanceof
+      StaleBuildOwnershipError
+    ) {
       return "stale";
     }
 
-    const transitioned = await tx.deployment.updateMany({
-      where: {
-        ...buildScope(claim.payload),
-        status: "BUILDING",
-      },
-
-      data: {
-        status: "BUILD_SUCCEEDED",
-        updatedAt: now,
-      },
-    });
-
-    if (transitioned.count !== 1) {
-      return "stale";
-    }
-
-    if (logs.length > 0) {
-      await tx.deploymentBuildLog.createMany({
-        data: logs.map((entry) => ({
-          ...buildScope(claim.payload),
-          buildId: claim.buildId,
-          sequence: BigInt(entry.sequence),
-          stream: entry.stream,
-          message: entry.message,
-        })),
-      });
-    }
-
-    await tx.auditLog.create({
-      data: {
-        workspaceId: claim.payload.workspaceId,
-
-        action: "DEPLOYMENT_BUILD_SUCCEEDED",
-
-        entityType: "Deployment",
-
-        entityId: claim.payload.deploymentId,
-
-        metadata: {
-          buildId: claim.buildId,
-          imageTag: artifact.imageTag,
-          durationMs: artifact.durationMs,
-        },
-      },
-    });
-
-    return "succeeded";
-  });
+    throw error;
+  }
 }
 
 async function settleFailure(
@@ -690,133 +1486,298 @@ async function settleFailure(
   code: BuildFailureCode,
   retryable: boolean,
   logs: BuildLogEntry[],
+  executionMayHaveStarted: boolean,
 ): Promise<SettlementResult> {
-  return prisma.$transaction(async (tx) => {
-    const now = new Date();
+  try {
+    return await prisma.$transaction(
+      async (tx): Promise<SettlementResult> => {
+        const scope =
+          buildScope(claim.payload);
 
-    const scope = buildScope(claim.payload);
+        const locked =
+          await tx.$queryRaw<
+            Array<{ id: string }>
+          >`
+            SELECT "id"
+            FROM "deployments"
+            WHERE "id" = ${scope.deploymentId}::uuid
+              AND "workspaceId" = ${scope.workspaceId}::uuid
+              AND "projectId" = ${scope.projectId}::uuid
+            FOR UPDATE
+          `;
 
-    const fence = fencedBuildScope(claim, now);
+        if (locked.length !== 1) {
+          throw new StaleBuildOwnershipError();
+        }
 
-    const cancelled = await tx.deployment.updateMany({
-      where: { ...scope, status: "CANCELLING" },
+        const now = new Date();
 
-      data: {
-        status: "CANCELLED",
-        failureCode: "CANCELLED",
-        failureMessage:
-          "Deployment cancellation was acknowledged by the build worker.",
-        finishedAt: now,
+        const fence =
+          fencedBuildScope(claim, now);
+
+        const deployment =
+          await tx.deployment.findFirst({
+            where: scope,
+
+            select: {
+              status: true,
+            },
+          });
+
+        if (
+          !deployment ||
+          (
+            deployment.status !== "BUILDING" &&
+            deployment.status !== "CANCELLING"
+          )
+        ) {
+          throw new StaleBuildOwnershipError();
+        }
+
+        /**
+         * A cancelled CLI command is not proof that
+         * the underlying Docker build has terminated.
+         */
+        const cancelling =
+          deployment.status === "CANCELLING";
+
+        if (
+          cancelling &&
+          executionMayHaveStarted
+        ) {
+          const fenced =
+            await tx.deploymentBuild.updateMany({
+              where: fence,
+
+              data: {
+                failureCode:
+                  "BUILD_CANCELLED",
+
+                failureMessage:
+                  "Build termination requires reconciliation.",
+              },
+            });
+
+          assertSingleUpdate(fenced.count);
+
+          await tx.auditLog.create({
+            data: {
+              workspaceId:
+                claim.payload.workspaceId,
+
+              action:
+                "DEPLOYMENT_BUILD_RECONCILIATION_REQUIRED",
+
+              entityType: "Deployment",
+
+              entityId:
+                claim.payload.deploymentId,
+
+              metadata: {
+                buildId: claim.buildId,
+
+                reason:
+                  "CANCELLATION_OUTCOME_UNCERTAIN",
+              },
+            },
+          });
+
+          return "stale";
+        }
+
+        const shouldRetry =
+          !cancelling &&
+          retryable &&
+          !executionMayHaveStarted;
+
+        const finalCode =
+          cancelling
+            ? "BUILD_CANCELLED"
+            : code;
+
+        const updated =
+          await tx.deploymentBuild.updateMany({
+            where: fence,
+
+            data: {
+              status: cancelling
+                ? "CANCELLED"
+                : shouldRetry
+                  ? "QUEUED"
+                  : "FAILED",
+
+              failureCode:
+                finalCode,
+
+              failureMessage:
+                buildFailureMessage(
+                  finalCode,
+                ),
+
+              executionLeaseToken: null,
+
+              executionLeaseExpiresAt: null,
+
+              completedAt: shouldRetry
+                ? null
+                : now,
+            },
+          });
+
+        assertSingleUpdate(updated.count);
+
+        if (!shouldRetry) {
+          const transitioned =
+            await tx.deployment.updateMany({
+              where: {
+                ...scope,
+
+                status:
+                  deployment.status,
+              },
+
+              data: {
+                status: cancelling
+                  ? "CANCELLED"
+                  : "FAILED",
+
+                failureCode: cancelling
+                  ? "CANCELLED"
+                  : "BUILD_FAILED",
+
+                failureMessage:
+                  buildFailureMessage(
+                    finalCode,
+                  ),
+
+                finishedAt: now,
+              },
+            });
+
+          assertSingleUpdate(
+            transitioned.count,
+          );
+        }
+
+        /**
+         * Retryable pre-execution failures do not
+         * write attempt logs into the shared sequence.
+         *
+         * The same build identity is reused, so log
+         * sequence collisions must be avoided.
+         */
+        if (
+          !shouldRetry &&
+          logs.length > 0
+        ) {
+          await tx.deploymentBuildLog.createMany({
+            data: logs.map((entry) => ({
+              ...scope,
+
+              buildId: claim.buildId,
+
+              sequence:
+                BigInt(entry.sequence),
+
+              stream: entry.stream,
+
+              message: entry.message,
+            })),
+          });
+        }
+
+        await tx.auditLog.create({
+          data: {
+            workspaceId:
+              claim.payload.workspaceId,
+
+            action: cancelling
+              ? "DEPLOYMENT_BUILD_CANCELLED"
+              : shouldRetry
+                ? "DEPLOYMENT_BUILD_RETRY_SCHEDULED"
+                : "DEPLOYMENT_BUILD_FAILED",
+
+            entityType: "Deployment",
+
+            entityId:
+              claim.payload.deploymentId,
+
+            metadata: {
+              buildId: claim.buildId,
+
+              buildAttempt:
+                claim.buildAttempt,
+
+              failureCode:
+                finalCode,
+
+              retryable:
+                shouldRetry,
+
+              reconciliationRequired:
+                executionMayHaveStarted,
+            },
+          },
+        });
+
+        if (cancelling) {
+          return "cancelled";
+        }
+
+        return shouldRetry
+          ? "retry"
+          : "failed";
       },
-    });
-
-    if (cancelled.count === 1) {
-      await tx.deploymentBuild.updateMany({
-        where: fence,
-        data: {
-          status: "CANCELLED",
-          failureCode: "BUILD_CANCELLED",
-          failureMessage: buildFailureMessage("BUILD_CANCELLED"),
-          executionLeaseToken: null,
-          executionLeaseExpiresAt: null,
-          completedAt: now,
-        },
-      });
-
-      return "cancelled";
-    }
-
-    const updated = await tx.deploymentBuild.updateMany({
-      where: fence,
-
-      data: {
-        status: retryable ? "QUEUED" : "FAILED",
-
-        failureCode: retryable ? null : code,
-
-        failureMessage: retryable
-          ? null
-          : buildFailureMessage(code),
-
-        executionLeaseToken: null,
-
-        executionLeaseExpiresAt: null,
-
-        completedAt: retryable ? null : now,
-      },
-    });
-
-    if (updated.count !== 1) {
+    );
+  } catch (error) {
+    if (
+      error instanceof
+      StaleBuildOwnershipError
+    ) {
       return "stale";
     }
 
-    if (!retryable) {
-      await tx.deployment.updateMany({
-        where: { ...scope, status: "BUILDING" },
-
-        data: {
-          status: "FAILED",
-          failureCode: "BUILD_FAILED",
-          failureMessage: buildFailureMessage(code),
-          finishedAt: now,
-        },
-      });
-    }
-
-    if (logs.length > 0) {
-      await tx.deploymentBuildLog.createMany({
-        data: logs.map((entry) => ({
-          ...scope,
-          buildId: claim.buildId,
-          sequence: BigInt(entry.sequence),
-          stream: entry.stream,
-          message: entry.message,
-        })),
-      });
-    }
-
-    await tx.auditLog.create({
-      data: {
-        workspaceId: claim.payload.workspaceId,
-
-        action: retryable
-          ? "DEPLOYMENT_BUILD_RETRY_SCHEDULED"
-          : "DEPLOYMENT_BUILD_FAILED",
-
-        entityType: "Deployment",
-
-        entityId: claim.payload.deploymentId,
-
-        metadata: {
-          buildId: claim.buildId,
-          failureCode: code,
-          retryable,
-        },
-      },
-    });
-
-    return retryable ? "retry" : "failed";
-  });
+    throw error;
+  }
 }
 
 // ==================================================
-// Retry budget
+// Deferred artifact cleanup
 // ==================================================
 
-function hasBuildRetryBudget(
-  job: Job<QueueJob>,
-  buildAttempt: number,
-): boolean {
-  const queueAttemptsRemaining =
-    job.attemptsMade + 1 <
-    (job.opts.attempts ?? workerEnv.QUEUE_JOB_ATTEMPTS);
+function reportDeferredCleanup(
+  claim: ExecutionClaim,
+  reason: string,
+): void {
+  /**
+   * Never delete an image merely because its tag
+   * resembles a CloudPilot-managed artifact.
+   *
+   * Cleanup requires verified artifact identity,
+   * tenant ownership and reconciliation eligibility.
+   */
+  workerLogger.warn(
+    {
+      workspaceId:
+        claim.payload.workspaceId,
 
-  const configuredRetries = workerEnv.BUILD_MAX_RETRIES;
+      projectId:
+        claim.payload.projectId,
 
-  const retryBudgetRemaining =
-    buildAttempt <= configuredRetries + 1;
+      deploymentId:
+        claim.payload.deploymentId,
 
-  return queueAttemptsRemaining && retryBudgetRemaining;
+      buildId:
+        claim.buildId,
+
+      buildAttempt:
+        claim.buildAttempt,
+
+      reason,
+    },
+
+    "Build artifact reconciliation required; automatic cleanup deferred",
+  );
 }
 
 // ==================================================
@@ -833,7 +1794,11 @@ export async function processBuildJob(
   // Validate outbox event
   // ================================================
 
-  const valid = await validateBuildOutbox(job, payload);
+  const valid =
+    await validateBuildOutbox(
+      job,
+      payload,
+    );
 
   if (!valid) {
     throw new UnrecoverableError(
@@ -851,9 +1816,20 @@ export async function processBuildJob(
     );
   }
 
-  if (!SHA_PATTERN.test(payload.resolvedCommitSha)) {
+  if (
+    payload.resolvedCommitSha.length !== 40 ||
+    !SHA_PATTERN.test(
+      payload.resolvedCommitSha,
+    )
+  ) {
     throw new UnrecoverableError(
       "Build commit identity is invalid.",
+    );
+  }
+
+  if (signal.aborted) {
+    throw new TransientJobError(
+      "Build worker execution was interrupted.",
     );
   }
 
@@ -861,10 +1837,14 @@ export async function processBuildJob(
   // Skip terminal deployments
   // ================================================
 
-  const existing = await prisma.deployment.findFirst({
-    where: buildScope(payload),
-    select: { status: true },
-  });
+  const existing =
+    await prisma.deployment.findFirst({
+      where: buildScope(payload),
+
+      select: {
+        status: true,
+      },
+    });
 
   if (
     !existing ||
@@ -872,13 +1852,9 @@ export async function processBuildJob(
       existing.status,
     )
   ) {
-    return { status: "skipped" };
-  }
-
-  if (signal.aborted) {
-    throw new TransientJobError(
-      "Build worker is shutting down.",
-    );
+    return {
+      status: "skipped",
+    };
   }
 
   // ================================================
@@ -887,201 +1863,437 @@ export async function processBuildJob(
 
   const claimed = await claimBuild(
     payload,
-    workerEnv.QUEUE_JOB_ATTEMPTS,
+
+    getMaximumBuildAttempts(job),
   );
 
-  if (!claimed) {
-    const current = await prisma.deployment.findFirst({
-      where: buildScope(payload),
-      select: { status: true },
-    });
+  if (claimed.status === "skipped") {
+    return {
+      status: "skipped",
+    };
+  }
 
-    if (
-      !current ||
-      BUILD_TERMINAL_DEPLOYMENT_STATUSES.has(
-        current.status,
-      )
-    ) {
-      return { status: "skipped" };
-    }
+  if (claimed.status === "uncertain") {
+    workerLogger.warn(
+      {
+        deploymentId:
+          payload.deploymentId,
 
+        buildId:
+          payload.buildId,
+      },
+
+      "Build ownership is uncertain; automatic execution refused",
+    );
+
+    throw new UnrecoverableError(
+      "Build execution requires reconciliation.",
+    );
+  }
+
+  if (claimed.status === "busy") {
     throw new TransientJobError(
       "Build execution ownership is unavailable.",
     );
   }
 
-  const claim: ExecutionClaim = {
-    payload,
-    buildId: claimed.buildId,
-    leaseToken: claimed.leaseToken,
-    buildAttempt: claimed.buildAttempt,
-    startedAt: claimed.startedAt,
-  };
+  if (claimed.status !== "claimed") {
+    throw new UnrecoverableError(
+      "Unexpected build claim result.",
+    );
+  }
 
-  const monitor = createBuildMonitor(claim, signal);
+  const claim = claimed.claim;
 
-  let imageTag: string | null = null;
+  const monitor =
+    createBuildMonitor(
+      claim,
+      signal,
+    );
+
+  let executionMayHaveStarted = false;
 
   let logs: BuildLogEntry[] = [];
+
+  let artifact:
+    | VerifiedBuildArtifact
+    | undefined;
+
+  let executionFailure:
+    | BuildError
+    | undefined;
 
   try {
     // ==============================================
     // Resolve authorized source
     // ==============================================
 
-    const source = await resolveBuildSource(
-      payload,
-      options.workspace,
-    );
+    try {
+      const source =
+        await resolveBuildSource(
+          payload,
 
-    if (monitor.signal.aborted) {
-      throw new BuildError("BUILD_CANCELLED");
+          options.workspace,
+        );
+
+      if (monitor.signal.aborted) {
+        throw new BuildError(
+          monitor.state === "cancelling"
+            ? "BUILD_CANCELLED"
+            : "BUILD_LEASE_LOST",
+        );
+      }
+
+      /**
+       * Revalidate ownership immediately before
+       * crossing the external execution boundary.
+       */
+      const ownership =
+        await renewBuildLease(claim);
+
+      if (ownership !== "active") {
+        throw new BuildError(
+          ownership === "cancelling"
+            ? "BUILD_CANCELLED"
+            : "BUILD_LEASE_LOST",
+        );
+      }
+
+      if (monitor.signal.aborted) {
+        throw new BuildError(
+          "BUILD_LEASE_LOST",
+        );
+      }
+
+      // ==============================================
+      // Execute the trusted local build
+      // ==============================================
+
+      /**
+       * Once runBuild is invoked, conservatively assume
+       * Docker may have received a build request.
+       *
+       * Do not retry uncertain external side effects.
+       */
+      executionMayHaveStarted = true;
+
+      const result = await runBuild({
+        sourceDir:
+          source.sourceDir,
+
+        projectId:
+          payload.projectId,
+
+        deploymentId:
+          payload.deploymentId,
+
+        resolvedCommitSha:
+          payload.resolvedCommitSha,
+
+        buildAttempt:
+          claim.buildAttempt,
+
+        dockerfilePath:
+          source.dockerfilePath,
+
+        buildContextPath:
+          source.buildContextPath,
+
+        trustedRepository:
+          source.trustedRepository,
+
+        buildArgs: {},
+
+        target: null,
+
+        platform:
+          workerEnv.BUILD_PLATFORM,
+
+        limits: {
+          timeoutMs:
+            workerEnv.BUILD_TIMEOUT_MS,
+
+          maxContextBytes:
+            workerEnv.BUILD_MAX_CONTEXT_BYTES,
+
+          maxFileCount:
+            workerEnv.SOURCE_MAX_FILE_COUNT,
+
+          maxLogBytes:
+            workerEnv.BUILD_MAX_LOG_BYTES,
+        },
+
+        executor:
+          options.executor,
+
+        signal:
+          monitor.signal,
+      });
+
+      logs = result.logEntries;
+
+      artifact = {
+        imageTag:
+          result.imageTag,
+
+        imageId:
+          result.imageId,
+
+        imageDigest:
+          result.imageDigest,
+
+        imageSizeBytes:
+          result.imageSizeBytes,
+
+        platform:
+          result.platform,
+
+        durationMs:
+          result.durationMs,
+      };
+
+      assertVerifiedArtifact(artifact);
+    } catch (error) {
+      const code =
+        getBuildFailureCode(error);
+
+      executionFailure =
+        error instanceof BuildError
+          ? error
+          : new BuildError(
+              code,
+
+              buildFailureMessage(code),
+            );
     }
 
     // ==============================================
-    // Execute the isolated build
+    // Verify ownership before settlement
     // ==============================================
 
-    const result = await runBuild({
-      sourceDir: source.sourceDir,
-      projectId: payload.projectId,
-      deploymentId: payload.deploymentId,
-      resolvedCommitSha: payload.resolvedCommitSha,
-      buildAttempt: claim.buildAttempt,
-      dockerfilePath: source.dockerfilePath,
-      buildContextPath: source.buildContextPath,
-      buildArgs: {},
-      target: null,
-      platform: workerEnv.BUILD_PLATFORM,
-      limits: {
-        timeoutMs: workerEnv.BUILD_TIMEOUT_MS,
-        maxContextBytes:
-          workerEnv.BUILD_MAX_CONTEXT_BYTES,
-        maxFileCount: workerEnv.SOURCE_MAX_FILE_COUNT,
-        maxLogBytes: workerEnv.BUILD_MAX_LOG_BYTES,
-      },
-      executor: options.executor,
-      signal: monitor.signal,
-    });
+    if (
+      monitor.state === "lost" ||
+      monitor.state === "unavailable"
+    ) {
+      if (executionMayHaveStarted) {
+        reportDeferredCleanup(
+          claim,
+          "EXECUTION_OWNERSHIP_UNCERTAIN",
+        );
+      }
 
-    imageTag = result.imageTag;
-    logs = result.logEntries;
-
-    if (monitor.signal.aborted) {
-      throw new BuildError("BUILD_CANCELLED");
+      throw new UnrecoverableError(
+        "Build ownership could not be verified; reconciliation required.",
+      );
     }
 
-    await monitor.stop();
+    let ownership: ExecutionState;
 
-    if (monitor.signal.aborted) {
-      throw new BuildError("BUILD_CANCELLED");
+    try {
+      ownership =
+        await renewBuildLease(claim);
+    } catch {
+      if (executionMayHaveStarted) {
+        reportDeferredCleanup(
+          claim,
+          "LEASE_RENEWAL_FAILED",
+        );
+      }
+
+      throw new UnrecoverableError(
+        "Build lease verification failed; reconciliation required.",
+      );
+    }
+
+    if (
+      ownership === "lost" ||
+      ownership === "unavailable"
+    ) {
+      if (executionMayHaveStarted) {
+        reportDeferredCleanup(
+          claim,
+          "SETTLEMENT_OWNERSHIP_LOST",
+        );
+      }
+
+      throw new UnrecoverableError(
+        "Build execution ownership was lost.",
+      );
     }
 
     // ==============================================
     // Publish verified success
     // ==============================================
 
-    const settled = await settleSuccess(
-      claim,
-      {
-        imageTag: result.imageTag,
-        imageId: result.imageId,
-        imageDigest: result.imageDigest,
-        imageSizeBytes: result.imageSizeBytes,
-        platform: result.platform,
-        durationMs: result.durationMs,
-      },
-      result.logEntries,
-    );
+    if (
+      artifact &&
+      !executionFailure
+    ) {
+      if (
+        signal.aborted &&
+        ownership !== "cancelling"
+      ) {
+        reportDeferredCleanup(
+          claim,
+          "WORKER_INTERRUPTED_AFTER_BUILD",
+        );
 
-    if (settled === "succeeded") {
-      workerLogger.info(
-        {
-          deploymentId: payload.deploymentId,
-          buildId: claim.buildId,
-          imageTag: result.imageTag,
-          durationMs: result.durationMs,
-        },
-        "Deployment build succeeded",
+        throw new UnrecoverableError(
+          "Build completed during worker interruption; reconciliation required.",
+        );
+      }
+
+      let settled: SettlementResult;
+
+      try {
+        settled =
+          await settleSuccess(
+            claim,
+
+            artifact,
+
+            logs,
+          );
+      } catch {
+        /**
+         * A failed transaction response can represent
+         * an uncertain commit outcome.
+         *
+         * Never settle the same operation as failed
+         * or rebuild automatically from this catch.
+         */
+        reportDeferredCleanup(
+          claim,
+          "SUCCESS_SETTLEMENT_UNCERTAIN",
+        );
+
+        throw new UnrecoverableError(
+          "Build success settlement is uncertain.",
+        );
+      }
+
+      if (settled === "succeeded") {
+        workerLogger.info(
+          {
+            deploymentId:
+              payload.deploymentId,
+
+            buildId:
+              claim.buildId,
+
+            buildAttempt:
+              claim.buildAttempt,
+
+            imageTag:
+              artifact.imageTag,
+
+            durationMs:
+              artifact.durationMs,
+          },
+
+          "Deployment build succeeded",
+        );
+
+        return {
+          status: "succeeded",
+        };
+      }
+
+      if (settled === "cancelled") {
+        reportDeferredCleanup(
+          claim,
+          "CANCELLED_AFTER_BUILD_COMPLETION",
+        );
+
+        return {
+          status: "cancelled",
+        };
+      }
+
+      reportDeferredCleanup(
+        claim,
+        "STALE_SUCCESS_SETTLEMENT",
       );
 
-      return { status: "succeeded" };
+      throw new UnrecoverableError(
+        "Build success ownership was lost.",
+      );
     }
 
-    if (settled === "cancelled") {
-      workerLogger.warn({ deploymentId: payload.deploymentId, buildId: claim.buildId }, "Artifact cleanup deferred pending ownership verification");
-
-      return { status: "cancelled" };
-    }
-
-    // stale: a newer execution owns the build.
-    throw new TransientJobError(
-      "Build execution ownership was lost.",
-    );
-  } catch (error) {
-    await monitor.stop();
+    // ==============================================
+    // Publish verified failure
+    // ==============================================
 
     const buildError =
-      error instanceof BuildError
-        ? error
-        : new BuildError(
-            getBuildFailureCode(error),
-            buildFailureMessage(
-              getBuildFailureCode(error),
-            ),
-          );
-
-    if (monitor.state === "lost") {
-      logs = [];
-    }
-
-    const interrupted =
-      signal.aborted ||
-      monitor.state === "unavailable";
+      executionFailure ??
+      new BuildError(
+        "UNEXPECTED_BUILD_FAILURE",
+      );
 
     const retryable =
-      (buildError.retryable || interrupted) &&
-      hasBuildRetryBudget(job, claim.buildAttempt);
+      !executionMayHaveStarted &&
+      !signal.aborted &&
+      ownership === "active" &&
+      buildError.retryable &&
+      isRetryableBuildFailure(
+        buildError.code,
+      ) &&
+      hasBuildRetryBudget(
+        job,
+
+        claim.buildAttempt,
+      );
 
     let settled: SettlementResult;
 
     try {
       settled = await settleFailure(
         claim,
+
         buildError.code,
+
         retryable,
+
         logs,
+
+        executionMayHaveStarted,
       );
     } catch {
-      throw new TransientJobError(
-        "Build settlement is unavailable.",
+      if (executionMayHaveStarted) {
+        reportDeferredCleanup(
+          claim,
+          "FAILURE_SETTLEMENT_UNCERTAIN",
+        );
+      }
+
+      throw new UnrecoverableError(
+        "Build failure settlement is uncertain.",
       );
     }
 
     if (settled === "cancelled") {
-      if (imageTag) {
-        workerLogger.warn({ deploymentId: payload.deploymentId, buildId: claim.buildId }, "Artifact cleanup deferred pending ownership verification");
-      }
-
-      return { status: "cancelled" };
+      return {
+        status: "cancelled",
+      };
     }
 
     if (settled === "retry") {
-      if (imageTag) {
-        workerLogger.warn({ deploymentId: payload.deploymentId, buildId: claim.buildId }, "Artifact cleanup deferred pending ownership verification");
-      }
-
       throw new TransientJobError(
         `Build failed: ${buildError.code}`,
       );
     }
 
-    if (settled === "stale") {
-      return { status: "skipped" };
+    if (executionMayHaveStarted) {
+      reportDeferredCleanup(
+        claim,
+        "BUILD_EXECUTION_FAILED",
+      );
     }
 
-    if (imageTag) {
-      workerLogger.warn({ deploymentId: payload.deploymentId, buildId: claim.buildId }, "Artifact cleanup deferred pending ownership verification");
+    if (settled === "stale") {
+      throw new UnrecoverableError(
+        "Build settlement requires reconciliation.",
+      );
     }
 
     throw new UnrecoverableError(

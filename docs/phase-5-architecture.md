@@ -46,7 +46,7 @@ The Phase 5.2 checkpoint is:
 | Phase 5.2 — Queue and worker | Implemented |
 | Phase 5.3 — Source retrieval | Implemented; final review pending |
 | Phase 5.4 — Isolated build | Implemented; disabled by default |
-| Phase 5.5 — Container runtime | Not enabled |
+| Phase 5.5 — Container runtime | Implemented; disabled by default |
 | Phase 5.6 — Real-time logs | Planned |
 | Phase 5.7 — Health and rollback | Planned |
 | Phase 5.8 — GitHub webhooks | Planned |
@@ -571,6 +571,12 @@ implemented, and tested.
 If the required isolation cannot be established, execution
 must remain disabled.
 
+Phase 5.5 applies the same model to the container runtime: managed
+containers run read-only with dropped capabilities, resource caps,
+loopback-only published ports, and secrets injected out-of-band.
+The runtime remains disabled by default because the local Docker
+driver cannot enforce strong multi-tenant isolation.
+
 ## 16. Environment variable security
 
 Environment variable values are stored separately from
@@ -873,10 +879,27 @@ conditional and protected by execution ownership.
 A prepared source workspace is not authorization to execute
 repository-controlled code on the host.
 
-## 24. Known limitations
+## 24. Phase 5.5 runtime entry gate
 
-- Docker build execution remains disabled.
-- Container runtime execution remains disabled.
+The container runtime must not start until:
+
+- Deployment state is BUILD_SUCCEEDED.
+- A verified image artifact and immutable image id exist.
+- The build artifact ownership matches the deployment.
+- Tenant ownership is verified.
+- A fresh execution lease is acquired.
+- Runtime configuration is valid and the bind host is loopback.
+- The runtime encryption key is configured.
+- Required execution isolation is available.
+
+The transition from BUILD_SUCCEEDED to DEPLOYING must be
+conditional and protected by execution ownership. A verified image
+is not authorization to run untrusted repository code on the host.
+
+## 25. Known limitations
+
+- Docker build execution remains disabled by default.
+- Container runtime execution remains disabled by default.
 - Cancellation remains cooperative.
 - Prisma/Effect advisory remains unresolved.
 - Single active encryption-key configuration remains.
@@ -885,7 +908,7 @@ repository-controlled code on the host.
 - Deployment endpoint rate limiting requires verification.
 - Production-grade execution isolation is not established.
 
-## 25. Release policy
+## 26. Release policy
 
 Every milestone requires:
 

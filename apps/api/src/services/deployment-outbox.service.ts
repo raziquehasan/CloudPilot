@@ -4,6 +4,7 @@ import {
   QueueManager,
   type BuildJob,
   type DeploymentJob,
+  type RuntimeJob,
 } from "@cloudpilot/queue";
 
 export interface DeploymentOutboxPolicy {
@@ -18,7 +19,7 @@ interface ClaimedOutboxEvent {
   workspaceId: string;
   projectId: string;
   deploymentId: string;
-  eventType: "DEPLOYMENT_REQUESTED" | "BUILD_REQUESTED";
+  eventType: "DEPLOYMENT_REQUESTED" | "BUILD_REQUESTED" | "RUNTIME_REQUESTED";
   jobId: string;
   attemptCount: number;
   leaseToken: string;
@@ -181,6 +182,8 @@ export class DeploymentOutboxPublisher {
     try {
       if (event.eventType === "BUILD_REQUESTED") {
         await this.publishBuildEvent(event);
+      } else if (event.eventType === "RUNTIME_REQUESTED") {
+        await this.publishRuntimeEvent(event);
       } else {
         const payload: DeploymentJob = {
           kind: "deployment",
@@ -261,5 +264,45 @@ export class DeploymentOutboxPublisher {
     };
 
     await this.queueManager.addJob("build", payload, event.jobId);
+  }
+
+  /**
+   * Publish a runtime deployment job. The payload is derived
+   * from authoritative database state and contains identifiers
+   * only — never credentials, decrypted environment variables,
+   * or filesystem paths.
+   */
+  private async publishRuntimeEvent(
+    event: ClaimedOutboxEvent,
+  ): Promise<void> {
+    const build = await this.database.deploymentBuild.findFirst({
+      where: {
+        workspaceId: event.workspaceId,
+        projectId: event.projectId,
+        deploymentId: event.deploymentId,
+        status: "SUCCEEDED",
+      },
+      select: { id: true },
+      orderBy: { buildAttempt: "desc" },
+    });
+
+    if (!build) {
+      // No successful build: leave the event for retry rather
+      // than publishing an invalid runtime job.
+      throw new Error("Runtime deployment has no verified build");
+    }
+
+    const payload: RuntimeJob = {
+      kind: "runtime",
+      workspaceId: event.workspaceId,
+      projectId: event.projectId,
+      deploymentId: event.deploymentId,
+      runtimeInstanceId: event.id,
+      buildId: build.id,
+      action: "deploy",
+      correlationId: event.id,
+    };
+
+    await this.queueManager.addJob("runtime", payload, event.jobId);
   }
 }

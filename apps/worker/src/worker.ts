@@ -33,8 +33,17 @@ import {
 } from "./processors/build.processor.js";
 
 import {
+  processRuntimeJob,
+  reconcileRuntimeInstances,
+} from "./processors/runtime.processor.js";
+
+import {
   BuildKitExecutor,
 } from "./build/buildkit-client.js";
+
+import {
+  DockerRuntimeExecutor,
+} from "./runtime/docker-runtime-client.js";
 
 // ==================================================
 // Constants
@@ -75,6 +84,18 @@ let cleanupTimer: Timer | undefined;
 let heartbeatTask: Promise<void> | null = null;
 
 let maintenanceTask: Promise<void> | null = null;
+
+let workspaceStorageAvailable = false;
+
+async function refreshWorkspaceStorage(): Promise<void> {
+  try {
+    await workspaceManager.ensureRoot();
+
+    workspaceStorageAvailable = true;
+  } catch {
+    workspaceStorageAvailable = false;
+  }
+}
 
 // ==================================================
 // Shared dependencies
@@ -180,6 +201,61 @@ const buildQueueManager = workerEnv.BUILD_ENABLED
 
 const buildExecutor = workerEnv.BUILD_ENABLED
   ? new BuildKitExecutor()
+  : null;
+
+// ==================================================
+// Runtime queue manager
+// ==================================================
+//
+// Container execution is long-running and uses a dedicated
+// execution timeout derived from RUNTIME_STARTUP_TIMEOUT_MS.
+// The runtime queue is only created when runtime execution
+// is enabled.
+// ==================================================
+
+const RUNTIME_QUEUE_TIMEOUT_MARGIN_MS = 120_000;
+
+const runtimeExecutionTimeoutMs = Math.max(
+  workerEnv.QUEUE_EXECUTION_TIMEOUT_MS,
+
+  workerEnv.RUNTIME_STARTUP_TIMEOUT_MS +
+    RUNTIME_QUEUE_TIMEOUT_MARGIN_MS,
+);
+
+const runtimeQueueManager = workerEnv.RUNTIME_ENABLED
+  ? new QueueManager(
+      workerConnection,
+
+      workerConnection,
+
+      {
+        attempts:
+          workerEnv.QUEUE_JOB_ATTEMPTS,
+
+        backoffMs:
+          workerEnv.QUEUE_BACKOFF_MS,
+
+        completedRetention:
+          workerEnv.QUEUE_COMPLETED_RETENTION,
+
+        failedRetention:
+          workerEnv.QUEUE_FAILED_RETENTION,
+
+        executionTimeoutMs:
+          runtimeExecutionTimeoutMs,
+
+        backoffJitter:
+          workerEnv.QUEUE_BACKOFF_JITTER,
+      },
+
+      false,
+
+      workerEnv.QUEUE_PREFIX,
+    )
+  : null;
+
+const runtimeExecutor = workerEnv.RUNTIME_ENABLED
+  ? new DockerRuntimeExecutor()
   : null;
 
 // ==================================================
@@ -540,6 +616,79 @@ const buildWorker =
     : null;
 
 // ==================================================
+// Runtime queue worker
+// ==================================================
+
+const runtimeWorker =
+  runtimeQueueManager && runtimeExecutor
+    ? runtimeQueueManager.createWorker(
+        QUEUE_NAMES.runtime,
+
+        async (
+          job: Job<QueueJob>,
+          _token,
+          signal,
+        ) => {
+          const parsed =
+            queuePayloadSchemas.runtime.safeParse(
+              job.data,
+            );
+
+          if (!parsed.success) {
+            workerLogger.warn(
+              {
+                workerId,
+
+                jobId: job.id,
+
+                issueCount:
+                  parsed.error.issues.length,
+              },
+
+              "Invalid runtime job payload",
+            );
+
+            throw new UnrecoverableError(
+              "Invalid runtime job payload.",
+            );
+          }
+
+          const jobSignal =
+            createJobSignal(signal);
+
+          workerLogger.info(
+            {
+              workerId,
+
+              jobId: job.id,
+
+              deploymentId:
+                parsed.data.deploymentId,
+
+              attempts: job.attemptsStarted,
+            },
+
+            "Container runtime job started",
+          );
+
+          return processRuntimeJob(
+            job,
+
+            parsed.data,
+
+            jobSignal,
+
+            {
+              executor: runtimeExecutor,
+            },
+          );
+        },
+
+        workerEnv.RUNTIME_MAX_CONCURRENCY,
+      )
+    : null;
+
+// ==================================================
 // Worker event handlers
 // ==================================================
 
@@ -735,6 +884,70 @@ buildWorker?.on("error", (error) => {
 });
 
 // ==================================================
+// Runtime worker event handlers
+// ==================================================
+
+runtimeWorker?.on("completed", (job) => {
+  workerLogger.info(
+    {
+      workerId,
+
+      jobId: job.id,
+
+      queue: QUEUE_NAMES.runtime,
+    },
+
+    "Container runtime job completed",
+  );
+});
+
+runtimeWorker?.on("failed", (job, error) => {
+  workerLogger.warn(
+    {
+      workerId,
+
+      jobId: job?.id,
+
+      queue: QUEUE_NAMES.runtime,
+
+      attemptsMade: job?.attemptsMade,
+
+      ...sanitizedError(error),
+    },
+
+    "Container runtime job failed",
+  );
+});
+
+runtimeWorker?.on("stalled", (jobId) => {
+  workerLogger.warn(
+    {
+      workerId,
+
+      jobId,
+
+      queue: QUEUE_NAMES.runtime,
+    },
+
+    "Runtime queue job stalled",
+  );
+});
+
+runtimeWorker?.on("error", (error) => {
+  workerLogger.error(
+    {
+      workerId,
+
+      queue: QUEUE_NAMES.runtime,
+
+      ...sanitizedError(error),
+    },
+
+    "Runtime worker error",
+  );
+});
+
+// ==================================================
 // Worker readiness
 // ==================================================
 
@@ -777,6 +990,23 @@ function isBuildAvailable(): boolean {
   );
 }
 
+function isRuntimeAvailable(): boolean {
+  if (
+    !workerEnv.RUNTIME_ENABLED ||
+    !runtimeWorker ||
+    shuttingDown ||
+    !startupCompleted ||
+    workerConnection.status !== "ready"
+  ) {
+    return false;
+  }
+
+  return (
+    runtimeWorker.isRunning() &&
+    !runtimeWorker.isPaused()
+  );
+}
+
 // ==================================================
 // Worker heartbeat publication
 // ==================================================
@@ -813,14 +1043,27 @@ async function publishHeartbeat(
             isDeploymentWorker &&
             sourceRetrievalConfigured,
 
+          workspaceStorage:
+            isDeploymentWorker &&
+            workspaceStorageAvailable,
+
           // Phase 5.4 adds isolated Docker image builds.
-          // Container execution remains disabled.
 
           dockerBuild:
             isDeploymentWorker &&
             isBuildAvailable(),
 
-          containerExecution: false,
+          // Phase 5.5 adds secure container execution.
+          // Disabled by default; untrusted workloads remain
+          // unsupported.
+
+          containerExecution:
+            isDeploymentWorker &&
+            isRuntimeAvailable(),
+
+          containerRuntime:
+            isDeploymentWorker &&
+            isRuntimeAvailable(),
         },
 
         startupAt,
@@ -869,6 +1112,8 @@ function refreshHeartbeats(): Promise<void> {
     if (workerConnection.status !== "ready") {
       return;
     }
+
+    await refreshWorkspaceStorage();
 
     await Promise.all([
       publishHeartbeat(
@@ -1079,7 +1324,7 @@ async function start(): Promise<void> {
 
       dockerBuild: isBuildAvailable(),
 
-      containerExecution: false,
+      containerExecution: isRuntimeAvailable(),
     },
 
     "CloudPilot worker starting",
@@ -1095,6 +1340,10 @@ async function start(): Promise<void> {
 
     ...(buildWorker
       ? [buildWorker.waitUntilReady()]
+      : []),
+
+    ...(runtimeWorker
+      ? [runtimeWorker.waitUntilReady()]
       : []),
   ]);
 
@@ -1123,6 +1372,35 @@ async function start(): Promise<void> {
 
   scheduleWorkspaceCleanup();
 
+  if (runtimeWorker) {
+    try {
+      const result =
+        await reconcileRuntimeInstances();
+
+      if (result.recovered > 0) {
+        workerLogger.info(
+          {
+            workerId,
+
+            recovered: result.recovered,
+          },
+
+          "Runtime reconciliation recovered abandoned instances",
+        );
+      }
+    } catch (error) {
+      workerLogger.warn(
+        {
+          workerId,
+
+          ...sanitizedError(error),
+        },
+
+        "Runtime reconciliation failed",
+      );
+    }
+  }
+
   if (!sourceRetrievalConfigured) {
     workerLogger.warn(
       {
@@ -1144,6 +1422,10 @@ async function start(): Promise<void> {
         isWorkerAvailable("deployment"),
 
       sourceRetrievalConfigured,
+
+      dockerBuild: isBuildAvailable(),
+
+      containerRuntime: isRuntimeAvailable(),
     },
 
     "CloudPilot worker startup completed",
@@ -1324,6 +1606,10 @@ function shutdown(
               ...(buildWorker
                 ? [buildWorker.pause(true)]
                 : []),
+
+              ...(runtimeWorker
+                ? [runtimeWorker.pause(true)]
+                : []),
             ]);
 
           if (
@@ -1355,6 +1641,10 @@ function shutdown(
 
           if (buildQueueManager) {
             await buildQueueManager.close();
+          }
+
+          if (runtimeQueueManager) {
+            await runtimeQueueManager.close();
           }
         },
       );

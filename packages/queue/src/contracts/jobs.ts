@@ -13,6 +13,8 @@
 
 import { z } from "zod";
 
+import { runtimeJobSchema } from "./runtime.js";
+
 // ==================================================
 // Shared validation schemas
 // ==================================================
@@ -207,6 +209,7 @@ export const queueJobKinds = Object.freeze([
   "diagnostic",
   "deployment",
   "build",
+  "runtime",
   "rollback",
 ] as const);
 
@@ -245,6 +248,7 @@ export const queueJobSchema = z.discriminatedUnion(
     diagnosticJobSchema,
     deploymentJobSchema,
     buildJobSchema,
+    runtimeJobSchema,
     rollbackJobSchema,
   ],
 );
@@ -283,6 +287,7 @@ export const queuePayloadSchemas = Object.freeze({
   diagnostic: diagnosticJobSchema,
   deployment: deploymentJobSchema,
   build: buildJobSchema,
+  runtime: runtimeJobSchema,
   rollback: rollbackJobSchema,
 } satisfies Record<QueueJobKind, z.ZodType>);
 

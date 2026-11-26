@@ -105,6 +105,7 @@ enum DeploymentFailureCode {
   BUILD_FAILED
   DEPLOY_FAILED
   HEALTH_CHECK_FAILED
+  RUNTIME_FAILED
   TIMEOUT
   CANCELLED
   UNKNOWN
@@ -120,6 +121,7 @@ enum DeploymentOutboxStatus {
 enum DeploymentOutboxEventType {
   DEPLOYMENT_REQUESTED
   BUILD_REQUESTED
+  RUNTIME_REQUESTED
 }
 
 enum DeploymentSourceStatus {
@@ -383,6 +385,7 @@ model Deployment {
   outboxEvents   DeploymentOutboxEvent[]
   sourcePreparation DeploymentSourcePreparation?
   deploymentBuilds  DeploymentBuild[]
+  runtimeInstances  DeploymentRuntimeInstance[]
   createdAt      DateTime                @default(now())
   updatedAt      DateTime                @updatedAt
   startedAt      DateTime?
@@ -485,6 +488,7 @@ model DeploymentBuild {
   updatedAt            DateTime                  @updatedAt
   deployment           Deployment                @relation(fields: [workspaceId, projectId, deploymentId], references: [workspaceId, projectId, id], onDelete: Cascade)
   logs                 DeploymentBuildLog[]
+  runtimeInstances DeploymentRuntimeInstance[]
 
   @@unique([workspaceId, projectId, deploymentId, buildAttempt])
   @@unique([workspaceId, projectId, deploymentId, id])
@@ -576,4 +580,56 @@ model AuditLog {
   @@index([workspaceId, createdAt])
   @@index([workspaceId, entityType, entityId])
   @@map("audit_logs")
+}
+
+enum DeploymentRuntimeStatus {
+  QUEUED
+  CREATING
+  STARTING
+  RUNNING
+  STOPPED
+  FAILED
+  CANCELLED
+}
+
+model DeploymentRuntimeInstance {
+  id                   String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId          String                  @db.Uuid
+  projectId            String                  @db.Uuid
+  deploymentId         String                  @db.Uuid
+  buildId              String                  @db.Uuid
+  runtimeAttempt       Int                     @default(1)
+  status               DeploymentRuntimeStatus @default(QUEUED)
+  containerId          String?                 @db.VarChar(255)
+  containerName        String?                 @db.VarChar(255)
+  imageId              String?                 @db.VarChar(255)
+  imageTag             String?                 @db.VarChar(255)
+  containerPort        Int?
+  hostPort             Int?
+  hostBindingAddress   String?                 @db.VarChar(64)
+  networkName          String?                 @db.VarChar(255)
+  cpuLimit             Int?
+  memoryLimitMb        Int?
+  pidsLimit            Int?
+  restartCount         Int                     @default(0)
+  failureCode          String?                 @db.VarChar(80)
+  failureMessage       String?                 @db.Text
+  executionLeaseToken  String?                 @db.Uuid
+  executionLeaseExpiresAt DateTime?
+  startedAt            DateTime?
+  readyAt              DateTime?
+  stoppedAt            DateTime?
+  exitCode             Int?
+  createdAt            DateTime                @default(now())
+  updatedAt            DateTime                @updatedAt
+  deployment Deployment @relation(fields: [workspaceId, projectId, deploymentId], references: [workspaceId, projectId, id], onDelete: Cascade, onUpdate: Cascade, map: "dri_deployment_fkey")
+  build DeploymentBuild @relation(fields: [workspaceId, projectId, deploymentId, buildId], references: [workspaceId, projectId, deploymentId, id], onDelete: NoAction, onUpdate: Cascade, map: "dri_build_fkey")
+
+  @@unique([workspaceId, projectId, deploymentId, runtimeAttempt], map: "dri_ws_proj_dep_attempt_key")
+  @@unique([workspaceId, projectId, deploymentId, id], map: "dri_ws_proj_dep_id_key")
+  @@index([workspaceId, deploymentId, createdAt], map: "dri_ws_dep_created_idx")
+  @@index([status, createdAt], map: "dri_status_created_idx")
+  @@index([status, executionLeaseExpiresAt], map: "dri_status_lease_expires_idx")
+  @@index([workspaceId, projectId, deploymentId, buildId], map: "dri_ws_proj_dep_build_idx")
+  @@map("deployment_runtime_instances")
 }

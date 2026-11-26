@@ -3,6 +3,7 @@ import {
   createProducerConnection,
   parseQueueEnv,
   type DiagnosticJob,
+  type RuntimeJob,
 } from "@cloudpilot/queue";
 import { env } from "../config/env.js";
 
@@ -38,6 +39,28 @@ export async function removeQueuedDeploymentJob(jobId: string): Promise<boolean>
   if (!["waiting", "delayed", "paused", "prioritized"].includes(state)) return false;
   await job.remove();
   return true;
+}
+
+export async function enqueueRuntimeLifecycleJob(input: {
+  workspaceId: string;
+  projectId: string;
+  deploymentId: string;
+  runtimeInstanceId: string;
+  buildId: string;
+  action: "start" | "stop" | "restart";
+  jobId: string;
+}): Promise<void> {
+  const payload: RuntimeJob = {
+    kind: "runtime",
+    workspaceId: input.workspaceId,
+    projectId: input.projectId,
+    deploymentId: input.deploymentId,
+    runtimeInstanceId: input.runtimeInstanceId,
+    buildId: input.buildId,
+    action: input.action,
+    correlationId: input.jobId,
+  };
+  await queueManager.addJob("runtime", payload, QueueManager.validateJobId(input.jobId));
 }
 
 export async function disconnectQueueProducer(): Promise<void> {

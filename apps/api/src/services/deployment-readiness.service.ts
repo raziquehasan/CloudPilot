@@ -22,8 +22,10 @@ function workerSummary(workers: WorkerHeartbeat[]) {
     capabilities: {
       deploymentQueue: availableWorkers.some((worker) => worker.capabilities.deploymentQueue),
       sourceRetrieval: availableWorkers.some((worker) => worker.capabilities.sourceRetrieval),
+      workspaceStorage: availableWorkers.some((worker) => worker.capabilities.workspaceStorage),
       dockerBuild: availableWorkers.some((worker) => worker.capabilities.dockerBuild),
       containerExecution: availableWorkers.some((worker) => worker.capabilities.containerExecution),
+      containerRuntime: availableWorkers.some((worker) => worker.capabilities.containerRuntime),
     },
     lastHeartbeatAt: workers
       .map((worker) => worker.lastHeartbeatAt)
@@ -156,6 +158,7 @@ export async function getDeploymentReadiness(workspaceId: string, projectId: str
   const sourceRetrievalAvailable = deploymentWorker.capabilities.sourceRetrieval;
   const dockerBuildAvailable = deploymentWorker.capabilities.dockerBuild;
   const containerExecutionAvailable = deploymentWorker.capabilities.containerExecution;
+  const containerRuntimeAvailable = deploymentWorker.capabilities.containerRuntime;
 
   return {
     postgres: { available: database.healthy },
@@ -191,6 +194,17 @@ export async function getDeploymentReadiness(workspaceId: string, projectId: str
       containerDeployment: {
         available: containerExecutionAvailable,
         enabled: false,
+      },
+    },
+    runtime: {
+      // Container execution is implemented but disabled by
+      // default. A successful build does not imply the
+      // application is running.
+      workerCapable: containerRuntimeAvailable,
+      available: containerRuntimeAvailable && workspaceStorageAvailable,
+      containerExecution: {
+        available: containerExecutionAvailable,
+        enabled: containerRuntimeAvailable,
       },
     },
     execution: {
