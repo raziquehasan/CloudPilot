@@ -3,6 +3,8 @@ export type ProjectDeployment = {
   status: string;
   environment: string;
   triggerSource: string;
+  requestedBranch: string | null;
+  commitSha: string | null;
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;

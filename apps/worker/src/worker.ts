@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+
 import {
   QUEUE_NAMES,
   QueueManager,
@@ -8,179 +9,1247 @@ import {
   type QueueJob,
   queuePayloadSchemas,
 } from "@cloudpilot/queue";
-import type { Job } from "bullmq";
-import { UnrecoverableError } from "bullmq";
+
+import {
+  UnrecoverableError,
+  type Job,
+} from "bullmq";
+
 import { workerEnv } from "./config/env.js";
 import { workerLogger } from "./config/logger.js";
-import { processDiagnosticJob } from "./processors/diagnostic.processor.js";
-import { processDeploymentJob } from "./processors/deployment.processor.js";
 
-const workerConnection = createWorkerConnection(workerEnv.REDIS_URL);
+import {
+  processDiagnosticJob,
+} from "./processors/diagnostic.processor.js";
+
+import {
+  createWorkerGitHubAuth,
+  createWorkspaceManager,
+  processDeploymentJob,
+} from "./processors/deployment.processor.js";
+
+// ==================================================
+// Constants
+// ==================================================
+
+const WORKER_VERSION = "0.1.0";
+
+const SHUTDOWN_TIMEOUT_MS = 30_000;
+
+const HEARTBEAT_SHUTDOWN_TIMEOUT_MS = 2_000;
+
+type WorkerRole = "diagnostic" | "deployment";
+
+type Timer = ReturnType<typeof setTimeout>;
+
+// ==================================================
+// Worker identity and lifecycle
+// ==================================================
+
 const workerId = `worker-${randomUUID()}`;
+
 const startupAt = new Date().toISOString();
-const heartbeatOptions = {
-  prefix: workerEnv.QUEUE_PREFIX,
-  ttlSeconds: workerEnv.WORKER_HEARTBEAT_TTL_SECONDS,
-};
-const queueManager = new QueueManager(workerConnection, workerConnection, {
-  attempts: workerEnv.QUEUE_JOB_ATTEMPTS,
-  backoffMs: workerEnv.QUEUE_BACKOFF_MS,
-  completedRetention: workerEnv.QUEUE_COMPLETED_RETENTION,
-  failedRetention: workerEnv.QUEUE_FAILED_RETENTION,
-  executionTimeoutMs: workerEnv.QUEUE_EXECUTION_TIMEOUT_MS,
-  backoffJitter: workerEnv.QUEUE_BACKOFF_JITTER,
-}, false, workerEnv.QUEUE_PREFIX);
+
+const shutdownController = new AbortController();
+
 let shuttingDown = false;
 
-function publishHeartbeat(role: "diagnostic" | "deployment", available: boolean, draining: boolean): void {
-  const isDeploymentWorker = role === "deployment";
-  void publishWorkerHeartbeat(workerConnection, heartbeatOptions, {
-    workerId,
-    role,
-    version: "0.1.0",
-    capabilities: {
-      diagnostic: !isDeploymentWorker,
-      deploymentQueue: isDeploymentWorker,
-      sourceRetrieval: false,
-      dockerBuild: false,
-      containerExecution: false,
-    },
-    startupAt,
-    lastHeartbeatAt: new Date().toISOString(),
-    available,
-    draining,
-    concurrency: isDeploymentWorker
-      ? workerEnv.DEPLOYMENT_WORKER_CONCURRENCY
-      : workerEnv.WORKER_CONCURRENCY,
-  }).catch((error: unknown) => {
-    workerLogger.warn(
-      { role, errorName: error instanceof Error ? error.name : "UnknownError" },
-      "Worker heartbeat update failed",
-    );
-  });
+let startupCompleted = false;
+
+let shutdownExitCode = 0;
+
+let shutdownPromise: Promise<void> | null = null;
+
+let heartbeatTimer: Timer | undefined;
+
+let cleanupTimer: Timer | undefined;
+
+let heartbeatTask: Promise<void> | null = null;
+
+let maintenanceTask: Promise<void> | null = null;
+
+// ==================================================
+// Shared dependencies
+// ==================================================
+
+const workerConnection = createWorkerConnection(
+  workerEnv.REDIS_URL,
+);
+
+const sourceAuth = createWorkerGitHubAuth();
+
+const workspaceManager = createWorkspaceManager();
+
+const sourceRetrievalConfigured =
+  sourceAuth !== null;
+
+const heartbeatOptions = {
+  prefix: workerEnv.QUEUE_PREFIX,
+
+  ttlSeconds:
+    workerEnv.WORKER_HEARTBEAT_TTL_SECONDS,
+};
+
+const queueManager = new QueueManager(
+  workerConnection,
+
+  workerConnection,
+
+  {
+    attempts:
+      workerEnv.QUEUE_JOB_ATTEMPTS,
+
+    backoffMs:
+      workerEnv.QUEUE_BACKOFF_MS,
+
+    completedRetention:
+      workerEnv.QUEUE_COMPLETED_RETENTION,
+
+    failedRetention:
+      workerEnv.QUEUE_FAILED_RETENTION,
+
+    executionTimeoutMs:
+      workerEnv.QUEUE_EXECUTION_TIMEOUT_MS,
+
+    backoffJitter:
+      workerEnv.QUEUE_BACKOFF_JITTER,
+  },
+
+  false,
+
+  workerEnv.QUEUE_PREFIX,
+);
+
+// ==================================================
+// Sanitized error utilities
+// ==================================================
+
+function getErrorName(error: unknown): string {
+  if (error instanceof Error) {
+    const name = error.name;
+
+    if (/^[A-Za-z0-9_-]{1,80}$/u.test(name)) {
+      return name;
+    }
+  }
+
+  return "UnknownError";
 }
 
-workerConnection.on("error", (error) => {
-  workerLogger.error({ err: error }, "Worker Redis connection error");
+function getErrorCode(
+  error: unknown,
+): string | undefined {
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    typeof error.code === "string" &&
+    /^[A-Za-z0-9_-]{1,80}$/u.test(error.code)
+  ) {
+    return error.code;
+  }
+
+  return undefined;
+}
+
+function sanitizedError(error: unknown) {
+  return {
+    errorName: getErrorName(error),
+
+    errorCode: getErrorCode(error),
+  };
+}
+
+// ==================================================
+// Bounded asynchronous operations
+// ==================================================
+
+async function withTimeout<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  message: string,
+): Promise<T> {
+  let timer: Timer | undefined;
+
+  try {
+    return await Promise.race([
+      operation,
+
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(message));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+// ==================================================
+// Cancellation propagation
+// ==================================================
+
+function createJobSignal(
+  jobSignal?: AbortSignal,
+): AbortSignal {
+  if (!jobSignal) {
+    return shutdownController.signal;
+  }
+
+  return AbortSignal.any([
+    jobSignal,
+
+    shutdownController.signal,
+  ]);
+}
+
+// ==================================================
+// Redis connection monitoring
+// ==================================================
+
+workerConnection.on("error", (error: unknown) => {
+  workerLogger.error(
+    {
+      workerId,
+
+      ...sanitizedError(error),
+    },
+
+    "Worker Redis connection error",
+  );
 });
 
 workerConnection.on("ready", () => {
-  workerLogger.info("Worker Redis connection ready");
+  workerLogger.info(
+    {
+      workerId,
+    },
+
+    "Worker Redis connection ready",
+  );
+
+  if (startupCompleted && !shuttingDown) {
+    void refreshHeartbeats();
+  }
 });
+
+workerConnection.on("reconnecting", () => {
+  workerLogger.warn(
+    {
+      workerId,
+    },
+
+    "Worker Redis connection reconnecting",
+  );
+});
+
+workerConnection.on("end", () => {
+  if (!shuttingDown) {
+    workerLogger.warn(
+      {
+        workerId,
+      },
+
+      "Worker Redis connection ended",
+    );
+  }
+});
+
+// ==================================================
+// Diagnostic queue worker
+// ==================================================
 
 const worker = queueManager.createWorker(
   QUEUE_NAMES.diagnostic,
-  async (job: Job<QueueJob>, _token, signal) => {
-    const parsed = queuePayloadSchemas.diagnostic.safeParse(job.data);
+
+  async (
+    job: Job<QueueJob>,
+    _token,
+    signal,
+  ) => {
+    const parsed =
+      queuePayloadSchemas.diagnostic.safeParse(
+        job.data,
+      );
+
     if (!parsed.success) {
+      workerLogger.warn(
+        {
+          workerId,
+
+          jobId: job.id,
+
+          issueCount:
+            parsed.error.issues.length,
+        },
+
+        "Invalid diagnostic job payload",
+      );
+
       throw new UnrecoverableError(
-        `Invalid diagnostic job payload: ${parsed.error.issues.map((issue) => issue.path.join(".")).join(", ")}`,
+        "Invalid diagnostic job payload.",
       );
     }
-    const result = await processDiagnosticJob(job as Job<DiagnosticJob>, signal);
+
+    const jobSignal = createJobSignal(signal);
+
+    if (jobSignal.aborted) {
+      throw new Error(
+        "Diagnostic execution was interrupted.",
+      );
+    }
+
+    const result = await processDiagnosticJob(
+      job as Job<DiagnosticJob>,
+
+      jobSignal,
+    );
+
     workerLogger.info(
-      { jobId: job.id, correlationId: job.data.kind === "diagnostic" ? job.data.correlationId : undefined, attempts: job.attemptsStarted },
+      {
+        workerId,
+
+        jobId: job.id,
+
+        correlationId:
+          parsed.data.correlationId,
+
+        attempts: job.attemptsStarted,
+      },
+
       "Diagnostic job completed",
     );
+
     return result;
   },
+
   workerEnv.WORKER_CONCURRENCY,
 );
-const deploymentWorker = queueManager.createWorker(
-  QUEUE_NAMES.deployment,
-  async (job: Job<QueueJob>, _token, signal) => {
-    const parsed = queuePayloadSchemas.deployment.safeParse(job.data);
-    if (!parsed.success) {
-      throw new UnrecoverableError(
-        `Invalid deployment job payload: ${parsed.error.issues.map((issue) => issue.path.join(".")).join(", ")}`,
+
+// ==================================================
+// Deployment queue worker
+// ==================================================
+
+const deploymentWorker =
+  queueManager.createWorker(
+    QUEUE_NAMES.deployment,
+
+    async (
+      job: Job<QueueJob>,
+      _token,
+      signal,
+    ) => {
+      const parsed =
+        queuePayloadSchemas.deployment.safeParse(
+          job.data,
+        );
+
+      if (!parsed.success) {
+        workerLogger.warn(
+          {
+            workerId,
+
+            jobId: job.id,
+
+            issueCount:
+              parsed.error.issues.length,
+          },
+
+          "Invalid deployment job payload",
+        );
+
+        throw new UnrecoverableError(
+          "Invalid deployment job payload.",
+        );
+      }
+
+      const jobSignal =
+        createJobSignal(signal);
+
+      workerLogger.info(
+        {
+          workerId,
+
+          jobId: job.id,
+
+          deploymentId:
+            parsed.data.deploymentId,
+
+          attempts: job.attemptsStarted,
+        },
+
+        "Deployment infrastructure job started",
       );
-    }
-    return processDeploymentJob(job, parsed.data, signal ?? new AbortController().signal);
-  },
-  workerEnv.DEPLOYMENT_WORKER_CONCURRENCY,
-);
+
+      return processDeploymentJob(
+        job,
+
+        parsed.data,
+
+        jobSignal,
+
+        {
+          auth: sourceAuth,
+
+          workspace: workspaceManager,
+        },
+      );
+    },
+
+    workerEnv.DEPLOYMENT_WORKER_CONCURRENCY,
+  );
+
+// ==================================================
+// Worker event handlers
+// ==================================================
 
 worker.on("completed", (job) => {
-  workerLogger.info({ jobId: job.id, queue: QUEUE_NAMES.diagnostic }, "Job completed");
+  workerLogger.info(
+    {
+      workerId,
+
+      jobId: job.id,
+
+      queue: QUEUE_NAMES.diagnostic,
+    },
+
+    "Diagnostic queue job completed",
+  );
 });
 
 worker.on("failed", (job, error) => {
   workerLogger.warn(
-    { jobId: job?.id, queue: QUEUE_NAMES.diagnostic, errorName: error.name },
-    "Job failed",
+    {
+      workerId,
+
+      jobId: job?.id,
+
+      queue: QUEUE_NAMES.diagnostic,
+
+      attemptsMade: job?.attemptsMade,
+
+      ...sanitizedError(error),
+    },
+
+    "Diagnostic queue job failed",
   );
 });
 
 worker.on("stalled", (jobId) => {
-  workerLogger.warn({ jobId, queue: QUEUE_NAMES.diagnostic }, "Job stalled");
+  workerLogger.warn(
+    {
+      workerId,
+
+      jobId,
+
+      queue: QUEUE_NAMES.diagnostic,
+    },
+
+    "Diagnostic queue job stalled",
+  );
 });
 
 worker.on("error", (error) => {
-  workerLogger.error({ err: error }, "Worker error");
+  workerLogger.error(
+    {
+      workerId,
+
+      queue: QUEUE_NAMES.diagnostic,
+
+      ...sanitizedError(error),
+    },
+
+    "Diagnostic worker error",
+  );
 });
 
+// ==================================================
+// Deployment worker event handlers
+// ==================================================
+
 deploymentWorker.on("completed", (job) => {
-  workerLogger.info({ jobId: job.id, queue: QUEUE_NAMES.deployment }, "Deployment infrastructure job completed");
+  workerLogger.info(
+    {
+      workerId,
+
+      jobId: job.id,
+
+      queue: QUEUE_NAMES.deployment,
+    },
+
+    "Deployment infrastructure job completed",
+  );
 });
 
 deploymentWorker.on("failed", (job, error) => {
   workerLogger.warn(
-    { jobId: job?.id, queue: QUEUE_NAMES.deployment, errorName: error.name },
+    {
+      workerId,
+
+      jobId: job?.id,
+
+      queue: QUEUE_NAMES.deployment,
+
+      attemptsMade: job?.attemptsMade,
+
+      configuredAttempts:
+        job?.opts.attempts,
+
+      ...sanitizedError(error),
+    },
+
     "Deployment infrastructure job failed",
   );
 });
 
 deploymentWorker.on("stalled", (jobId) => {
-  workerLogger.warn({ jobId, queue: QUEUE_NAMES.deployment }, "Deployment job stalled");
+  workerLogger.warn(
+    {
+      workerId,
+
+      jobId,
+
+      queue: QUEUE_NAMES.deployment,
+    },
+
+    "Deployment queue job stalled",
+  );
 });
 
 deploymentWorker.on("error", (error) => {
-  workerLogger.error({ err: error }, "Deployment worker error");
+  workerLogger.error(
+    {
+      workerId,
+
+      queue: QUEUE_NAMES.deployment,
+
+      ...sanitizedError(error),
+    },
+
+    "Deployment worker error",
+  );
 });
 
-publishHeartbeat("diagnostic", true, false);
-publishHeartbeat("deployment", true, false);
-const heartbeatTimer = setInterval(() => {
-  const available = workerConnection.status === "ready" && !shuttingDown;
-  publishHeartbeat("diagnostic", available, shuttingDown);
-  publishHeartbeat("deployment", available, shuttingDown);
-}, workerEnv.WORKER_HEARTBEAT_INTERVAL_MS);
-heartbeatTimer.unref();
+// ==================================================
+// Worker readiness
+// ==================================================
 
-async function shutdown(signal: string): Promise<void> {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  workerLogger.info({ signal }, "Worker graceful shutdown started");
-  clearInterval(heartbeatTimer);
-  publishHeartbeat("diagnostic", false, true);
-  publishHeartbeat("deployment", false, true);
+function isWorkerAvailable(
+  role: WorkerRole,
+): boolean {
+  if (
+    shuttingDown ||
+    !startupCompleted ||
+    workerConnection.status !== "ready"
+  ) {
+    return false;
+  }
 
-  const timeout = setTimeout(() => {
-    workerLogger.error({ signal }, "Worker graceful shutdown timeout exceeded");
-    process.exit(1);
-  }, 10000);
-  timeout.unref();
+  const currentWorker =
+    role === "deployment"
+      ? deploymentWorker
+      : worker;
+
+  return (
+    currentWorker.isRunning() &&
+    !currentWorker.isPaused()
+  );
+}
+
+// ==================================================
+// Worker heartbeat publication
+// ==================================================
+
+async function publishHeartbeat(
+  role: WorkerRole,
+  available: boolean,
+  draining: boolean,
+): Promise<void> {
+  const isDeploymentWorker =
+    role === "deployment";
 
   try {
-    await queueManager.close();
-    await workerConnection.quit();
-    clearTimeout(timeout);
-    workerLogger.info({ signal }, "Worker graceful shutdown completed");
-    process.exit(0);
+    await publishWorkerHeartbeat(
+      workerConnection,
+
+      heartbeatOptions,
+
+      {
+        workerId,
+
+        role,
+
+        version: WORKER_VERSION,
+
+        capabilities: {
+          diagnostic:
+            !isDeploymentWorker,
+
+          deploymentQueue:
+            isDeploymentWorker,
+
+          sourceRetrieval:
+            isDeploymentWorker &&
+            sourceRetrievalConfigured,
+
+          // Phase 5.3 only prepares source code.
+          // Docker and container execution remain disabled.
+
+          dockerBuild: false,
+
+          containerExecution: false,
+        },
+
+        startupAt,
+
+        lastHeartbeatAt:
+          new Date().toISOString(),
+
+        available,
+
+        draining,
+
+        concurrency: isDeploymentWorker
+          ? workerEnv.DEPLOYMENT_WORKER_CONCURRENCY
+          : workerEnv.WORKER_CONCURRENCY,
+      },
+    );
   } catch (error) {
-    clearTimeout(timeout);
-    workerLogger.error({ err: error, signal }, "Worker graceful shutdown failed");
-    process.exit(1);
+    workerLogger.warn(
+      {
+        workerId,
+
+        role,
+
+        ...sanitizedError(error),
+      },
+
+      "Worker heartbeat update failed",
+    );
   }
 }
 
-process.on("SIGINT", () => void shutdown("SIGINT"));
-process.on("SIGTERM", () => void shutdown("SIGTERM"));
-process.on("uncaughtException", (error) => {
-  workerLogger.fatal({ err: error }, "Uncaught worker exception");
-  void shutdown("uncaughtException");
+// ==================================================
+// Non-overlapping heartbeat execution
+// ==================================================
+
+function refreshHeartbeats(): Promise<void> {
+  if (shuttingDown) {
+    return Promise.resolve();
+  }
+
+  if (heartbeatTask) {
+    return heartbeatTask;
+  }
+
+  heartbeatTask = (async () => {
+    if (workerConnection.status !== "ready") {
+      return;
+    }
+
+    await Promise.all([
+      publishHeartbeat(
+        "diagnostic",
+
+        isWorkerAvailable("diagnostic"),
+
+        false,
+      ),
+
+      publishHeartbeat(
+        "deployment",
+
+        isWorkerAvailable("deployment"),
+
+        false,
+      ),
+    ]);
+  })().finally(() => {
+    heartbeatTask = null;
+  });
+
+  return heartbeatTask;
+}
+
+function scheduleHeartbeat(): void {
+  if (shuttingDown) {
+    return;
+  }
+
+  heartbeatTimer = setTimeout(() => {
+    void refreshHeartbeats().finally(() => {
+      scheduleHeartbeat();
+    });
+  }, workerEnv.WORKER_HEARTBEAT_INTERVAL_MS);
+
+  heartbeatTimer.unref();
+}
+
+// ==================================================
+// Workspace maintenance
+// ==================================================
+
+type MaintenanceMode =
+  | "recovery"
+  | "expiration";
+
+function runWorkspaceMaintenance(
+  mode: MaintenanceMode,
+): Promise<void> {
+  if (shuttingDown) {
+    return Promise.resolve();
+  }
+
+  if (maintenanceTask) {
+    return maintenanceTask;
+  }
+
+  maintenanceTask = (async () => {
+    try {
+      const result =
+        mode === "recovery"
+          ? await workspaceManager.recoverOrphaned()
+          : await workspaceManager.cleanupExpired();
+
+      if (result.removed > 0) {
+        workerLogger.info(
+          {
+            workerId,
+
+            mode,
+
+            removed: result.removed,
+          },
+
+          "Source workspace maintenance completed",
+        );
+      }
+    } catch (error) {
+      workerLogger.warn(
+        {
+          workerId,
+
+          mode,
+
+          ...sanitizedError(error),
+        },
+
+        "Source workspace maintenance failed",
+      );
+    }
+  })().finally(() => {
+    maintenanceTask = null;
+  });
+
+  return maintenanceTask;
+}
+
+function scheduleWorkspaceCleanup(): void {
+  if (shuttingDown) {
+    return;
+  }
+
+  cleanupTimer = setTimeout(() => {
+    void runWorkspaceMaintenance(
+      "expiration",
+    ).finally(() => {
+      scheduleWorkspaceCleanup();
+    });
+  }, workerEnv.SOURCE_CLEANUP_INTERVAL_SECONDS * 1000);
+
+  cleanupTimer.unref();
+}
+
+// ==================================================
+// Startup validation
+// ==================================================
+
+function validateWorkerConfiguration(): void {
+  const heartbeatTtlMs =
+    workerEnv.WORKER_HEARTBEAT_TTL_SECONDS *
+    1000;
+
+  const heartbeatIntervalMs =
+    workerEnv.WORKER_HEARTBEAT_INTERVAL_MS;
+
+  if (
+    !Number.isSafeInteger(heartbeatTtlMs) ||
+    heartbeatTtlMs <= 0 ||
+    !Number.isSafeInteger(heartbeatIntervalMs) ||
+    heartbeatIntervalMs <= 0
+  ) {
+    throw new Error(
+      "Invalid worker heartbeat configuration.",
+    );
+  }
+
+  if (heartbeatIntervalMs >= heartbeatTtlMs) {
+    throw new Error(
+      "Worker heartbeat interval must be shorter than its TTL.",
+    );
+  }
+
+  if (
+    heartbeatIntervalMs * 2 >= heartbeatTtlMs
+  ) {
+    workerLogger.warn(
+      {
+        workerId,
+
+        heartbeatIntervalMs,
+
+        heartbeatTtlMs,
+      },
+
+      "Worker heartbeat TTL has limited recovery margin",
+    );
+  }
+
+  const cleanupIntervalMs =
+    workerEnv.SOURCE_CLEANUP_INTERVAL_SECONDS *
+    1000;
+
+  if (
+    !Number.isSafeInteger(cleanupIntervalMs) ||
+    cleanupIntervalMs <= 0 ||
+    cleanupIntervalMs > 2_147_483_647
+  ) {
+    throw new Error(
+      "Invalid workspace cleanup interval.",
+    );
+  }
+}
+
+// ==================================================
+// Worker startup
+// ==================================================
+
+async function start(): Promise<void> {
+  validateWorkerConfiguration();
+
+  workerLogger.info(
+    {
+      workerId,
+
+      version: WORKER_VERSION,
+
+      diagnosticConcurrency:
+        workerEnv.WORKER_CONCURRENCY,
+
+      deploymentConcurrency:
+        workerEnv.DEPLOYMENT_WORKER_CONCURRENCY,
+
+      sourceRetrievalConfigured,
+
+      dockerBuild: false,
+
+      containerExecution: false,
+    },
+
+    "CloudPilot worker starting",
+  );
+
+  // Wait until both BullMQ workers have established
+  // their required Redis connections.
+
+  await Promise.all([
+    worker.waitUntilReady(),
+
+    deploymentWorker.waitUntilReady(),
+  ]);
+
+  if (shuttingDown) {
+    return;
+  }
+
+  startupCompleted = true;
+
+  await refreshHeartbeats();
+
+  if (shuttingDown) {
+    return;
+  }
+
+  scheduleHeartbeat();
+
+  // Maintenance operations are serialized to prevent
+  // startup recovery and periodic cleanup overlapping.
+
+  await runWorkspaceMaintenance("recovery");
+
+  if (shuttingDown) {
+    return;
+  }
+
+  scheduleWorkspaceCleanup();
+
+  if (!sourceRetrievalConfigured) {
+    workerLogger.warn(
+      {
+        workerId,
+      },
+
+      "GitHub App source retrieval is not configured",
+    );
+  }
+
+  workerLogger.info(
+    {
+      workerId,
+
+      diagnosticAvailable:
+        isWorkerAvailable("diagnostic"),
+
+      deploymentAvailable:
+        isWorkerAvailable("deployment"),
+
+      sourceRetrievalConfigured,
+    },
+
+    "CloudPilot worker startup completed",
+  );
+}
+
+// ==================================================
+// Shutdown utilities
+// ==================================================
+
+function stopBackgroundTimers(): void {
+  if (heartbeatTimer) {
+    clearTimeout(heartbeatTimer);
+
+    heartbeatTimer = undefined;
+  }
+
+  if (cleanupTimer) {
+    clearTimeout(cleanupTimer);
+
+    cleanupTimer = undefined;
+  }
+}
+
+async function publishDrainingHeartbeats():
+  Promise<void> {
+  if (workerConnection.status !== "ready") {
+    return;
+  }
+
+  try {
+    // Ensure an older available heartbeat cannot
+    // overwrite the final draining heartbeat.
+
+    if (heartbeatTask) {
+      await withTimeout(
+        heartbeatTask,
+
+        HEARTBEAT_SHUTDOWN_TIMEOUT_MS,
+
+        "Pending heartbeat did not finish.",
+      );
+    }
+
+    await withTimeout(
+      Promise.all([
+        publishHeartbeat(
+          "diagnostic",
+          false,
+          true,
+        ),
+
+        publishHeartbeat(
+          "deployment",
+          false,
+          true,
+        ),
+      ]),
+
+      HEARTBEAT_SHUTDOWN_TIMEOUT_MS,
+
+      "Draining heartbeat publication timed out.",
+    );
+  } catch (error) {
+    workerLogger.warn(
+      {
+        workerId,
+
+        ...sanitizedError(error),
+      },
+
+      "Final worker heartbeat could not be confirmed",
+    );
+  }
+}
+
+async function shutdownStep(
+  name: string,
+  operation: () => Promise<unknown>,
+): Promise<void> {
+  try {
+    await operation();
+  } catch (error) {
+    shutdownExitCode = 1;
+
+    workerLogger.error(
+      {
+        workerId,
+
+        step: name,
+
+        ...sanitizedError(error),
+      },
+
+      "Worker shutdown step failed",
+    );
+  }
+}
+
+// ==================================================
+// Graceful shutdown
+// ==================================================
+
+function shutdown(
+  reason: string,
+  exitCode = 0,
+): Promise<void> {
+  // A fatal error during an existing graceful shutdown
+  // must still result in a non-zero process exit.
+
+  shutdownExitCode = Math.max(
+    shutdownExitCode,
+
+    exitCode,
+  );
+
+  if (shutdownPromise) {
+    return shutdownPromise;
+  }
+
+  shuttingDown = true;
+
+  startupCompleted = false;
+
+  stopBackgroundTimers();
+
+  workerLogger.info(
+    {
+      workerId,
+
+      reason,
+
+      exitCode: shutdownExitCode,
+    },
+
+    "Worker graceful shutdown started",
+  );
+
+  // Keep this timer referenced. It must enforce
+  // the deadline even if other handles disappear.
+
+  const deadline = setTimeout(() => {
+    workerLogger.error(
+      {
+        workerId,
+
+        reason,
+
+        timeoutMs: SHUTDOWN_TIMEOUT_MS,
+      },
+
+      "Worker graceful shutdown deadline exceeded",
+    );
+
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS);
+
+  shutdownPromise = (async () => {
+    try {
+      // Signal active processors so they can stop
+      // downloads and extraction cooperatively.
+
+      shutdownController.abort();
+
+      // Stop accepting new work without waiting
+      // for current jobs at this stage.
+
+      await shutdownStep(
+        "pause-workers",
+
+        async () => {
+          const results =
+            await Promise.allSettled([
+              worker.pause(true),
+
+              deploymentWorker.pause(true),
+            ]);
+
+          if (
+            results.some(
+              (result) =>
+                result.status === "rejected",
+            )
+          ) {
+            throw new Error(
+              "One or more workers could not be paused.",
+            );
+          }
+        },
+      );
+
+      // Publish unavailable/draining state before
+      // closing Redis-dependent infrastructure.
+
+      await publishDrainingHeartbeats();
+
+      // QueueManager should wait for active processors
+      // to settle before closing worker connections.
+
+      await shutdownStep(
+        "close-queue-manager",
+
+        async () => {
+          await queueManager.close();
+        },
+      );
+
+      // Do not disconnect Redis while workspace
+      // maintenance may still be using dependencies.
+
+      await shutdownStep(
+        "finish-workspace-maintenance",
+
+        async () => {
+          if (maintenanceTask) {
+            await maintenanceTask;
+          }
+        },
+      );
+
+      // Redis is closed only after workers finish.
+
+      await shutdownStep(
+        "close-redis-connection",
+
+        async () => {
+          if (workerConnection.status === "end") {
+            return;
+          }
+
+          try {
+            await workerConnection.quit();
+          } catch {
+            workerConnection.disconnect();
+
+            throw new Error(
+              "Redis graceful disconnect failed.",
+            );
+          }
+        },
+      );
+
+      workerLogger.info(
+        {
+          workerId,
+
+          reason,
+
+          exitCode: shutdownExitCode,
+        },
+
+        "Worker graceful shutdown completed",
+      );
+    } catch (error) {
+      shutdownExitCode = 1;
+
+      workerLogger.error(
+        {
+          workerId,
+
+          reason,
+
+          ...sanitizedError(error),
+        },
+
+        "Worker graceful shutdown failed",
+      );
+    } finally {
+      clearTimeout(deadline);
+
+      process.exit(shutdownExitCode);
+    }
+  })();
+
+  return shutdownPromise;
+}
+
+// ==================================================
+// Process lifecycle handlers
+// ==================================================
+
+process.on("SIGINT", () => {
+  void shutdown("SIGINT");
 });
+
+process.on("SIGTERM", () => {
+  void shutdown("SIGTERM");
+});
+
+process.on("uncaughtException", (error) => {
+  workerLogger.fatal(
+    {
+      workerId,
+
+      ...sanitizedError(error),
+    },
+
+    "Uncaught worker exception",
+  );
+
+  void shutdown(
+    "uncaughtException",
+
+    1,
+  );
+});
+
 process.on("unhandledRejection", (reason) => {
-  workerLogger.fatal({ err: reason }, "Unhandled worker rejection");
-  void shutdown("unhandledRejection");
+  workerLogger.fatal(
+    {
+      workerId,
+
+      ...sanitizedError(reason),
+    },
+
+    "Unhandled worker rejection",
+  );
+
+  void shutdown(
+    "unhandledRejection",
+
+    1,
+  );
+});
+
+// ==================================================
+// Application entry point
+// ==================================================
+
+void start().catch((error: unknown) => {
+  workerLogger.fatal(
+    {
+      workerId,
+
+      ...sanitizedError(error),
+    },
+
+    "CloudPilot worker startup failed",
+  );
+
+  void shutdown(
+    "startupFailure",
+
+    1,
+  );
 });

@@ -5,6 +5,9 @@ import {
   type WorkerHeartbeat,
 } from "@cloudpilot/queue";
 import { prisma } from "@cloudpilot/database";
+import { access, constants } from "node:fs/promises";
+import { resolve } from "node:path";
+import { env } from "../config/env.js";
 import { logger } from "../config/logger.js";
 import { deploymentOutboxRuntime } from "./deployment-outbox-runtime.js";
 import { queueEnv, queueManager, redisProducerConnection } from "./queue-producer.js";
@@ -27,6 +30,29 @@ function workerSummary(workers: WorkerHeartbeat[]) {
       .sort()
       .at(-1) ?? null,
   };
+}
+
+export async function hasAvailableDeploymentWorker(): Promise<boolean> {
+  try {
+    const redis = await checkRedisHealth(redisProducerConnection);
+    if (!redis.healthy) return false;
+    const workers = await listWorkerHeartbeats(redisProducerConnection, {
+      prefix: queueEnv.QUEUE_PREFIX,
+      ttlSeconds: queueEnv.WORKER_HEARTBEAT_TTL_SECONDS,
+    }, "deployment");
+    return workers.some((worker) => worker.available && !worker.draining && worker.capabilities.deploymentQueue);
+  } catch {
+    return false;
+  }
+}
+
+export async function checkWorkspaceStorage(): Promise<boolean> {
+  try {
+    await access(resolve(env.SOURCE_WORKSPACE_ROOT), constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function getDeploymentReadiness(workspaceId: string, projectId: string) {
@@ -126,6 +152,8 @@ export async function getDeploymentReadiness(workspaceId: string, projectId: str
   const pendingOutboxEvents = outboxStats
     .filter((entry) => entry.status === "PENDING" || entry.status === "PUBLISHING")
     .reduce((count, entry) => count + entry._count._all, 0);
+  const workspaceStorageAvailable = await checkWorkspaceStorage();
+  const sourceRetrievalAvailable = deploymentWorker.capabilities.sourceRetrieval;
 
   return {
     postgres: { available: database.healthy },
@@ -143,6 +171,13 @@ export async function getDeploymentReadiness(workspaceId: string, projectId: str
       deployment: deploymentWorker,
     },
     repository: { connected: repositoryConnected },
+    commitResolution: { available: repositoryConnected && sourceRetrievalAvailable },
+    sourceRetrieval: {
+      available: sourceRetrievalAvailable && workspaceStorageAvailable,
+      workerCapable: sourceRetrievalAvailable,
+      workspaceStorage: workspaceStorageAvailable,
+    },
+    workspaceStorage: { available: workspaceStorageAvailable },
     buildConfiguration: { configured: buildConfigured },
     execution: {
       capabilitiesAvailable: executionCapabilitiesAvailable,

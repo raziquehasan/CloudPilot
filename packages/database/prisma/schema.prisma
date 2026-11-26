@@ -19,6 +19,7 @@ enum DeploymentStatus {
   QUEUED
   PENDING
   PREPARING
+  SOURCE_PREPARED
   CLONING
   BUILDING
   DEPLOYING
@@ -104,6 +105,15 @@ enum DeploymentOutboxStatus {
 
 enum DeploymentOutboxEventType {
   DEPLOYMENT_REQUESTED
+}
+
+enum DeploymentSourceStatus {
+  PENDING
+  DOWNLOADING
+  EXTRACTING
+  READY
+  FAILED
+  CANCELLED
 }
 
 model User {
@@ -356,6 +366,7 @@ model Deployment {
   builds         Build[]
   logs           DeploymentLog[]
   outboxEvents   DeploymentOutboxEvent[]
+  sourcePreparation DeploymentSourcePreparation?
   createdAt      DateTime                @default(now())
   updatedAt      DateTime                @updatedAt
   startedAt      DateTime?
@@ -398,6 +409,34 @@ model DeploymentOutboxEvent {
   @@index([status, leaseExpiresAt])
   @@index([workspaceId, projectId, createdAt])
   @@map("deployment_outbox_events")
+}
+
+model DeploymentSourcePreparation {
+  id                 String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId        String                  @db.Uuid
+  projectId          String                  @db.Uuid
+  deploymentId       String                  @db.Uuid
+  repositoryFullName String                  @db.VarChar(255)
+  requestedBranch    String?                 @db.VarChar(255)
+  resolvedCommitSha  String                  @db.VarChar(40)
+  status             DeploymentSourceStatus  @default(PENDING)
+  attempt            Int                     @default(0)
+  sourceWorkspaceKey String?                 @db.VarChar(64)
+  downloadedBytes    BigInt                  @default(0)
+  extractedBytes     BigInt                  @default(0)
+  fileCount          Int                     @default(0)
+  failureCode        String?                 @db.VarChar(80)
+  expiresAt          DateTime?
+  startedAt          DateTime?
+  completedAt        DateTime?
+  createdAt          DateTime                @default(now())
+  updatedAt          DateTime                @updatedAt
+  deployment         Deployment              @relation(fields: [workspaceId, projectId, deploymentId], references: [workspaceId, projectId, id], onDelete: Cascade)
+
+  @@unique([workspaceId, projectId, deploymentId])
+  @@index([status, expiresAt])
+  @@index([workspaceId, projectId, createdAt])
+  @@map("deployment_source_preparations")
 }
 
 model Build {

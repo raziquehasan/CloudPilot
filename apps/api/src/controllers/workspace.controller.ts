@@ -13,7 +13,7 @@ const projectDetailsInclude = {
     selectedBranch: true, language: true, isPrivate: true, createdAt: true, updatedAt: true,
     installation: { select: { accountLogin: true, accountType: true, status: true, repositorySelection: true } },
   } },
-  deployments: { orderBy: { createdAt: "desc" as const }, take: 8, select: { id: true, status: true, environment: true, triggerSource: true, createdAt: true, startedAt: true, finishedAt: true, failureCode: true } },
+  deployments: { orderBy: { createdAt: "desc" as const }, take: 8, select: { id: true, status: true, environment: true, triggerSource: true, requestedBranch: true, commitSha: true, createdAt: true, startedAt: true, finishedAt: true, failureCode: true } },
   environmentVariables: { orderBy: [{ environment: "asc" as const }, { key: "asc" as const }], select: { id: true, key: true, environment: true, createdAt: true, updatedAt: true } },
   _count: { select: { deployments: true, environmentVariables: true } },
 };

@@ -70,6 +70,9 @@ interface ProjectDeploymentReadiness {
   deploymentQueue: { available: boolean };
   workers: { deployment: { connected: boolean; available: boolean } };
   repository: { connected: boolean };
+  commitResolution: { available: boolean };
+  sourceRetrieval: { available: boolean; workerCapable: boolean; workspaceStorage: boolean };
+  workspaceStorage: { available: boolean };
   buildConfiguration: { configured: boolean };
   execution: { capabilitiesAvailable: boolean; available: boolean };
 }
@@ -83,7 +86,6 @@ function Readiness({ project, workspaceId, branch, branchStatus, framework, save
   const [readinessLoading, setReadinessLoading] = useState(true);
   useEffect(() => {
     let active = true;
-    setReadinessLoading(true);
     void apiFetch<ProjectDeploymentReadiness>(`/projects/${encodeURIComponent(project.id)}/deployment-readiness`)
       .then((result) => { if (active) setReadiness(result); })
       .catch(() => { if (active) setReadiness(null); })
@@ -99,8 +101,11 @@ function Readiness({ project, workspaceId, branch, branchStatus, framework, save
     { label: "Environment variables", value: project._count.environmentVariables ? `${project._count.environmentVariables} configured · review application requirements` : "Configure only if your application requires them", ready: null },
     { label: "Deployment queue", value: readinessLoading ? "Checking availability" : readiness?.deploymentQueue.available ? "Available" : "Unavailable", ready: readiness?.deploymentQueue.available ?? false },
     { label: "Deployment worker", value: readinessLoading ? "Checking connection" : readiness?.workers.deployment.connected ? readiness.workers.deployment.available ? "Connected and available" : "Connected but unavailable" : "Disconnected", ready: readiness?.workers.deployment.available ?? false },
+    { label: "Immutable commit resolution", value: readinessLoading ? "Checking capability" : readiness?.commitResolution.available ? "Available" : "Unavailable", ready: readiness?.commitResolution.available ?? false },
+    { label: "Source retrieval", value: readinessLoading ? "Checking capability" : readiness?.sourceRetrieval.available ? "Available" : readiness?.sourceRetrieval.workerCapable ? "Worker ready, storage unavailable" : "Unavailable", ready: readiness?.sourceRetrieval.available ?? false },
+    { label: "Workspace storage", value: readinessLoading ? "Checking storage" : readiness?.workspaceStorage.available ? "Available" : "Unavailable", ready: readiness?.workspaceStorage.available ?? false },
     { label: "Deployment engine", value: readinessLoading ? "Checking capabilities" : readiness?.execution.capabilitiesAvailable ? "Configured" : "Not configured", ready: readiness?.execution.capabilitiesAvailable ?? false },
-    { label: "Execution capability", value: readinessLoading ? "Checking availability" : readiness?.execution.available ? "Available" : "Unavailable", ready: readiness?.execution.available ?? false },
+    { label: "Execution capability", value: readinessLoading ? "Checking availability" : readiness?.execution.available ? "Available" : "Unavailable (build/runtime disabled)", ready: readiness?.execution.available ?? false },
   ];
   return <Card size="sm">
     <CardHeader className="border-b"><CardTitle className="text-sm">Deployment readiness</CardTitle></CardHeader>
@@ -116,7 +121,7 @@ function Readiness({ project, workspaceId, branch, branchStatus, framework, save
 function DeploymentRows({ rows }: { rows: ProjectDeployment[] }) {
   if (!rows.length) return <EmptyPanel icon={Workflow} title="No deployment activity yet" description="Deployment runs will appear here once a deployment engine is available. Your project and repository are ready to configure." />;
   return <div className="divide-y">{rows.map((deployment) => <div key={deployment.id} className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 py-3 first:pt-0 last:pb-0">
-    <div className="flex min-w-0 items-center gap-3"><span className="grid size-8 shrink-0 place-items-center rounded-lg border bg-muted/40"><GitCommitHorizontal className="size-4 text-muted-foreground" /></span><div className="min-w-0"><p className="truncate font-mono text-xs">{deployment.id.slice(0, 8)}</p><p className="mt-1 text-xs text-muted-foreground">{deployment.environment.toLowerCase()} · {deployment.triggerSource.toLowerCase().replaceAll("_", " ")}</p></div></div>
+    <div className="flex min-w-0 items-center gap-3"><span className="grid size-8 shrink-0 place-items-center rounded-lg border bg-muted/40"><GitCommitHorizontal className="size-4 text-muted-foreground" /></span><div className="min-w-0"><p className="truncate font-mono text-xs">{deployment.id.slice(0, 8)}</p><p className="mt-1 text-xs text-muted-foreground">{deployment.environment.toLowerCase()} · {deployment.triggerSource.toLowerCase().replaceAll("_", " ")}{deployment.commitSha ? ` · ${deployment.commitSha.slice(0, 7)}` : ""}{deployment.status === "SOURCE_PREPARED" ? " · source ready" : ""}</p></div></div>
     <div className="flex items-center gap-3"><StatusBadge status={deployment.status} /><time className="whitespace-nowrap text-xs text-muted-foreground" dateTime={deployment.createdAt}>{new Date(deployment.createdAt).toLocaleString()}</time></div>
   </div>)}</div>;
 }

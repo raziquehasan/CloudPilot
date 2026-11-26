@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { deploymentStatuses } from "../services/deployment-state-machine.js";
-import { branchNameSchema } from "./project-intelligence.validator.js";
+import { branchNameSchema, commitShaSchema } from "./project-intelligence.validator.js";
 
 export const deploymentEnvironmentSchema = z.enum([
   "DEVELOPMENT",
@@ -13,8 +13,12 @@ export const deploymentStatusSchema = z.enum(deploymentStatuses);
 
 export const createDeploymentSchema = z.object({
   branch: branchNameSchema.optional(),
+  commit: commitShaSchema.optional(),
   environment: deploymentEnvironmentSchema,
-}).strict();
+}).strict().refine(
+  (value) => value.branch !== undefined || value.commit !== undefined,
+  { message: "A branch or commit must be provided." },
+);
 
 export const deploymentListQuerySchema = z.object({
   page: z.coerce.number().int().min(1).max(10_000).default(1),

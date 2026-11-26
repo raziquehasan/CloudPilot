@@ -20,6 +20,7 @@ Thumbs.db
 docker-data
 postgres-data
 redis-data
+runtime
 *.sqlite
 *.sqlite3
 *.pem

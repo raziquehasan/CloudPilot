@@ -97,7 +97,7 @@ test("deployment API enforces workspace, role, CSRF, worker readiness, and atomi
     );
     assert.equal(crossWorkspaceResponse.status, 404);
 
-    const requestBody = JSON.stringify({ environment: "DEVELOPMENT" });
+    const requestBody = JSON.stringify({ environment: "DEVELOPMENT", branch: "main" });
     const missingCsrf = await fetch(baseUrl, {
       method: "POST",
       headers: { Cookie: ownerSession.cookie, "Content-Type": "application/json" },
@@ -124,10 +124,10 @@ test("deployment API enforces workspace, role, CSRF, worker readiness, and atomi
       headers: { ...csrfHeaders(ownerSession), "Idempotency-Key": `owner-${suffix}` },
       body: requestBody,
     });
-    assert.equal(blockedCreate.status, 503);
+    assert.equal(blockedCreate.status, 409);
     assert.equal(
       (await blockedCreate.json() as { error: { code: string } }).error.code,
-      "DEPLOYMENT_WORKER_UNAVAILABLE",
+      "REPOSITORY_NOT_CONNECTED",
     );
     assert.equal(await prisma.deployment.count({ where: { workspaceId: workspace.id } }), 0);
 
@@ -178,7 +178,7 @@ test("deployment API enforces workspace, role, CSRF, worker readiness, and atomi
     );
     assert.equal(
       await prisma.auditLog.count({
-        where: { workspaceId: workspace.id, entityId: queued.id, action: "DEPLOYMENT_STATUS_CHANGED" },
+        where: { workspaceId: workspace.id, entityId: queued.id, action: "DEPLOYMENT_CANCELLATION_REQUESTED" },
       }),
       1,
     );

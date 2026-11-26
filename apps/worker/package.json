@@ -1,17 +1,33 @@
 {
   "name": "@cloudpilot/worker",
   "version": "0.1.0",
+  "description": "CloudPilot background worker for secure source retrieval, deployment orchestration and diagnostic job processing.",
   "private": true,
   "type": "module",
+  "main": "./dist/worker.js",
+  "engines": {
+    "node": ">=22.12.0",
+    "npm": ">=10.0.0"
+  },
   "scripts": {
     "dev": "tsx watch src/worker.ts",
     "build": "tsc",
-    "start": "node dist/worker.js",
-    "typecheck": "tsc --noEmit"
+    "start": "node --enable-source-maps dist/worker.js",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/source-extract.test.ts test/source-pipeline.test.ts",
+    "test:watch": "node --import tsx --test --watch test/source-extract.test.ts test/source-pipeline.test.ts",
+    "test:extract": "node --import tsx --test test/source-extract.test.ts",
+    "test:pipeline": "node --import tsx --test test/source-pipeline.test.ts",
+    "test:live": "node --enable-source-maps test/live-source-retrieval.mjs",
+    "test:coverage": "node --import tsx --experimental-test-coverage --test test/source-extract.test.ts test/source-pipeline.test.ts",
+    "check": "npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {
     "@cloudpilot/database": "*",
     "@cloudpilot/queue": "*",
+    "@octokit/app": "^16.1.4",
+    "@octokit/rest": "^22.0.1",
+    "bullmq": "^6.7.9",
     "dotenv": "^18.0.10",
     "pino": "^10.4.0",
     "zod": "^4.6.7"
