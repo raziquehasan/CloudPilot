@@ -1,9 +1,12 @@
 import { config } from "dotenv";
 import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
 import { z } from "zod";
 
 config({ path: fileURLToPath(new URL("../../../../.env", import.meta.url)) });
 config({ path: fileURLToPath(new URL("../../.env", import.meta.url)) });
+
+const PROJECT_ROOT = fileURLToPath(new URL("../../../../", import.meta.url));
 
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
@@ -27,7 +30,7 @@ const envSchema = z.object({
   GITHUB_INSTALLATION_OAUTH_CALLBACK_URL: z.string().trim().url().optional(),
   AUTH_SECRET: z.string().trim().min(32).optional(),
   ENVIRONMENT_VARIABLE_ENCRYPTION_KEY: z.preprocess((value) => value === "" ? undefined : value, z.string().regex(/^[a-f0-9]{64}$/i).optional()),
-  SOURCE_WORKSPACE_ROOT: z.string().trim().min(1).default("runtime/workspaces"),
+  SOURCE_WORKSPACE_ROOT: z.string().trim().min(1).default("runtime/workspaces").transform((value) => resolve(PROJECT_ROOT, value)),
 }).superRefine((values, context) => {
   const appFields = [values.GITHUB_APP_ID, values.GITHUB_APP_SLUG, values.GITHUB_APP_PRIVATE_KEY_PATH];
   if (appFields.some(Boolean) && !appFields.every(Boolean)) {
