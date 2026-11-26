@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Prisma, prisma } from "@cloudpilot/database";
 import {
   QueueManager,
+  type BuildJob,
   type DeploymentJob,
 } from "@cloudpilot/queue";
 
@@ -17,6 +18,7 @@ interface ClaimedOutboxEvent {
   workspaceId: string;
   projectId: string;
   deploymentId: string;
+  eventType: "DEPLOYMENT_REQUESTED" | "BUILD_REQUESTED";
   jobId: string;
   attemptCount: number;
   leaseToken: string;
@@ -145,8 +147,8 @@ export class DeploymentOutboxPublisher {
         FROM candidate
         WHERE event."id" = candidate."id"
         RETURNING event."id", event."workspaceId", event."projectId",
-                  event."deploymentId", event."jobId", event."attemptCount",
-                  event."leaseToken"
+                  event."deploymentId", event."eventType", event."jobId",
+                  event."attemptCount", event."leaseToken"
       `;
       return rows[0] ?? null;
     });
@@ -176,18 +178,21 @@ export class DeploymentOutboxPublisher {
       return "deferred";
     }
 
-    const payload: DeploymentJob = {
-      kind: "deployment",
-      workspaceId: event.workspaceId,
-      projectId: event.projectId,
-      deploymentId: event.deploymentId,
-      eventId: event.id,
-      correlationId: event.id,
-      idempotencyKey: event.id,
-    };
-
     try {
-      await this.queueManager.addJob("deployment", payload, event.jobId);
+      if (event.eventType === "BUILD_REQUESTED") {
+        await this.publishBuildEvent(event);
+      } else {
+        const payload: DeploymentJob = {
+          kind: "deployment",
+          workspaceId: event.workspaceId,
+          projectId: event.projectId,
+          deploymentId: event.deploymentId,
+          eventId: event.id,
+          correlationId: event.id,
+          idempotencyKey: event.id,
+        };
+        await this.queueManager.addJob("deployment", payload, event.jobId);
+      }
       await this.database.deploymentOutboxEvent.updateMany({
         where: { id: event.id, status: "PUBLISHING", leaseToken: event.leaseToken },
         data: {
@@ -218,5 +223,43 @@ export class DeploymentOutboxPublisher {
       });
       return "deferred";
     }
+  }
+
+  /**
+   * Publish a build job. The payload is derived from
+   * authoritative database state and contains identifiers
+   * only — never credentials or filesystem paths.
+   */
+  private async publishBuildEvent(
+    event: ClaimedOutboxEvent,
+  ): Promise<void> {
+    const source = await this.database.deploymentSourcePreparation.findFirst({
+      where: {
+        workspaceId: event.workspaceId,
+        projectId: event.projectId,
+        deploymentId: event.deploymentId,
+        status: "READY",
+      },
+      select: { id: true, resolvedCommitSha: true },
+    });
+
+    if (!source) {
+      // No READY source: leave the event for retry rather
+      // than publishing an invalid build.
+      throw new Error("Build source preparation is not ready");
+    }
+
+    const payload: BuildJob = {
+      kind: "build",
+      workspaceId: event.workspaceId,
+      projectId: event.projectId,
+      deploymentId: event.deploymentId,
+      buildId: event.id,
+      sourcePreparationId: source.id,
+      resolvedCommitSha: source.resolvedCommitSha,
+      correlationId: event.id,
+    };
+
+    await this.queueManager.addJob("build", payload, event.jobId);
   }
 }

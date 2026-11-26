@@ -16,6 +16,18 @@ test("deployment lifecycle allows only ordered preparation and health-verified r
   assert.equal(canTransitionDeployment("PREPARING", "DEPLOYING"), false);
 });
 
+test("phase 5.4 build lifecycle reaches BUILD_SUCCEEDED without deploying", () => {
+  assert.equal(canTransitionDeployment("SOURCE_PREPARED", "BUILDING"), true);
+  assert.equal(canTransitionDeployment("BUILDING", "BUILD_SUCCEEDED"), true);
+  // A successful build must not be treated as a live deployment.
+  assert.equal(canTransitionDeployment("BUILD_SUCCEEDED", "RUNNING"), false);
+  assert.equal(canTransitionDeployment("BUILD_SUCCEEDED", "SUCCEEDED"), false);
+  // No build before source preparation.
+  assert.equal(canTransitionDeployment("PREPARING", "BUILDING"), false);
+  // No build for cancelled deployments.
+  assert.equal(canTransitionDeployment("CANCELLED", "BUILDING"), false);
+});
+
 test("deployment cancellation and terminal states cannot be overwritten", () => {
   assert.equal(canTransitionDeployment("QUEUED", "CANCELLED"), true);
   assert.equal(canTransitionDeployment("CANCELLING", "CANCELLED"), true);

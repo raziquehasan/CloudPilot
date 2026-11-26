@@ -154,6 +154,8 @@ export async function getDeploymentReadiness(workspaceId: string, projectId: str
     .reduce((count, entry) => count + entry._count._all, 0);
   const workspaceStorageAvailable = await checkWorkspaceStorage();
   const sourceRetrievalAvailable = deploymentWorker.capabilities.sourceRetrieval;
+  const dockerBuildAvailable = deploymentWorker.capabilities.dockerBuild;
+  const containerExecutionAvailable = deploymentWorker.capabilities.containerExecution;
 
   return {
     postgres: { available: database.healthy },
@@ -179,6 +181,18 @@ export async function getDeploymentReadiness(workspaceId: string, projectId: str
     },
     workspaceStorage: { available: workspaceStorageAvailable },
     buildConfiguration: { configured: buildConfigured },
+    build: {
+      // Image build capability is distinct from application
+      // hosting readiness. A successful build does not imply
+      // the application is deployed or live.
+      workerCapable: dockerBuildAvailable,
+      available: dockerBuildAvailable && workspaceStorageAvailable,
+      producesImageArtifact: dockerBuildAvailable,
+      containerDeployment: {
+        available: containerExecutionAvailable,
+        enabled: false,
+      },
+    },
     execution: {
       capabilitiesAvailable: executionCapabilitiesAvailable,
       available: database.healthy

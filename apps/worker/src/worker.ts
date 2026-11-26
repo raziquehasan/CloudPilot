@@ -28,6 +28,14 @@ import {
   processDeploymentJob,
 } from "./processors/deployment.processor.js";
 
+import {
+  processBuildJob,
+} from "./processors/build.processor.js";
+
+import {
+  BuildKitExecutor,
+} from "./build/buildkit-client.js";
+
 // ==================================================
 // Constants
 // ==================================================
@@ -119,6 +127,60 @@ const queueManager = new QueueManager(
 
   workerEnv.QUEUE_PREFIX,
 );
+
+// ==================================================
+// Build queue manager
+// ==================================================
+//
+// Builds are long-running and use a dedicated execution
+// timeout derived from BUILD_TIMEOUT_MS. The build queue
+// is only created when build execution is enabled.
+// ==================================================
+
+const BUILD_QUEUE_TIMEOUT_MARGIN_MS = 120_000;
+
+const buildExecutionTimeoutMs = Math.max(
+  workerEnv.QUEUE_EXECUTION_TIMEOUT_MS,
+
+  workerEnv.BUILD_TIMEOUT_MS +
+    BUILD_QUEUE_TIMEOUT_MARGIN_MS,
+);
+
+const buildQueueManager = workerEnv.BUILD_ENABLED
+  ? new QueueManager(
+      workerConnection,
+
+      workerConnection,
+
+      {
+        attempts:
+          workerEnv.QUEUE_JOB_ATTEMPTS,
+
+        backoffMs:
+          workerEnv.QUEUE_BACKOFF_MS,
+
+        completedRetention:
+          workerEnv.QUEUE_COMPLETED_RETENTION,
+
+        failedRetention:
+          workerEnv.QUEUE_FAILED_RETENTION,
+
+        executionTimeoutMs:
+          buildExecutionTimeoutMs,
+
+        backoffJitter:
+          workerEnv.QUEUE_BACKOFF_JITTER,
+      },
+
+      false,
+
+      workerEnv.QUEUE_PREFIX,
+    )
+  : null;
+
+const buildExecutor = workerEnv.BUILD_ENABLED
+  ? new BuildKitExecutor()
+  : null;
 
 // ==================================================
 // Sanitized error utilities
@@ -403,6 +465,81 @@ const deploymentWorker =
   );
 
 // ==================================================
+// Build queue worker
+// ==================================================
+
+const buildWorker =
+  buildQueueManager && buildExecutor
+    ? buildQueueManager.createWorker(
+        QUEUE_NAMES.build,
+
+        async (
+          job: Job<QueueJob>,
+          _token,
+          signal,
+        ) => {
+          const parsed =
+            queuePayloadSchemas.build.safeParse(
+              job.data,
+            );
+
+          if (!parsed.success) {
+            workerLogger.warn(
+              {
+                workerId,
+
+                jobId: job.id,
+
+                issueCount:
+                  parsed.error.issues.length,
+              },
+
+              "Invalid build job payload",
+            );
+
+            throw new UnrecoverableError(
+              "Invalid build job payload.",
+            );
+          }
+
+          const jobSignal =
+            createJobSignal(signal);
+
+          workerLogger.info(
+            {
+              workerId,
+
+              jobId: job.id,
+
+              deploymentId:
+                parsed.data.deploymentId,
+
+              attempts: job.attemptsStarted,
+            },
+
+            "Deployment build job started",
+          );
+
+          return processBuildJob(
+            job,
+
+            parsed.data,
+
+            jobSignal,
+
+            {
+              executor: buildExecutor,
+
+              workspace: workspaceManager,
+            },
+          );
+        },
+
+        workerEnv.BUILD_MAX_CONCURRENCY,
+      )
+    : null;
+
+// ==================================================
 // Worker event handlers
 // ==================================================
 
@@ -534,6 +671,70 @@ deploymentWorker.on("error", (error) => {
 });
 
 // ==================================================
+// Build worker event handlers
+// ==================================================
+
+buildWorker?.on("completed", (job) => {
+  workerLogger.info(
+    {
+      workerId,
+
+      jobId: job.id,
+
+      queue: QUEUE_NAMES.build,
+    },
+
+    "Deployment build job completed",
+  );
+});
+
+buildWorker?.on("failed", (job, error) => {
+  workerLogger.warn(
+    {
+      workerId,
+
+      jobId: job?.id,
+
+      queue: QUEUE_NAMES.build,
+
+      attemptsMade: job?.attemptsMade,
+
+      ...sanitizedError(error),
+    },
+
+    "Deployment build job failed",
+  );
+});
+
+buildWorker?.on("stalled", (jobId) => {
+  workerLogger.warn(
+    {
+      workerId,
+
+      jobId,
+
+      queue: QUEUE_NAMES.build,
+    },
+
+    "Build queue job stalled",
+  );
+});
+
+buildWorker?.on("error", (error) => {
+  workerLogger.error(
+    {
+      workerId,
+
+      queue: QUEUE_NAMES.build,
+
+      ...sanitizedError(error),
+    },
+
+    "Build worker error",
+  );
+});
+
+// ==================================================
 // Worker readiness
 // ==================================================
 
@@ -556,6 +757,23 @@ function isWorkerAvailable(
   return (
     currentWorker.isRunning() &&
     !currentWorker.isPaused()
+  );
+}
+
+function isBuildAvailable(): boolean {
+  if (
+    !workerEnv.BUILD_ENABLED ||
+    !buildWorker ||
+    shuttingDown ||
+    !startupCompleted ||
+    workerConnection.status !== "ready"
+  ) {
+    return false;
+  }
+
+  return (
+    buildWorker.isRunning() &&
+    !buildWorker.isPaused()
   );
 }
 
@@ -595,10 +813,12 @@ async function publishHeartbeat(
             isDeploymentWorker &&
             sourceRetrievalConfigured,
 
-          // Phase 5.3 only prepares source code.
-          // Docker and container execution remain disabled.
+          // Phase 5.4 adds isolated Docker image builds.
+          // Container execution remains disabled.
 
-          dockerBuild: false,
+          dockerBuild:
+            isDeploymentWorker &&
+            isBuildAvailable(),
 
           containerExecution: false,
         },
@@ -821,6 +1041,19 @@ function validateWorkerConfiguration(): void {
       "Invalid workspace cleanup interval.",
     );
   }
+
+  if (
+    workerEnv.BUILD_ENABLED &&
+    (
+      !Number.isSafeInteger(buildExecutionTimeoutMs) ||
+      buildExecutionTimeoutMs <= 0 ||
+      buildExecutionTimeoutMs > 2_147_483_647
+    )
+  ) {
+    throw new Error(
+      "Invalid build execution timeout.",
+    );
+  }
 }
 
 // ==================================================
@@ -844,7 +1077,7 @@ async function start(): Promise<void> {
 
       sourceRetrievalConfigured,
 
-      dockerBuild: false,
+      dockerBuild: isBuildAvailable(),
 
       containerExecution: false,
     },
@@ -852,13 +1085,17 @@ async function start(): Promise<void> {
     "CloudPilot worker starting",
   );
 
-  // Wait until both BullMQ workers have established
-  // their required Redis connections.
+  // Wait until all registered BullMQ workers have
+  // established their required Redis connections.
 
   await Promise.all([
     worker.waitUntilReady(),
 
     deploymentWorker.waitUntilReady(),
+
+    ...(buildWorker
+      ? [buildWorker.waitUntilReady()]
+      : []),
   ]);
 
   if (shuttingDown) {
@@ -1083,6 +1320,10 @@ function shutdown(
               worker.pause(true),
 
               deploymentWorker.pause(true),
+
+              ...(buildWorker
+                ? [buildWorker.pause(true)]
+                : []),
             ]);
 
           if (
@@ -1111,6 +1352,10 @@ function shutdown(
 
         async () => {
           await queueManager.close();
+
+          if (buildQueueManager) {
+            await buildQueueManager.close();
+          }
         },
       );
 

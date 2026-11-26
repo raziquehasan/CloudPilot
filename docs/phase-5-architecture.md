@@ -45,7 +45,7 @@ The Phase 5.2 checkpoint is:
 | Phase 5.1 — Deployment API | Implemented |
 | Phase 5.2 — Queue and worker | Implemented |
 | Phase 5.3 — Source retrieval | Implemented; final review pending |
-| Phase 5.4 — Isolated build | Not enabled |
+| Phase 5.4 — Isolated build | Implemented; disabled by default |
 | Phase 5.5 — Container runtime | Not enabled |
 | Phase 5.6 — Real-time logs | Planned |
 | Phase 5.7 — Health and rollback | Planned |
@@ -210,7 +210,15 @@ Cleanup must not delete unrelated or actively owned workspaces.
 
 ### Worker to build and runtime engines
 
-This boundary remains disabled in Phase 5.3.
+Phase 5.4 introduces an isolated Docker build engine that
+produces a verified image artifact. It is disabled by default
+and only builds explicitly trusted repositories locally.
+
+Detailed implementation documentation:
+
+`docs/phase-5.4-docker-build-engine.md`
+
+The runtime boundary remains disabled in Phase 5.4.
 
 Future repository-controlled execution must not receive:
 

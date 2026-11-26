@@ -934,6 +934,45 @@ export class WorkspaceManager {
   }
 
   // ================================================
+  // Prepared source resolution (build phase)
+  // ================================================
+
+  /**
+   * Resolve and validate the source directory of a prepared
+   * attempt for the build phase. Verifies containment and
+   * that the source directory exists and is a real directory.
+   *
+   * Does not take local ownership; distributed ownership is
+   * coordinated through PostgreSQL execution leases.
+   */
+  async resolvePreparedSourceDir(
+    deploymentId: string,
+    attemptId: string,
+  ): Promise<string> {
+    const attemptDir = this.attemptPath(
+      deploymentId,
+      attemptId,
+    );
+
+    const sourceDir = join(attemptDir, "source");
+
+    try {
+      await this.assertContainedDirectory(sourceDir);
+    } catch (error) {
+      if (error instanceof SourcePreparationError) {
+        throw error;
+      }
+
+      throw new SourcePreparationError(
+        "WORKSPACE_UNAVAILABLE",
+        "Prepared source workspace is unavailable.",
+      );
+    }
+
+    return sourceDir;
+  }
+
+  // ================================================
   // Explicit attempt cleanup
   // ================================================
 

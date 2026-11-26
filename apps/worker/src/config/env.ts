@@ -123,6 +123,49 @@ function decimalEnv(
   );
 }
 
+function booleanEnv(defaultValue: boolean) {
+  return z.preprocess(
+    (value) => {
+      if (typeof value !== "string") {
+        return value;
+      }
+
+      const normalized = value.trim().toLowerCase();
+
+      if (normalized === "true" || normalized === "1") {
+        return true;
+      }
+
+      if (normalized === "false" || normalized === "0") {
+        return false;
+      }
+
+      return value;
+    },
+
+    z.boolean().default(defaultValue),
+  );
+}
+
+function csvEnv(defaultValue: readonly string[]) {
+  return z.preprocess(
+    (value) => {
+      if (typeof value !== "string") {
+        return value;
+      }
+
+      return value
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0);
+    },
+
+    z
+      .array(z.string().trim().min(1))
+      .default([...defaultValue]),
+  );
+}
+
 function optionalString() {
   return z.preprocess(
     (value) => {
@@ -482,6 +525,68 @@ const envSchema = z
       8 * GiB,
       100 * MiB,
     ),
+
+    // ==============================================
+    // Isolated build engine configuration
+    // ==============================================
+    //
+    // Build execution is disabled by default. Untrusted
+    // repository-controlled builds require strong isolation
+    // that the local Docker driver cannot enforce.
+    // ==============================================
+
+    BUILD_ENABLED: booleanEnv(false),
+
+    BUILD_EXECUTOR: z
+      .enum(["buildkit"])
+      .default("buildkit"),
+
+    BUILD_TRUSTED_LOCAL_ONLY: booleanEnv(true),
+
+    BUILD_TRUSTED_REPOSITORIES: csvEnv([]),
+
+    BUILD_PLATFORM: z
+      .string()
+      .trim()
+      .min(1)
+      .max(40)
+      .regex(
+        /^[A-Za-z0-9._/-]+$/u,
+        "Must be a valid platform identifier.",
+      )
+      .default("linux/amd64"),
+
+    BUILD_MAX_CONCURRENCY: integerEnv(1, 20, 1),
+
+    BUILD_TIMEOUT_MS: integerEnv(
+      SECOND,
+      60 * MINUTE,
+      15 * MINUTE,
+    ),
+
+    BUILD_CPU_LIMIT: integerEnv(1, 64, 2),
+
+    BUILD_MEMORY_LIMIT_MB: integerEnv(128, 65_536, 2_048),
+
+    BUILD_MAX_CONTEXT_BYTES: integerEnv(
+      MiB,
+      8 * GiB,
+      500 * MiB,
+    ),
+
+    BUILD_MAX_LOG_BYTES: integerEnv(
+      KiB,
+      100 * MiB,
+      10 * MiB,
+    ),
+
+    BUILD_MAX_RETRIES: integerEnv(0, 10, 1),
+
+    BUILD_ARTIFACT_TTL_SECONDS: integerEnv(
+      60,
+      7 * 86_400,
+      86_400,
+    ),
   })
 
   // ==================================================
@@ -752,6 +857,60 @@ const envSchema = z
 
           message:
             "Configured duration exceeds supported timer limits.",
+        });
+      }
+    }
+
+    // ==============================================
+    // Build engine configuration
+    // ==============================================
+
+    for (const timer of [
+      {
+        name: "BUILD_TIMEOUT_MS",
+        value: value.BUILD_TIMEOUT_MS,
+      },
+
+      {
+        name: "BUILD_ARTIFACT_TTL_SECONDS",
+        value:
+          value.BUILD_ARTIFACT_TTL_SECONDS * SECOND,
+      },
+    ]) {
+      if (
+        !Number.isSafeInteger(timer.value) ||
+        timer.value <= 0 ||
+        timer.value > MAX_TIMER_MS
+      ) {
+        context.addIssue({
+          code: "custom",
+
+          path: [timer.name],
+
+          message:
+            "Configured build duration exceeds supported timer limits.",
+        });
+      }
+    }
+
+    // The build queue uses a dedicated execution timeout
+    // derived from BUILD_TIMEOUT_MS in worker.ts, so the
+    // build timeout is not constrained by the shared queue
+    // execution timeout here.
+
+    for (const repository of value.BUILD_TRUSTED_REPOSITORIES) {
+      if (
+        !/^[A-Za-z0-9-]{1,39}\/[A-Za-z0-9_.-]{1,100}$/u.test(
+          repository,
+        )
+      ) {
+        context.addIssue({
+          code: "custom",
+
+          path: ["BUILD_TRUSTED_REPOSITORIES"],
+
+          message:
+            "Trusted build repositories must use owner/name format.",
         });
       }
     }

@@ -11,6 +11,7 @@ import type {
 import {
   SourcePreparationError,
   TransientJobError,
+  QueueManager,
 } from "@cloudpilot/queue";
 
 import {
@@ -961,6 +962,41 @@ async function markSourcePrepared(
         },
       },
     });
+
+    // ==============================================
+    // Schedule the build in the same transaction
+    // ==============================================
+    //
+    // The build outbox event is committed atomically
+    // with SOURCE_PREPARED so there is no gap between
+    // the database transition and queue publication.
+    //
+    // When builds are disabled the deployment remains
+    // SOURCE_PREPARED and no build is scheduled.
+    // ==============================================
+
+    if (workerEnv.BUILD_ENABLED) {
+      await tx.deploymentOutboxEvent.create({
+        data: {
+          workspaceId:
+            claim.payload.workspaceId,
+
+          projectId:
+            claim.payload.projectId,
+
+          deploymentId:
+            claim.payload.deploymentId,
+
+          eventType: "BUILD_REQUESTED",
+
+          jobId:
+            QueueManager.deterministicJobId(
+              "build",
+              [claim.payload.deploymentId],
+            ),
+        },
+      });
+    }
 
     return true;
   });

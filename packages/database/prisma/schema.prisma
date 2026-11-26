@@ -22,6 +22,7 @@ enum DeploymentStatus {
   SOURCE_PREPARED
   CLONING
   BUILDING
+  BUILD_SUCCEEDED
   DEPLOYING
   HEALTH_CHECKING
   RUNNING
@@ -39,6 +40,19 @@ enum BuildStatus {
   SUCCEEDED
   FAILED
   CANCELLED
+}
+
+enum DeploymentBuildStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+enum DeploymentBuildArtifactType {
+  DOCKER_IMAGE_STORE
+  OCI_ARCHIVE
 }
 
 enum LogLevel {
@@ -105,6 +119,7 @@ enum DeploymentOutboxStatus {
 
 enum DeploymentOutboxEventType {
   DEPLOYMENT_REQUESTED
+  BUILD_REQUESTED
 }
 
 enum DeploymentSourceStatus {
@@ -367,6 +382,7 @@ model Deployment {
   logs           DeploymentLog[]
   outboxEvents   DeploymentOutboxEvent[]
   sourcePreparation DeploymentSourcePreparation?
+  deploymentBuilds  DeploymentBuild[]
   createdAt      DateTime                @default(now())
   updatedAt      DateTime                @updatedAt
   startedAt      DateTime?
@@ -437,6 +453,61 @@ model DeploymentSourcePreparation {
   @@index([status, expiresAt])
   @@index([workspaceId, projectId, createdAt])
   @@map("deployment_source_preparations")
+}
+
+model DeploymentBuild {
+  id                   String                    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId          String                    @db.Uuid
+  projectId            String                    @db.Uuid
+  deploymentId         String                    @db.Uuid
+  sourcePreparationId  String                    @db.Uuid
+  resolvedCommitSha    String                    @db.VarChar(40)
+  buildAttempt         Int                       @default(1)
+  status               DeploymentBuildStatus     @default(QUEUED)
+  builderType          String?                   @db.VarChar(40)
+  dockerfilePath       String?                   @db.VarChar(500)
+  buildContextPath     String?                   @db.VarChar(500)
+  imageTag             String?                   @db.VarChar(255)
+  imageId              String?                   @db.VarChar(255)
+  imageDigest          String?                   @db.VarChar(255)
+  artifactType         DeploymentBuildArtifactType?
+  artifactLocation     String?                   @db.VarChar(500)
+  platform             String?                   @db.VarChar(40)
+  imageSizeBytes       BigInt?
+  failureCode          String?                   @db.VarChar(80)
+  failureMessage       String?                   @db.Text
+  executionLeaseToken  String?                   @db.Uuid
+  executionLeaseExpiresAt DateTime?
+  startedAt            DateTime?
+  completedAt          DateTime?
+  durationMs           Int?
+  createdAt            DateTime                  @default(now())
+  updatedAt            DateTime                  @updatedAt
+  deployment           Deployment                @relation(fields: [workspaceId, projectId, deploymentId], references: [workspaceId, projectId, id], onDelete: Cascade)
+  logs                 DeploymentBuildLog[]
+
+  @@unique([workspaceId, projectId, deploymentId, buildAttempt])
+  @@unique([workspaceId, projectId, deploymentId, id])
+  @@index([workspaceId, deploymentId, createdAt])
+  @@index([status, createdAt])
+  @@map("deployment_builds")
+}
+
+model DeploymentBuildLog {
+  id            String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId   String          @db.Uuid
+  projectId     String          @db.Uuid
+  deploymentId  String          @db.Uuid
+  buildId       String          @db.Uuid
+  sequence      BigInt
+  stream        String          @db.VarChar(16)
+  message       String          @db.Text
+  createdAt     DateTime        @default(now())
+  build         DeploymentBuild @relation(fields: [workspaceId, projectId, deploymentId, buildId], references: [workspaceId, projectId, deploymentId, id], onDelete: Cascade)
+
+  @@unique([workspaceId, projectId, deploymentId, buildId, sequence])
+  @@index([workspaceId, projectId, deploymentId, buildId, createdAt])
+  @@map("deployment_build_logs")
 }
 
 model Build {

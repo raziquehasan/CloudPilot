@@ -80,7 +80,88 @@ const deploymentSelect = {
   startedAt: true,
   finishedAt: true,
   updatedAt: true,
+  deploymentBuilds: {
+    select: {
+      id: true,
+      buildAttempt: true,
+      status: true,
+      builderType: true,
+      dockerfilePath: true,
+      imageTag: true,
+      imageId: true,
+      imageDigest: true,
+      artifactType: true,
+      platform: true,
+      imageSizeBytes: true,
+      failureCode: true,
+      failureMessage: true,
+      startedAt: true,
+      completedAt: true,
+      durationMs: true,
+    },
+    orderBy: { buildAttempt: "desc" },
+    take: 1,
+  },
 } as const;
+
+// ==================================================
+// BigInt-safe serialization
+// ==================================================
+
+type DeploymentRow = {
+  deploymentBuilds: Array<{
+    id: string;
+    buildAttempt: number;
+    status: string;
+    builderType: string | null;
+    dockerfilePath: string | null;
+    imageTag: string | null;
+    imageId: string | null;
+    imageDigest: string | null;
+    artifactType: string | null;
+    platform: string | null;
+    imageSizeBytes: bigint | null;
+    failureCode: string | null;
+    failureMessage: string | null;
+    startedAt: Date | null;
+    completedAt: Date | null;
+    durationMs: number | null;
+  }>;
+};
+
+function serializeDeployment(row: DeploymentRow) {
+  const { deploymentBuilds, ...rest } = row;
+
+  const latest = deploymentBuilds[0] ?? null;
+
+  return {
+    ...rest,
+
+    build: latest
+      ? {
+          id: latest.id,
+          buildAttempt: latest.buildAttempt,
+          status: latest.status,
+          builderType: latest.builderType,
+          dockerfilePath: latest.dockerfilePath,
+          imageTag: latest.imageTag,
+          imageId: latest.imageId,
+          imageDigest: latest.imageDigest,
+          artifactType: latest.artifactType,
+          platform: latest.platform,
+          imageSizeBytes:
+            latest.imageSizeBytes === null
+              ? null
+              : latest.imageSizeBytes.toString(),
+          failureCode: latest.failureCode,
+          failureMessage: latest.failureMessage,
+          startedAt: latest.startedAt,
+          completedAt: latest.completedAt,
+          durationMs: latest.durationMs,
+        }
+      : null,
+  };
+}
 
 // ==================================================
 // Internal contracts
@@ -429,7 +510,7 @@ async function createDeployment(
 
     res.status(200).json({
       success: true,
-      data: existing,
+      data: serializeDeployment(existing),
       idempotent: true,
     });
 
@@ -811,7 +892,7 @@ async function createDeployment(
     if (result.kind === "existing") {
       res.status(200).json({
         success: true,
-        data: result.deployment,
+        data: serializeDeployment(result.deployment),
         idempotent: true,
       });
 
@@ -892,7 +973,7 @@ async function createDeployment(
           res.status(200).json({
             success: true,
 
-            data: concurrentDeployment,
+            data: serializeDeployment(concurrentDeployment),
 
             idempotent: true,
           });
@@ -1072,7 +1153,7 @@ async function listDeployments(
       success: true,
 
       data: {
-        items,
+        items: items.map(serializeDeployment),
 
         page,
 
@@ -1162,7 +1243,7 @@ async function getDeployment(
 
     res.json({
       success: true,
-      data: deployment,
+      data: serializeDeployment(deployment),
     });
   } catch (error) {
     logger.error(
@@ -1173,6 +1254,7 @@ async function getDeployment(
 
         ...sanitizedError(error),
       },
+
       "Deployment retrieval failed",
     );
 
@@ -1535,7 +1617,7 @@ async function cancelDeployment(
     res.json({
       success: true,
 
-      data: result.deployment,
+      data: serializeDeployment(result.deployment),
     });
   } catch (error) {
     logger.error(
@@ -1546,6 +1628,7 @@ async function cancelDeployment(
 
         ...sanitizedError(error),
       },
+
       "Deployment cancellation failed",
     );
 
@@ -1554,6 +1637,123 @@ async function cancelDeployment(
       503,
       "DEPLOYMENT_CANCELLATION_FAILED",
       "Deployment cancellation could not be confirmed. Refresh the deployment status before retrying.",
+    );
+  }
+}
+
+// ==================================================
+// Build logs
+// ==================================================
+
+async function getBuildLogs(
+  req: Request,
+  res: Response,
+): Promise<void> {
+  disableResponseCaching(res);
+
+  const scope = await resolveProject(req, res);
+
+  if (!scope) {
+    return;
+  }
+
+  const deploymentId =
+    deploymentIdSchema.safeParse(
+      req.params.deploymentId,
+    );
+
+  if (!deploymentId.success) {
+    sendError(
+      res,
+      404,
+      "DEPLOYMENT_NOT_FOUND",
+      "Deployment not found in this project.",
+    );
+
+    return;
+  }
+
+  const deploymentScope = {
+    workspaceId: scope.workspaceId,
+    projectId: scope.projectId,
+    deploymentId: deploymentId.data,
+  };
+
+  try {
+    const build =
+      await prisma.deploymentBuild.findFirst({
+        where: deploymentScope,
+
+        orderBy: { buildAttempt: "desc" },
+
+        select: {
+          id: true,
+          buildAttempt: true,
+          status: true,
+        },
+      });
+
+    if (!build) {
+      res.json({
+        success: true,
+        data: { build: null, logs: [] },
+      });
+
+      return;
+    }
+
+    const logs =
+      await prisma.deploymentBuildLog.findMany({
+        where: {
+          ...deploymentScope,
+          buildId: build.id,
+        },
+
+        orderBy: { sequence: "asc" },
+
+        take: 2_000,
+
+        select: {
+          sequence: true,
+          stream: true,
+          message: true,
+        },
+      });
+
+    res.json({
+      success: true,
+      data: {
+        build: {
+          id: build.id,
+          buildAttempt: build.buildAttempt,
+          status: build.status,
+        },
+
+        logs: logs.map((entry) => ({
+          sequence: entry.sequence.toString(),
+          stream: entry.stream,
+          message: entry.message,
+        })),
+      },
+    });
+  } catch (error) {
+    logger.error(
+      {
+        projectId: scope.projectId,
+
+        deploymentId: deploymentId.data,
+
+        ...sanitizedError(error),
+      },
+
+      "Build log retrieval failed",
+    );
+
+    sendError(
+      res,
+      503,
+      "BUILD_LOG_UNAVAILABLE",
+      "Build logs could not be retrieved right now.",
     );
   }
 }
@@ -1596,6 +1796,13 @@ projectDeploymentRouter.get(
 projectDeploymentRouter.get(
   "/:projectId/deployments/:deploymentId",
   getDeployment,
+);
+
+// Get build logs for the latest build attempt.
+
+projectDeploymentRouter.get(
+  "/:projectId/deployments/:deploymentId/build-logs",
+  getBuildLogs,
 );
 
 // Cancel deployment.
