@@ -36,6 +36,8 @@ import {
 
 import { workerEnv } from "../config/env.js";
 import { workerLogger } from "../config/logger.js";
+import { DeploymentLogWriter } from "../logging/log-writer.js";
+import { emitSystemLog } from "../logging/system-logs.js";
 
 import type { RuntimeExecutor } from "../runtime/runtime-executor.js";
 
@@ -138,6 +140,10 @@ function runtimeScope(payload: RuntimeJob): RuntimeScope {
   };
 }
 
+function deploymentScope({ workspaceId, projectId, deploymentId }: RuntimeScope) {
+  return { workspaceId, projectId, id: deploymentId };
+}
+
 function fencedRuntimeScope(claim: ExecutionClaim, now: Date) {
   return {
     ...runtimeScope(claim.payload),
@@ -156,6 +162,8 @@ async function validateRuntimeOutbox(
   job: Job<QueueJob>,
   payload: RuntimeJob,
 ): Promise<boolean> {
+  if (payload.runtimeInstanceId !== payload.correlationId) return false;
+
   const event =
     await prisma.deploymentOutboxEvent.findFirst({
       where: {
@@ -184,10 +192,9 @@ async function resolveBuildArtifact(
   const build = await prisma.deploymentBuild.findFirst({
     where: {
       ...runtimeScope(payload),
+      id: payload.buildId,
       status: "SUCCEEDED",
     },
-
-    orderBy: { buildAttempt: "desc" },
 
     select: {
       id: true,
@@ -211,110 +218,82 @@ async function resolveBuildArtifact(
 // Atomic runtime claim
 // ==================================================
 
-async function claimRuntime(
+class RuntimeClaimConflict extends Error {}
+
+export async function claimRuntime(
   payload: RuntimeJob,
 ): Promise<ExecutionClaim | null> {
   const now = new Date();
-
   const leaseToken = randomUUID();
+  const leaseExpiresAt = new Date(now.getTime() + workerEnv.DEPLOYMENT_EXECUTION_LEASE_MS);
+  const queuedInstance = {
+    ...runtimeScope(payload),
+    id: payload.runtimeInstanceId,
+    buildId: payload.buildId,
+    status: "QUEUED",
+    executionLeaseToken: null,
+    executionLeaseExpiresAt: null,
+    containerId: null,
+    containerName: null,
+  } as const;
 
-  const leaseExpiresAt = new Date(
-    now.getTime() +
-      workerEnv.DEPLOYMENT_EXECUTION_LEASE_MS,
-  );
-
-  return prisma.$transaction(async (tx) => {
-    // Transition BUILD_SUCCEEDED -> DEPLOYING, fenced by the
-    // absence of an active runtime lease.
-    const transitioned =
-      await tx.deployment.updateMany({
+  try {
+    return await prisma.$transaction(async (tx) => {
+      // Lock the deployment first, in the same order as runtime settlement.
+      const transitioned = await tx.deployment.updateMany({
         where: {
-          ...runtimeScope(payload),
-          status: "BUILD_SUCCEEDED",
+          ...deploymentScope(runtimeScope(payload)),
+          status: { in: ["BUILD_SUCCEEDED", "DEPLOYING"] },
+          runtimeInstances: { some: queuedInstance },
         },
+        data: { status: "DEPLOYING", updatedAt: now },
+      });
 
+      if (transitioned.count !== 1) return null;
+
+      const [instance] = await tx.deploymentRuntimeInstance.updateManyAndReturn({
+        where: queuedInstance,
         data: {
-          status: "DEPLOYING",
-          updatedAt: now,
+          status: "CREATING",
+          executionLeaseToken: leaseToken,
+          executionLeaseExpiresAt: leaseExpiresAt,
+          startedAt: now,
+          readyAt: null,
+          stoppedAt: null,
+          failureCode: null,
+          failureMessage: null,
+        },
+        select: { id: true, runtimeAttempt: true },
+      });
+
+      // Recheck the instance under the write lock and roll back a lost claim.
+      if (!instance) throw new RuntimeClaimConflict();
+
+      await tx.auditLog.create({
+        data: {
+          workspaceId: payload.workspaceId,
+          action: "DEPLOYMENT_RUNTIME_CLAIMED",
+          entityType: "Deployment",
+          entityId: payload.deploymentId,
+          metadata: {
+            runtimeInstanceId: instance.id,
+            runtimeAttempt: instance.runtimeAttempt,
+          },
         },
       });
 
-    if (transitioned.count !== 1) {
-      return null;
-    }
-
-    const runtimeInstance = await tx.deploymentRuntimeInstance.upsert({
-      where: {
-        workspaceId_projectId_deploymentId_runtimeAttempt: {
-          ...runtimeScope(payload),
-          runtimeAttempt: 1,
-        },
-      },
-
-      create: {
-        ...runtimeScope(payload),
-
-        buildId: payload.buildId,
-
-        runtimeAttempt: 1,
-
-        status: "CREATING",
-
-        executionLeaseToken: leaseToken,
-
-        executionLeaseExpiresAt: leaseExpiresAt,
-
+      return {
+        payload,
+        runtimeInstanceId: instance.id,
+        leaseToken,
+        runtimeAttempt: instance.runtimeAttempt,
         startedAt: now,
-      },
-
-      update: {
-        status: "CREATING",
-
-        executionLeaseToken: leaseToken,
-
-        executionLeaseExpiresAt: leaseExpiresAt,
-
-        startedAt: now,
-
-        readyAt: null,
-
-        stoppedAt: null,
-
-        failureCode: null,
-
-        failureMessage: null,
-      },
+      };
     });
-
-    await tx.auditLog.create({
-      data: {
-        workspaceId: payload.workspaceId,
-
-        action: "DEPLOYMENT_RUNTIME_CLAIMED",
-
-        entityType: "Deployment",
-
-        entityId: payload.deploymentId,
-
-        metadata: {
-          runtimeInstanceId: runtimeInstance.id,
-          runtimeAttempt: runtimeInstance.runtimeAttempt,
-        },
-      },
-    });
-
-    return {
-      payload,
-
-      runtimeInstanceId: runtimeInstance.id,
-
-      leaseToken,
-
-      runtimeAttempt: runtimeInstance.runtimeAttempt,
-
-      startedAt: now,
-    };
-  });
+  } catch (error) {
+    if (error instanceof RuntimeClaimConflict) return null;
+    throw error;
+  }
 }
 
 // ==================================================
@@ -367,7 +346,7 @@ async function renewRuntimeLease(
   }
 
   const deployment = await prisma.deployment.findFirst({
-    where: runtimeScope(claim.payload),
+    where: deploymentScope(runtimeScope(claim.payload)),
     select: { status: true },
   });
 
@@ -495,7 +474,7 @@ async function persistContainerIdentity(
       data: {
         containerId: container.containerId,
         containerName: container.containerName,
-        hostPort: container.hostPort,
+        hostPort: container.hostPort === 0 ? null : container.hostPort,
         networkName: container.networkName,
         status: "STARTING",
       },
@@ -527,7 +506,7 @@ async function settleSuccess(
     const scope = runtimeScope(claim.payload);
 
     const cancelled = await tx.deployment.updateMany({
-      where: { ...scope, status: "CANCELLING" },
+      where: { ...deploymentScope(scope), status: "CANCELLING" },
 
       data: {
         status: "CANCELLED",
@@ -582,7 +561,7 @@ async function settleSuccess(
 
     // DEPLOYING -> HEALTH_CHECKING -> RUNNING
     const checking = await tx.deployment.updateMany({
-      where: { ...scope, status: "DEPLOYING" },
+      where: { ...deploymentScope(scope), status: "DEPLOYING" },
       data: { status: "HEALTH_CHECKING", updatedAt: now },
     });
 
@@ -591,7 +570,7 @@ async function settleSuccess(
     }
 
     const running = await tx.deployment.updateMany({
-      where: { ...scope, status: "HEALTH_CHECKING" },
+      where: { ...deploymentScope(scope), status: "HEALTH_CHECKING" },
       data: {
         status: "RUNNING",
         failureCode: null,
@@ -640,7 +619,7 @@ async function settleFailure(
     const fence = fencedRuntimeScope(claim, now);
 
     const cancelled = await tx.deployment.updateMany({
-      where: { ...scope, status: "CANCELLING" },
+      where: { ...deploymentScope(scope), status: "CANCELLING" },
 
       data: {
         status: "CANCELLED",
@@ -689,7 +668,7 @@ async function settleFailure(
 
     if (!retryable) {
       await tx.deployment.updateMany({
-        where: { ...scope, status: "DEPLOYING" },
+        where: { ...deploymentScope(scope), status: "DEPLOYING" },
         data: {
           status: "FAILED",
           failureCode: "RUNTIME_FAILED",
@@ -830,7 +809,7 @@ export async function processRuntimeJob(
   // ================================================
 
   const existing = await prisma.deployment.findFirst({
-    where: runtimeScope(payload),
+    where: deploymentScope(runtimeScope(payload)),
     select: { status: true },
   });
 
@@ -879,7 +858,7 @@ export async function processRuntimeJob(
 
   if (!claimed) {
     const current = await prisma.deployment.findFirst({
-      where: runtimeScope(payload),
+      where: deploymentScope(runtimeScope(payload)),
       select: { status: true },
     });
 
@@ -906,6 +885,8 @@ export async function processRuntimeJob(
   const monitor = createRuntimeMonitor(claim, signal);
 
   let containerName: string | null = null;
+  let containerCreationStarted = false;
+  let stage = "runtime configuration";
 
   try {
     // ==============================================
@@ -935,7 +916,7 @@ export async function processRuntimeJob(
     // ==============================================
 
     const deployment = await prisma.deployment.findFirst({
-      where: runtimeScope(payload),
+      where: deploymentScope(runtimeScope(payload)),
       select: { environment: true },
     });
 
@@ -946,6 +927,7 @@ export async function processRuntimeJob(
       );
     }
 
+    stage = "runtime environment resolution";
     let env: Record<string, string> = {};
 
     if (workerEnv.ENVIRONMENT_VARIABLE_ENCRYPTION_KEY) {
@@ -980,6 +962,7 @@ export async function processRuntimeJob(
     // Verify runtime capabilities
     // ==============================================
 
+    stage = "Docker capability probe";
     const capabilities = await options.executor.probe();
 
     if (!capabilities.available) {
@@ -998,6 +981,7 @@ export async function processRuntimeJob(
       payload.projectId,
     );
 
+    stage = "managed network verification";
     await options.executor.ensureNetwork(networkName, {
       "cloudpilot.managed": "true",
       "cloudpilot.projectId": payload.projectId,
@@ -1012,6 +996,8 @@ export async function processRuntimeJob(
     // Create the container
     // ==============================================
 
+    containerCreationStarted = true;
+    stage = "container creation";
     const createdContainer =
       await options.executor.createContainer({
         imageId: artifact.imageId,
@@ -1039,6 +1025,7 @@ export async function processRuntimeJob(
       throw new RuntimeDeploymentError("RUNTIME_CANCELLED");
     }
 
+    stage = "container identity persistence";
     const persisted = await persistContainerIdentity(
       claim,
       createdContainer,
@@ -1052,6 +1039,7 @@ export async function processRuntimeJob(
     // Start the container
     // ==============================================
 
+    stage = "container startup";
     await options.executor.startContainer(
       createdContainer.containerName,
       monitor.signal,
@@ -1065,25 +1053,33 @@ export async function processRuntimeJob(
     // Verify startup
     // ==============================================
 
+    stage = "started container inspection";
     const inspection =
       await options.executor.inspectContainer(
         createdContainer.containerName,
       );
 
-    if (!inspection.running) {
+    if (
+      !inspection.running ||
+      inspection.containerId !== createdContainer.containerId ||
+      inspection.imageId !== artifact.imageId ||
+      inspection.hostPort === null
+    ) {
       throw new RuntimeDeploymentError(
         "CONTAINER_START_FAILED",
-        "The container is not running.",
+        "The running container identity or loopback port could not be verified.",
       );
     }
+    assertValidContainerPort(inspection.hostPort);
 
     // ==============================================
     // Startup readiness (loopback liveness)
     // ==============================================
 
+    stage = "loopback readiness check";
     const ready = await waitForReadiness(
       workerEnv.RUNTIME_BIND_HOST,
-      createdContainer.hostPort,
+      inspection.hostPort,
       workerEnv.RUNTIME_STARTUP_TIMEOUT_MS,
       workerEnv.RUNTIME_HEALTH_CHECK_INTERVAL_MS,
       monitor.signal,
@@ -1107,10 +1103,11 @@ export async function processRuntimeJob(
     // Publish verified success
     // ==============================================
 
+    stage = "runtime settlement";
     const settled = await settleSuccess(claim, {
       containerId: createdContainer.containerId,
       containerName: createdContainer.containerName,
-      hostPort: createdContainer.hostPort,
+      hostPort: inspection.hostPort,
       networkName: createdContainer.networkName,
       imageId: artifact.imageId,
       imageTag: artifact.imageTag,
@@ -1122,7 +1119,7 @@ export async function processRuntimeJob(
           deploymentId: payload.deploymentId,
           runtimeInstanceId: claim.runtimeInstanceId,
           containerName: createdContainer.containerName,
-          hostPort: createdContainer.hostPort,
+          hostPort: inspection.hostPort,
         },
         "Container deployment succeeded",
       );
@@ -1150,11 +1147,22 @@ export async function processRuntimeJob(
             ),
           );
 
+    const diagnostic = {
+      deploymentId: payload.deploymentId,
+      runtimeInstanceId: claim.runtimeInstanceId,
+      stage,
+      failureCode: runtimeError.code,
+    };
+    if (runtimeError.code !== "RUNTIME_CANCELLED") {
+      workerLogger.warn(diagnostic, "Container deployment operation failed");
+    }
+
     const interrupted =
       signal.aborted ||
       monitor.state === "unavailable";
 
     const retryable =
+      !containerCreationStarted &&
       (runtimeError.retryable || interrupted) &&
       hasRuntimeRetryBudget(job);
 
@@ -1175,6 +1183,21 @@ export async function processRuntimeJob(
 
     if (settled === "cancelled") {
       return { status: "cancelled" };
+    }
+
+    if (settled === "failed" && workerEnv.DEPLOYMENT_LOGS_ENABLED) {
+      try {
+        const writer = new DeploymentLogWriter({
+          ...runtimeScope(payload),
+          runtimeInstanceId: claim.runtimeInstanceId,
+          maxEntryBytes: workerEnv.LOG_MAX_ENTRY_BYTES,
+        });
+        // Only fixed stage names and normalized failure codes enter the log.
+        emitSystemLog(writer, `Runtime failed during ${stage} (${runtimeError.code}).`, "ERROR");
+        await writer.stop();
+      } catch {
+        workerLogger.warn(diagnostic, "Runtime failure log could not be persisted");
+      }
     }
 
     if (settled === "retry") {
@@ -1261,7 +1284,7 @@ async function processRuntimeLifecycle(
         });
 
         await tx.deployment.updateMany({
-          where: { ...scope, status: "RUNNING" },
+          where: { ...deploymentScope(scope), status: "RUNNING" },
           data: { status: "STOPPED", updatedAt: now },
         });
 
@@ -1334,7 +1357,7 @@ async function processRuntimeLifecycle(
       });
 
       await tx.deployment.updateMany({
-        where: { ...scope, status: "STOPPED" },
+        where: { ...deploymentScope(scope), status: "STOPPED" },
         data: { status: "RUNNING", updatedAt: now },
       });
 

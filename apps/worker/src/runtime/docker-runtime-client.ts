@@ -1512,6 +1512,24 @@ function resolveHistoricalSince(
 // Docker runtime executor
 // ==================================================
 
+export function readDockerRuntimeCapabilities(info: unknown): RuntimeCapabilities {
+  const linux = isRecord(info) && info.OSType === "linux";
+  const supportsResourceLimits = linux &&
+    info.MemoryLimit === true &&
+    info.CpuCfsQuota === true &&
+    info.PidsLimit === true;
+  const supportsNetworkIsolation = linux && isRecord(info.Plugins) &&
+    Array.isArray(info.Plugins.Network) && info.Plugins.Network.includes("bridge");
+
+  return {
+    available: supportsResourceLimits && supportsNetworkIsolation,
+    runtimeType: "docker",
+    supportsResourceLimits,
+    supportsNetworkIsolation,
+    supportsStrongIsolation: false,
+  };
+}
+
 export class DockerRuntimeExecutor
   implements RuntimeExecutor
 {
@@ -1520,18 +1538,7 @@ export class DockerRuntimeExecutor
   // ==================================================
 
   async probe(): Promise<RuntimeCapabilities> {
-    const unavailableCapabilities:
-      RuntimeCapabilities = {
-        available: false,
-
-        runtimeType: "docker",
-
-        supportsResourceLimits: false,
-
-        supportsNetworkIsolation: false,
-
-        supportsStrongIsolation: false,
-      };
+    const unavailableCapabilities = readDockerRuntimeCapabilities(null);
 
     try {
       const version = await runProcess({
@@ -1556,11 +1563,8 @@ export class DockerRuntimeExecutor
         args: [
           "info",
           "--format",
-          '{"OSType":{{json .OSType}},' +
-            '"MemoryLimit":{{json .MemoryLimit}},' +
-            '"CpuCfsQuota":{{json .CpuCfsQuota}},' +
-            '"PidsLimit":{{json .PidsLimit}},' +
-            '"Network":{{json .Plugins.Network}}}',
+          // JSON keys are stable even when CLI template fields use different casing.
+          "{{json .}}",
         ],
 
         timeoutMs: PROBE_TIMEOUT_MS,
@@ -1573,37 +1577,7 @@ export class DockerRuntimeExecutor
         return unavailableCapabilities;
       }
 
-      const parsed: unknown = JSON.parse(
-        info.stdout,
-      );
-
-      if (
-        !isRecord(parsed) ||
-        parsed.OSType !== "linux"
-      ) {
-        return unavailableCapabilities;
-      }
-
-      const supportsResourceLimits =
-        parsed.MemoryLimit === true &&
-        parsed.CpuCfsQuota === true &&
-        parsed.PidsLimit === true;
-
-      const supportsNetworkIsolation =
-        Array.isArray(parsed.Network) &&
-        parsed.Network.includes("bridge");
-
-      return {
-        available: true,
-
-        runtimeType: "docker",
-
-        supportsResourceLimits,
-
-        supportsNetworkIsolation,
-
-        supportsStrongIsolation: false,
-      };
+      return readDockerRuntimeCapabilities(JSON.parse(info.stdout) as unknown);
     } catch {
       return unavailableCapabilities;
     }

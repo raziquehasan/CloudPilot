@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState, useSyncExternalStore, type FormEvent } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore, type FormEvent } from "react";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import {
@@ -13,8 +13,9 @@ import { GitHubIcon } from "@/components/shared/github-icon";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
-import { apiFetch } from "@/lib/api";
-import { useRepository } from "@/lib/repository-intelligence";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { ApiError, apiFetch } from "@/lib/api";
+import { useBuildConfiguration, useRepository } from "@/lib/repository-intelligence";
 import { useDashboard } from "@/components/dashboard/dashboard-provider";
 import { ProjectSectionView, projectSections } from "./project-section-view";
 import type { Project } from "./project-types";
@@ -25,6 +26,148 @@ function subscribeToNavigationWidth(listener: () => void) {
   const query = window.matchMedia(wideNavigation);
   query.addEventListener("change", listener);
   return () => query.removeEventListener("change", listener);
+}
+
+interface DeploymentReadiness {
+  repository: { connected: boolean; trusted: boolean };
+  buildConfiguration: { configured: boolean };
+  execution: { available: boolean };
+}
+
+type DeployEnvironment = "DEVELOPMENT" | "STAGING" | "PRODUCTION" | "PREVIEW";
+
+function DeployControl({ project, branch, canManage }: { project: Project; branch: string; canManage: boolean }) {
+  const router = useRouter();
+  const queryClient = useQueryClient();
+  const { activeWorkspace } = useDashboard();
+  const workspaceId = activeWorkspace?.id;
+  const build = useBuildConfiguration(project.id, workspaceId);
+  const readinessQuery = useQuery({
+    queryKey: ["deployment-readiness", workspaceId, project.id, branch, build.data?.configuration?.updatedAt],
+    queryFn: ({ signal }) => apiFetch<DeploymentReadiness>(`/projects/${encodeURIComponent(project.id)}/deployment-readiness`, { signal }),
+    enabled: Boolean(project.id && workspaceId && canManage && build.isSuccess),
+    refetchInterval: 20_000,
+  });
+  const [open, setOpen] = useState(false);
+  const [environment, setEnvironment] = useState<DeployEnvironment>("PRODUCTION");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
+  const inFlight = useRef(false);
+  const request = useRef<{ body: string; key: string } | null>(null);
+
+  const readiness = readinessQuery.data;
+  const configured = readiness?.buildConfiguration.configured ?? false;
+  const executionAvailable = readiness?.execution.available ?? false;
+  const repositoryConnected = readiness?.repository.connected ?? false;
+  const repositoryTrusted = readiness?.repository.trusted ?? false;
+  const configSaved = build.isSuccess && build.data.saved && Boolean(build.data.configuration);
+
+  // Eligible only when the project is manageable, the repository is
+  // connected, a build configuration is saved, and the backend reports
+  // execution readiness. The server re-validates all of these regardless.
+  const eligible = canManage && readinessQuery.isSuccess && repositoryConnected && repositoryTrusted
+    && configured && configSaved && executionAvailable && Boolean(branch);
+  const checking = readinessQuery.isPending || build.isPending;
+
+  const reason = !canManage
+    ? "Workspace administrator access is required to deploy."
+    : checking
+      ? "Checking deployment readiness…"
+      : readinessQuery.isError || build.isError
+        ? "Deployment readiness could not be verified."
+      : !repositoryConnected
+        ? "Connect an authorized GitHub repository before deploying."
+        : !repositoryTrusted
+          ? "This repository is not authorized for local builds."
+        : !branch
+          ? "Select a branch before deploying."
+          : !configSaved || !configured
+            ? "Save a complete build configuration before deploying."
+            : !executionAvailable
+              ? "A deployment engine is not available right now."
+              : "";
+
+  function openDialog() {
+    if (!eligible || submitting) return;
+    const savedEnvironment = build.data?.configuration?.environment;
+    setEnvironment(savedEnvironment ?? "PRODUCTION");
+    setError("");
+    setOpen(true);
+  }
+
+  async function submit() {
+    if (!eligible || inFlight.current) return;
+    inFlight.current = true;
+    setSubmitting(true);
+    setError("");
+    let created = false;
+    try {
+      const latest = await readinessQuery.refetch({ throwOnError: true });
+      if (!latest.data?.execution.available) {
+        setError("Deployment readiness changed. Check the project configuration and try again.");
+        return;
+      }
+      const body = JSON.stringify({ branch, environment });
+      if (request.current?.body !== body) request.current = { body, key: crypto.randomUUID() };
+      const result = await apiFetch<{ id: string; status: string; failureMessage?: string | null }>(`/projects/${encodeURIComponent(project.id)}/deployments`, {
+        method: "POST",
+        headers: { "Idempotency-Key": request.current.key },
+        body,
+      });
+      created = true;
+      queryClient.setQueryData(["deployment-status", workspaceId, project.id, result.id], {
+        status: result.status,
+        failureMessage: result.failureMessage ?? null,
+      });
+      setOpen(false);
+      const query = new URLSearchParams({ deployment: result.id, project: project.id });
+      router.push(`/dashboard/logs?${query.toString()}`);
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 403) {
+        setError(`Deployment request denied. ${cause.message}`);
+      } else {
+        setError(cause instanceof Error ? cause.message : "The deployment could not be created.");
+      }
+    } finally {
+      if (!created) {
+        inFlight.current = false;
+        setSubmitting(false);
+      }
+    }
+  }
+
+  const configuration = build.data?.configuration;
+
+  return <>
+    <span title={!eligible ? reason : undefined}>
+      <Button variant="outline" size="sm" disabled={!eligible || submitting} onClick={openDialog} aria-label={eligible ? undefined : `Deploy. ${reason}`}><Rocket />Deploy</Button>
+    </span>
+    <Dialog open={open} onOpenChange={(next) => { if (!submitting) setOpen(next); }}>
+      <DialogContent className="max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Deploy {project.name}</DialogTitle>
+          <DialogDescription>Confirm the deployment target. A new deployment will be queued on the connected deployment worker.</DialogDescription>
+        </DialogHeader>
+        <dl className="grid gap-3 text-sm sm:grid-cols-[auto_minmax(0,1fr)]">
+          <dt className="text-muted-foreground">Repository</dt>
+          <dd className="min-w-0 [overflow-wrap:anywhere] font-medium">{project.repository?.fullName ?? "Connected repository"}</dd>
+          <dt className="text-muted-foreground">Branch</dt>
+          <dd className="min-w-0 [overflow-wrap:anywhere] font-mono">{branch}</dd>
+          <dt className="text-muted-foreground">Environment</dt>
+          <dd><select aria-label="Deployment environment" value={environment} disabled={submitting} onChange={(event) => setEnvironment(event.target.value as DeployEnvironment)} className="h-9 w-full rounded-md border bg-background px-2 text-sm sm:w-auto">{(["DEVELOPMENT", "STAGING", "PRODUCTION", "PREVIEW"] as const).map((value) => <option key={value} value={value}>{value.charAt(0) + value.slice(1).toLowerCase()}</option>)}</select></dd>
+          <dt className="text-muted-foreground">Build configuration</dt>
+          <dd className="min-w-0 space-y-1 [overflow-wrap:anywhere]">
+            {configuration ? <><p className="font-medium">{configuration.framework ?? "Custom build"}{configuration.runtime ? ` · ${configuration.runtime}` : ""}</p>{configuration.dockerfilePath ? <p className="text-xs text-muted-foreground">Dockerfile: {configuration.dockerfilePath}</p> : configuration.buildCommand ? <p className="text-xs text-muted-foreground">Build: {configuration.buildCommand}</p> : null}</> : <span className="text-muted-foreground">Saved configuration</span>}
+          </dd>
+        </dl>
+        {(error || !eligible) && <p role="alert" className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">{error || reason}</p>}
+        <DialogFooter>
+          <Button type="button" variant="outline" disabled={submitting} onClick={() => setOpen(false)}>Cancel</Button>
+          <Button type="button" disabled={!eligible || submitting} onClick={() => void submit()}>{submitting ? "Deploying…" : "Deploy now"}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  </>;
 }
 
 export default function ProjectDetailsPage() {
@@ -118,11 +261,10 @@ export default function ProjectDetailsPage() {
                   </div>
                 </div>
                 <div className="flex shrink-0 flex-wrap items-center gap-2">
-                  <Button variant="outline" size="sm" disabled aria-describedby="deployment-requirement"><Rocket />Deploy</Button>
+                  <DeployControl key={`${activeWorkspace?.id}:${project.id}`} project={project} branch={repository?.selectedBranch ?? project.repository?.selectedBranch ?? ""} canManage={activeWorkspace?.role === "OWNER" || activeWorkspace?.role === "ADMIN"} />
                   <DropdownMenu><DropdownMenuTrigger asChild><Button variant="outline" size="sm" aria-label="Project actions"><span className="hidden sm:inline">Actions</span><ChevronDown /></Button></DropdownMenuTrigger><DropdownMenuContent align="end" className="w-48"><DropdownMenuItem onSelect={() => setEditing(true)}><Pencil />Edit project</DropdownMenuItem><DropdownMenuItem onSelect={() => router.push(`/dashboard/projects/${project.id}/settings`)}><Settings2 />Settings</DropdownMenuItem><DropdownMenuSeparator /><DropdownMenuItem variant="destructive" onSelect={() => void remove()}><Trash2 />Delete project</DropdownMenuItem></DropdownMenuContent></DropdownMenu>
                 </div>
               </div>
-              <p id="deployment-requirement" className="border-t px-3 py-2 text-xs text-muted-foreground sm:px-4">Deploy requires a deployment engine.</p>
             </section>
 
             <nav aria-label="Project navigation" className="mb-4 flex flex-wrap items-center gap-1 border-b">

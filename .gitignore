@@ -8,6 +8,11 @@ dist
 coverage
 *.log
 logs
+!/apps/web/app/dashboard/logs/
+/apps/web/app/dashboard/logs/*
+!/apps/web/app/dashboard/logs/page.tsx
+!/apps/web/app/dashboard/logs/deployment-logs-client.tsx
+!/apps/web/app/dashboard/logs/log-terminal.tsx
 .cache
 .turbo
 tmp

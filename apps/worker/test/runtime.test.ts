@@ -38,6 +38,39 @@ import {
   buildReadinessUrl,
   probeTcp,
 } from "../src/runtime/runtime-readiness.js";
+import { readDockerRuntimeCapabilities } from "../src/runtime/docker-runtime-client.js";
+
+test("Docker runtime requires explicit resource limits and a Linux bridge driver", () => {
+  const dockerInfo = {
+    ServerVersion: "29.9.3",
+    OSType: "linux",
+    MemoryLimit: true,
+    CpuCfsQuota: true,
+    PidsLimit: true,
+    Plugins: { Network: ["bridge", "host", "null"] },
+  };
+  assert.deepEqual(readDockerRuntimeCapabilities(dockerInfo), {
+    available: true,
+    runtimeType: "docker",
+    supportsResourceLimits: true,
+    supportsNetworkIsolation: true,
+    supportsStrongIsolation: false,
+  });
+
+  for (const capability of ["MemoryLimit", "CpuCfsQuota", "PidsLimit"] as const) {
+    for (const value of [false, undefined, "true"]) {
+      const result = readDockerRuntimeCapabilities({ ...dockerInfo, [capability]: value });
+      assert.equal(result.available, false);
+      assert.equal(result.supportsResourceLimits, false);
+    }
+  }
+  for (const info of [null, { ...dockerInfo, OSType: "windows" }, { ...dockerInfo, Plugins: { Network: ["host"] } }]) {
+    const result = readDockerRuntimeCapabilities(info);
+    assert.equal(result.available, false);
+    assert.equal(result.supportsNetworkIsolation, false);
+    assert.equal(result.supportsStrongIsolation, false);
+  }
+});
 
 // ==================================================
 // Managed container identity
@@ -373,7 +406,8 @@ test("resolveRuntimeEnvironment decrypts with matching context", () => {
     [stored],
   );
 
-  assert.deepEqual(resolved, {
+  assert.equal(Object.getPrototypeOf(resolved), null);
+  assert.deepEqual({ ...resolved }, {
     DATABASE_URL: "postgres://secret",
   });
 });

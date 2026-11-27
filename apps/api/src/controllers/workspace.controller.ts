@@ -3,6 +3,7 @@ import type { Request, Response } from "express";
 import { z } from "zod";
 import { prisma } from "@cloudpilot/database";
 import { requireAuth, requireCsrf } from "../middlewares/auth.middleware.js";
+import { deploymentSelect, serializeDeployment } from "./project-deployment.controller.js";
 
 const nameSchema = z.object({ name: z.string().trim().min(1).max(80) }).strict();
 const projectSchema = z.object({ name: z.string().trim().min(1).max(80), description: z.string().trim().max(500).optional().nullable() }).strict();
@@ -79,8 +80,33 @@ async function overview(req: Request, res: Response) {
 }
 async function listDeployments(req: Request, res: Response) {
   const member = await activeWorkspace(req);
-  const data = member ? await prisma.deployment.findMany({ where: { workspaceId: member.workspaceId }, orderBy: { createdAt: "desc" }, take: 100, select: { id: true, status: true, environment: true, triggerSource: true, createdAt: true, startedAt: true, finishedAt: true, failureCode: true, project: { select: { id: true, name: true } } } }) : [];
+  const data = member ? await readWorkspaceDeployments(member.workspaceId) : [];
   res.json({ success: true, data });
+}
+
+export async function readWorkspaceDeployments(workspaceId: string) {
+  const rows = await prisma.deployment.findMany({
+    where: { workspaceId },
+    orderBy: { createdAt: "desc" },
+    take: 100,
+    select: {
+      id: true,
+      status: true,
+      environment: true,
+      triggerSource: true,
+      commitSha: true,
+      createdAt: true,
+      startedAt: true,
+      finishedAt: true,
+      failureCode: true,
+      project: { select: { id: true, name: true } },
+      deploymentBuilds: deploymentSelect.deploymentBuilds,
+      runtimeInstances: deploymentSelect.runtimeInstances,
+    },
+  });
+
+  // The workspace list uses the same nullable summaries as project deployment details.
+  return rows.map(serializeDeployment);
 }
 async function listTeam(req: Request, res: Response) {
   const member = await activeWorkspace(req);

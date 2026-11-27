@@ -94,7 +94,7 @@ export async function getDeploymentReadiness(workspaceId: string, projectId: str
 
   let project: {
     repository: { fullName: string | null; selectedBranch: string | null; installation: { status: string } | null } | null;
-    buildConfiguration: { framework: string | null; runtime: string | null; buildCommand: string | null } | null;
+    buildConfiguration: { framework: string | null; runtime: string | null; buildCommand: string | null; dockerfilePath: string | null } | null;
   } | null = null;
   let outboxStats: Array<{ status: string; _count: { _all: number } }> = [];
   if (database.healthy) {
@@ -110,7 +110,7 @@ export async function getDeploymentReadiness(workspaceId: string, projectId: str
             },
           },
           buildConfiguration: {
-            select: { framework: true, runtime: true, buildCommand: true },
+            select: { framework: true, runtime: true, buildCommand: true, dockerfilePath: true },
           },
         },
       }),
@@ -137,10 +137,15 @@ export async function getDeploymentReadiness(workspaceId: string, projectId: str
       && project.repository.selectedBranch
       && project.repository.installation?.status === "ACTIVE",
   );
+  const repositoryFullName = project?.repository?.fullName?.toLowerCase();
+  const repositoryTrusted = Boolean(repositoryFullName && process.env.BUILD_TRUSTED_REPOSITORIES
+    ?.split(",")
+    .some((entry) => entry.trim().toLowerCase() === repositoryFullName));
   const buildConfigured = Boolean(
-    project?.buildConfiguration?.framework
-      && project.buildConfiguration.runtime
-      && project.buildConfiguration.buildCommand,
+    project?.buildConfiguration?.dockerfilePath
+      || (project?.buildConfiguration?.framework
+        && project.buildConfiguration.runtime
+        && project.buildConfiguration.buildCommand),
   );
   const deploymentWorker = workerSummary(deploymentWorkers);
   const diagnosticWorker = workerSummary(diagnosticWorkers);
@@ -148,9 +153,10 @@ export async function getDeploymentReadiness(workspaceId: string, projectId: str
   const outboxPublisherAvailable = outboxRuntime.running
     && Boolean(outboxRuntime.lastSuccessfulRunAt)
     && Date.now() - new Date(outboxRuntime.lastSuccessfulRunAt!).getTime() < queueEnv.DEPLOYMENT_OUTBOX_PUBLISH_INTERVAL_MS * 3;
-  const executionCapabilitiesAvailable = deploymentWorker.capabilities.sourceRetrieval
-    && deploymentWorker.capabilities.dockerBuild
-    && deploymentWorker.capabilities.containerExecution;
+  const executionCapabilitiesAvailable = deploymentWorkers.some(({ available, draining, capabilities }) =>
+    available && !draining && capabilities.deploymentQueue && capabilities.sourceRetrieval
+    && capabilities.workspaceStorage && capabilities.dockerBuild && capabilities.containerRuntime,
+  );
   const pendingOutboxEvents = outboxStats
     .filter((entry) => entry.status === "PENDING" || entry.status === "PUBLISHING")
     .reduce((count, entry) => count + entry._count._all, 0);
@@ -175,7 +181,7 @@ export async function getDeploymentReadiness(workspaceId: string, projectId: str
       diagnostic: diagnosticWorker,
       deployment: deploymentWorker,
     },
-    repository: { connected: repositoryConnected },
+    repository: { connected: repositoryConnected, trusted: repositoryTrusted },
     commitResolution: { available: repositoryConnected && sourceRetrievalAvailable },
     sourceRetrieval: {
       available: sourceRetrievalAvailable && workspaceStorageAvailable,
@@ -216,6 +222,7 @@ export async function getDeploymentReadiness(workspaceId: string, projectId: str
         && deploymentWorker.available
         && executionCapabilitiesAvailable
         && repositoryConnected
+        && repositoryTrusted
         && buildConfigured,
     },
   };

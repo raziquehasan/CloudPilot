@@ -31,6 +31,7 @@ import {
 } from "../src/build/dockerfile-validator.ts";
 
 import { runBuild } from "../src/build/build-engine.ts";
+import { assertManagedImageTag } from "../src/build/buildkit-client.ts";
 
 import type {
   BuilderCapabilities,
@@ -168,6 +169,33 @@ test("image tag rejects invalid identifiers", () => {
   );
 });
 
+test("BuildKit accepts only canonical deployment-scoped image tags", () => {
+  const project = "abcdefab-abcd-abcd-abcd-abcdefabcdef";
+  const deployment = "abcdefab-abcd-abcd-abcd-123456abcdef";
+  const tag = generateImageTag({
+    projectId: project.toUpperCase(),
+    deploymentId: deployment.toUpperCase(),
+    resolvedCommitSha: sha,
+    buildAttempt: 12,
+  });
+  assert.equal(tag, `cloudpilot/project-${project}:${sha}-${deployment}-12`);
+
+  assert.doesNotThrow(() => assertManagedImageTag(tag));
+
+  for (const invalid of [
+    `cloudpilot/project-${project}:${sha}-12`,
+    tag.replace(project, project.toUpperCase()),
+    tag.replace(deployment, deployment.toUpperCase()),
+    tag.replace(sha, sha.toUpperCase()),
+    tag.replace(/12$/, "0"),
+    tag.replace(/12$/, "9007199254740992"),
+    `registry.example/${tag}`,
+    "alpine:latest",
+  ]) {
+    assert.throws(() => assertManagedImageTag(invalid), expectBuildError("BUILD_POLICY_VIOLATION"));
+  }
+});
+
 // --------------------------------------------------
 // Policy tests
 // --------------------------------------------------
@@ -248,6 +276,7 @@ test("log collector enforces a byte bound", () => {
   const collector = new BuildLogCollector({ maxLogBytes: 32 });
 
   collector.append("stdout", "x".repeat(100));
+  collector.finalize();
 
   assert.equal(collector.isTruncated, true);
   assert.ok(collector.sizeBytes <= 32);

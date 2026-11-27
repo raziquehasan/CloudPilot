@@ -63,7 +63,7 @@ const REPOSITORY_NAME_PATTERN =
 // Public deployment selection
 // ==================================================
 
-const deploymentSelect = {
+export const deploymentSelect = {
   id: true,
   projectId: true,
   environment: true,
@@ -105,7 +105,7 @@ const deploymentSelect = {
     orderBy: { buildAttempt: "desc" },
     take: 1,
   },
-  deploymentRuntimeInstances: {
+  runtimeInstances: {
     select: {
       id: true,
       runtimeAttempt: true,
@@ -154,7 +154,7 @@ type DeploymentRow = {
     completedAt: Date | null;
     durationMs: number | null;
   }>;
-  deploymentRuntimeInstances: Array<{
+  runtimeInstances: Array<{
     id: string;
     runtimeAttempt: number;
     status: string;
@@ -176,12 +176,12 @@ type DeploymentRow = {
   }>;
 };
 
-function serializeDeployment(row: DeploymentRow) {
-  const { deploymentBuilds, deploymentRuntimeInstances, ...rest } = row;
+export function serializeDeployment<T extends DeploymentRow>(row: T) {
+  const { deploymentBuilds, runtimeInstances, ...rest } = row;
 
   const latest = deploymentBuilds[0] ?? null;
 
-  const runtime = deploymentRuntimeInstances[0] ?? null;
+  const runtime = runtimeInstances[0] ?? null;
 
   return {
     ...rest,

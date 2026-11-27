@@ -948,6 +948,8 @@ export class WorkspaceManager {
   async resolvePreparedSourceDir(
     deploymentId: string,
     attemptId: string,
+    repositoryFullName: string,
+    commitSha: string,
   ): Promise<string> {
     const attemptDir = this.attemptPath(
       deploymentId,
@@ -967,6 +969,18 @@ export class WorkspaceManager {
         "WORKSPACE_UNAVAILABLE",
         "Prepared source workspace is unavailable.",
       );
+    }
+
+    // GitHub tarballs wrap the repository in an owner-repo-commit directory.
+    const [entry, ...others] = await readdir(sourceDir, { withFileTypes: true });
+    const prefix = `${repositoryFullName.replace("/", "-").toLowerCase()}-`;
+    if (entry?.isDirectory() && others.length === 0 && entry.name.toLowerCase().startsWith(prefix)) {
+      const shortSha = entry.name.slice(prefix.length).toLowerCase();
+      if (/^[0-9a-f]{7,40}$/u.test(shortSha) && commitSha.startsWith(shortSha)) {
+        const repositoryDir = join(sourceDir, entry.name);
+        await this.assertContainedDirectory(repositoryDir);
+        return repositoryDir;
+      }
     }
 
     return sourceDir;

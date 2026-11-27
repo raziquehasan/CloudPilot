@@ -43,7 +43,7 @@ export function createApp(): express.Express {
       },
       credentials: true,
       methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-      allowedHeaders: ["Content-Type", "Authorization", "X-Request-ID", "X-CSRF-Token"],
+      allowedHeaders: ["Content-Type", "Authorization", "X-Request-ID", "X-CSRF-Token", "Idempotency-Key"],
     }),
   );
 

@@ -92,6 +92,8 @@ type Deployment = {
   status: string;
   environment: string;
   triggerSource: string;
+  // The workspace list always includes the commit and latest attempt summaries.
+  // An unresolved commit or a missing attempt is represented by null.
   commitSha: string | null;
   createdAt: string;
   startedAt: string | null;
@@ -459,7 +461,7 @@ function isDeployment(
       value.commitSha === null ||
       (
         typeof value.commitSha === "string" &&
-        /^[0-9a-f]{40,64}$/i.test(
+        /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(
           value.commitSha,
         )
       )

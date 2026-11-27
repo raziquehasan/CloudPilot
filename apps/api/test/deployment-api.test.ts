@@ -75,7 +75,8 @@ test("deployment API enforces workspace, role, CSRF, worker readiness, and atomi
     });
     const address = server.address();
     assert.ok(address && typeof address !== "string");
-    const baseUrl = `http://127.0.0.1:${address.port}/api/v1/projects/${project.id}/deployments`;
+    const apiUrl = `http://127.0.0.1:${address.port}/api/v1`;
+    const baseUrl = `${apiUrl}/projects/${project.id}/deployments`;
     const csrfHeaders = (session: TestSession) => ({
       Cookie: session.cookie,
       "Content-Type": "application/json",
@@ -141,6 +142,22 @@ test("deployment API enforces workspace, role, CSRF, worker readiness, and atomi
         requestedBranch: "main",
       },
     });
+    const workspaceList = await fetch(`${apiUrl}/deployments`, {
+      headers: { Cookie: ownerSession.cookie },
+    });
+    assert.equal(workspaceList.status, 200);
+    const { data: workspaceDeployments } = await workspaceList.json() as {
+      data: Array<{ id: string; commitSha: unknown; build: unknown; runtime: unknown; project: { id: string } }>;
+    };
+    assert.equal(workspaceDeployments.length, 1);
+    const [listed] = workspaceDeployments;
+    assert.ok(listed);
+    assert.equal(listed.id, idempotentDeployment.id);
+    assert.equal(listed.project.id, project.id);
+    assert.equal(listed.commitSha, null);
+    assert.equal(listed.build, null);
+    assert.equal(listed.runtime, null);
+
     const replay = await fetch(baseUrl, {
       method: "POST",
       headers: { ...csrfHeaders(ownerSession), "Idempotency-Key": `replay-${suffix}` },

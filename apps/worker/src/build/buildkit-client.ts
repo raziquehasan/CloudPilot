@@ -28,6 +28,7 @@ import {
 import { StringDecoder } from "node:string_decoder";
 
 import { BuildError } from "@cloudpilot/queue";
+import { assertValidImageReference } from "./image-artifact.js";
 
 import type {
   BuilderCapabilities,
@@ -76,9 +77,6 @@ const TARGET_PATTERN =
 
 const PLATFORM_PATTERN =
   /^linux\/(?:amd64|arm64|arm\/v7)$/u;
-
-const IMAGE_TAG_PATTERN =
-  /^cloudpilot\/project-[a-f0-9-]{36}:[a-f0-9]{40}-[1-9][0-9]*$/u;
 
 const UNSAFE_CONTROL_PATTERN =
   /[\u0000-\u001f\u007f-\u009f]/u;
@@ -202,6 +200,11 @@ function createDockerEnvironment():
     "DOCKER_TLS_VERIFY",
     "DOCKER_CERT_PATH",
   ]);
+
+  if (process.platform === "win32") {
+    // Docker Desktop uses ProgramFiles to find the installed Buildx plugin.
+    allowedKeys.add("PROGRAMFILES");
+  }
 
   const environment: NodeJS.ProcessEnv = {};
 
@@ -709,13 +712,13 @@ async function runProcess(
 // Image reference validation
 // ==================================================
 
-function assertManagedImageTag(
+export function assertManagedImageTag(
   imageTag: string,
 ): void {
-  if (
-    typeof imageTag !== "string" ||
-    !IMAGE_TAG_PATTERN.test(imageTag)
-  ) {
+  try {
+    assertValidImageReference(imageTag);
+  } catch (error) {
+    if (!(error instanceof BuildError)) throw error;
     throw policyViolation(
       "Invalid CloudPilot-managed image reference.",
     );

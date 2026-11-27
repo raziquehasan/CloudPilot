@@ -192,6 +192,10 @@ function buildScope(payload: BuildJob): BuildScope {
   };
 }
 
+function deploymentScope({ workspaceId, projectId, deploymentId }: BuildScope) {
+  return { workspaceId, projectId, id: deploymentId };
+}
+
 function fencedBuildScope(
   claim: ExecutionClaim,
   now: Date,
@@ -361,7 +365,7 @@ async function claimBuild(
 
         const deployment =
           await tx.deployment.findFirst({
-            where: scope,
+            where: deploymentScope(scope),
 
             select: {
               status: true,
@@ -590,7 +594,7 @@ async function claimBuild(
             const failed =
               await tx.deployment.updateMany({
                 where: {
-                  ...scope,
+                  ...deploymentScope(scope),
 
                   status: deployment.status,
                 },
@@ -616,7 +620,7 @@ async function claimBuild(
         const transitioned =
           await tx.deployment.updateMany({
             where: {
-              ...scope,
+              ...deploymentScope(scope),
 
               status: deployment.status,
 
@@ -795,7 +799,7 @@ async function renewBuildLease(
 
     const deployment =
       await tx.deployment.findFirst({
-        where: scope,
+        where: deploymentScope(scope),
 
         select: {
           status: true,
@@ -982,7 +986,7 @@ async function resolveBuildSource(
 ): Promise<BuildSourceContext> {
   const deployment =
     await prisma.deployment.findFirst({
-      where: buildScope(payload),
+      where: deploymentScope(buildScope(payload)),
 
       select: {
         status: true,
@@ -1130,6 +1134,8 @@ async function resolveBuildSource(
         payload.deploymentId,
 
         preparation.sourceWorkspaceKey,
+        repositoryFullName,
+        payload.resolvedCommitSha,
       );
   } catch {
     throw new BuildError(
@@ -1255,7 +1261,7 @@ async function settleSuccess(
 
         const deployment =
           await tx.deployment.findFirst({
-            where: scope,
+            where: deploymentScope(scope),
 
             select: {
               status: true,
@@ -1342,7 +1348,7 @@ async function settleSuccess(
         const transitioned =
           await tx.deployment.updateMany({
             where: {
-              ...scope,
+              ...deploymentScope(scope),
 
               status:
                 deployment.status,
@@ -1529,7 +1535,7 @@ async function settleFailure(
 
         const deployment =
           await tx.deployment.findFirst({
-            where: scope,
+            where: deploymentScope(scope),
 
             select: {
               status: true,
@@ -1642,7 +1648,7 @@ async function settleFailure(
           const transitioned =
             await tx.deployment.updateMany({
               where: {
-                ...scope,
+                ...deploymentScope(scope),
 
                 status:
                   deployment.status,
@@ -1851,7 +1857,7 @@ export async function processBuildJob(
 
   const existing =
     await prisma.deployment.findFirst({
-      where: buildScope(payload),
+      where: deploymentScope(buildScope(payload)),
 
       select: {
         status: true,

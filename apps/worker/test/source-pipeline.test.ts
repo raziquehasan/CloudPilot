@@ -494,6 +494,22 @@ test(
 // Test 6: Workspace isolation and active protection
 // --------------------------------------------------
 
+test("prepared source resolves only a matching GitHub archive wrapper", async () => {
+  await withTempDir("cp-source-root-", async (root) => {
+    const manager = new WorkspaceManager({ root, ttlSeconds: 3600, minFreeBytes: 0 });
+    const deploymentId = "11111111-1111-1111-1111-111111111111";
+    const attempt = await manager.prepareAttempt(deploymentId);
+    const wrapped = join(attempt.sourceDir, "owner-demo-app-aaaaaaa");
+    await mkdir(wrapped);
+    await writeFile(join(wrapped, "Dockerfile"), "FROM scratch\n");
+
+    assert.equal(await manager.resolvePreparedSourceDir(deploymentId, attempt.attemptId, "Owner/demo-app", sha), wrapped);
+    assert.equal(await manager.resolvePreparedSourceDir(deploymentId, attempt.attemptId, "Owner/demo-app", "b".repeat(40)), attempt.sourceDir);
+    await writeFile(join(attempt.sourceDir, "README.md"), "Flat source");
+    assert.equal(await manager.resolvePreparedSourceDir(deploymentId, attempt.attemptId, "Owner/demo-app", sha), attempt.sourceDir);
+  });
+});
+
 test(
   "workspace manager isolates attempts and refuses to delete active workspaces",
   async () => {
