@@ -16,6 +16,14 @@ const MINUTE = 60 * SECOND;
 
 const MAX_TIMER_MS = 2_147_483_647;
 
+/**
+ * Keep these limits aligned with the deployment log
+ * contracts, database constraints and log writer.
+ */
+const MAX_LOG_ENTRY_BYTES = 16 * KiB;
+
+const MAX_LOG_BUFFER_BYTES = 64 * MiB;
+
 // ==================================================
 // Stable project paths
 // ==================================================
@@ -607,7 +615,12 @@ const envSchema = z
       .trim()
       .min(1)
       .max(64)
-      .default("127.0.0.1"),
+      .default("127.0.0.1")
+      .transform((value) =>
+        value.toLowerCase() === "localhost"
+          ? "127.0.0.1"
+          : value,
+      ),
 
     RUNTIME_CONTAINER_PORT: integerEnv(1, 65_535, 3_000),
 
@@ -649,6 +662,78 @@ const envSchema = z
         "Must be a valid network name prefix.",
       )
       .default("cloudpilot"),
+
+    // ==============================================
+    // Real-time deployment logging (Phase 5.6)
+    // ==============================================
+    //
+    // Logging is disabled by default. Enabling log
+    // collection does not enable build or runtime
+    // execution.
+    // ==============================================
+
+    DEPLOYMENT_LOGS_ENABLED: booleanEnv(false),
+
+    LOG_STREAMING_ENABLED: booleanEnv(false),
+
+    LOG_RUNTIME_COLLECTION_ENABLED:
+      booleanEnv(false),
+
+    LOG_MAX_ENTRY_BYTES: integerEnv(
+      64,
+      MAX_LOG_ENTRY_BYTES,
+      MAX_LOG_ENTRY_BYTES,
+    ),
+
+    LOG_BATCH_SIZE: integerEnv(1, 1_000, 100),
+
+    LOG_FLUSH_INTERVAL_MS: integerEnv(
+      10,
+      60_000,
+      250,
+    ),
+
+    /**
+     * Compatibility limit for existing logging callers.
+     *
+     * This currently bounds configured buffering.
+     * It is not a cumulative persisted storage quota.
+     *
+     * Individual collectors may apply stricter limits.
+     */
+    LOG_MAX_DEPLOYMENT_BYTES: integerEnv(
+      1 * MiB,
+      MAX_LOG_BUFFER_BYTES,
+      50 * MiB,
+    ),
+
+    LOG_RETENTION_DAYS: integerEnv(1, 365, 7),
+
+    LOG_HISTORY_PAGE_SIZE: integerEnv(1, 1_000, 200),
+
+    LOG_HISTORY_MAX_PAGE_SIZE: integerEnv(
+      1,
+      1_000,
+      1_000,
+    ),
+
+    LOG_RUNTIME_HISTORICAL_MS: integerEnv(
+      0,
+      60 * MINUTE,
+      5 * MINUTE,
+    ),
+
+    LOG_COLLECTOR_LOCK_TTL_MS: integerEnv(
+      1_000,
+      5 * MINUTE,
+      15_000,
+    ),
+
+    LOG_COLLECTOR_RENEW_MS: integerEnv(
+      100,
+      MINUTE,
+      5_000,
+    ),
 
     // ==============================================
     // Runtime secret injection
@@ -1050,7 +1135,6 @@ const envSchema = z
 
     if (
       value.RUNTIME_BIND_HOST !== "127.0.0.1" &&
-      value.RUNTIME_BIND_HOST !== "localhost" &&
       value.RUNTIME_BIND_HOST !== "::1"
     ) {
       context.addIssue({
@@ -1058,8 +1142,82 @@ const envSchema = z
 
         path: ["RUNTIME_BIND_HOST"],
 
+      message:
+        "Runtime ports must bind to a loopback address in this phase.",
+      });
+    }
+
+    // ==============================================
+    // Logging configuration relationships
+    // ==============================================
+
+    if (
+      value.LOG_STREAMING_ENABLED &&
+      !value.DEPLOYMENT_LOGS_ENABLED
+    ) {
+      context.addIssue({
+        code: "custom",
+
+        path: ["LOG_STREAMING_ENABLED"],
+
         message:
-          "Runtime ports must bind to a loopback address in this phase.",
+          "Log streaming requires DEPLOYMENT_LOGS_ENABLED.",
+      });
+    }
+
+    if (
+      value.LOG_RUNTIME_COLLECTION_ENABLED &&
+      !value.DEPLOYMENT_LOGS_ENABLED
+    ) {
+      context.addIssue({
+        code: "custom",
+
+        path: ["LOG_RUNTIME_COLLECTION_ENABLED"],
+
+        message:
+          "Runtime log collection requires DEPLOYMENT_LOGS_ENABLED.",
+      });
+    }
+
+    if (
+      value.LOG_MAX_ENTRY_BYTES >
+      value.LOG_MAX_DEPLOYMENT_BYTES
+    ) {
+      context.addIssue({
+        code: "custom",
+
+        path: ["LOG_MAX_ENTRY_BYTES"],
+
+        message:
+          "Maximum log entry size must not exceed the configured deployment log limit.",
+      });
+    }
+
+    if (
+      value.LOG_HISTORY_PAGE_SIZE >
+      value.LOG_HISTORY_MAX_PAGE_SIZE
+    ) {
+      context.addIssue({
+        code: "custom",
+
+        path: ["LOG_HISTORY_PAGE_SIZE"],
+
+        message:
+          "History page size must not exceed the maximum page size.",
+      });
+    }
+
+    if (
+      value.LOG_COLLECTOR_RENEW_MS * 3 >
+      value.LOG_COLLECTOR_LOCK_TTL_MS
+    ) {
+      context.addIssue({
+        code: "custom",
+
+        path: ["LOG_COLLECTOR_RENEW_MS"],
+
+        message:
+          "Collector renew interval must not exceed one-third of the lock TTL.",
       });
     }
   });
@@ -1108,6 +1266,15 @@ export function parseWorkerEnv(
       `Invalid worker environment configuration: ${details}`,
     );
   }
+
+  /**
+   * Object.freeze is shallow. Freeze the nested
+   * repository allowlist separately to prevent
+   * accidental mutation after startup validation.
+   */
+  Object.freeze(
+    parsed.data.BUILD_TRUSTED_REPOSITORIES,
+  );
 
   return Object.freeze(parsed.data);
 }

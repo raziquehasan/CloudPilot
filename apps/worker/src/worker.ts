@@ -45,6 +45,12 @@ import {
   DockerRuntimeExecutor,
 } from "./runtime/docker-runtime-client.js";
 
+import {
+  RuntimeLogCollectorManager,
+} from "./logging/runtime-log-manager.js";
+
+import { runLogRetention } from "./logging/retention.js";
+
 // ==================================================
 // Constants
 // ==================================================
@@ -54,6 +60,32 @@ const WORKER_VERSION = "0.1.0";
 const SHUTDOWN_TIMEOUT_MS = 30_000;
 
 const HEARTBEAT_SHUTDOWN_TIMEOUT_MS = 2_000;
+
+/**
+ * Startup and maintenance safety limits.
+ *
+ * Timeout wrappers bound waiting, but do not guarantee
+ * cancellation of the underlying asynchronous operation.
+ */
+const STARTUP_TIMEOUT_MS = 60_000;
+
+const REDIS_SHUTDOWN_TIMEOUT_MS = 3_000;
+
+const BACKGROUND_SHUTDOWN_TIMEOUT_MS = 8_000;
+
+/**
+ * Runtime collector memory budgets.
+ *
+ * These limits apply to each worker process, not the
+ * entire distributed CloudPilot installation.
+ */
+const RUNTIME_LOG_MAX_COLLECTORS = 16;
+
+const RUNTIME_LOG_MAX_BUFFER_BYTES = 8 * 1024 * 1024;
+
+const RUNTIME_LOG_TOTAL_BUFFER_BYTES = 128 * 1024 * 1024;
+
+const RUNTIME_LOG_MAX_BUFFERED_ENTRIES = 20_000;
 
 type WorkerRole = "diagnostic" | "deployment";
 
@@ -81,9 +113,17 @@ let heartbeatTimer: Timer | undefined;
 
 let cleanupTimer: Timer | undefined;
 
+let logReconcileTimer: Timer | undefined;
+
+let logRetentionTimer: Timer | undefined;
+
 let heartbeatTask: Promise<void> | null = null;
 
 let maintenanceTask: Promise<void> | null = null;
+
+let logReconcileTask: Promise<void> | null = null;
+
+let logRetentionTask: Promise<void> | null = null;
 
 let workspaceStorageAvailable = false;
 
@@ -257,6 +297,68 @@ const runtimeQueueManager = workerEnv.RUNTIME_ENABLED
 const runtimeExecutor = workerEnv.RUNTIME_ENABLED
   ? new DockerRuntimeExecutor()
   : null;
+
+// ==================================================
+// Runtime log collector manager (Phase 5.6)
+// ==================================================
+//
+// Collects container logs for RUNNING runtime instances.
+// Independent of the deployment execution lease. Only one
+// worker collects a given stream (Redis ownership lock).
+// Disabled unless runtime logging is explicitly enabled.
+// ==================================================
+
+const runtimeLogManager =
+  runtimeExecutor &&
+  workerEnv.DEPLOYMENT_LOGS_ENABLED &&
+  workerEnv.LOG_RUNTIME_COLLECTION_ENABLED
+    ? new RuntimeLogCollectorManager({
+        executor: runtimeExecutor,
+
+        redis: workerConnection,
+
+        signal: shutdownController.signal,
+
+        config: {
+          maxEntryBytes:
+            workerEnv.LOG_MAX_ENTRY_BYTES,
+
+          batchSize: workerEnv.LOG_BATCH_SIZE,
+
+          flushIntervalMs:
+            workerEnv.LOG_FLUSH_INTERVAL_MS,
+
+          maxBufferedBytes: Math.min(
+            workerEnv.LOG_MAX_DEPLOYMENT_BYTES,
+            RUNTIME_LOG_MAX_BUFFER_BYTES,
+          ),
+
+          maxBufferedEntries:
+            RUNTIME_LOG_MAX_BUFFERED_ENTRIES,
+
+          maxActiveCollectors:
+            RUNTIME_LOG_MAX_COLLECTORS,
+
+          maxTotalBufferedBytes:
+            RUNTIME_LOG_TOTAL_BUFFER_BYTES,
+
+          reconcilePageSize: 100,
+
+          maxScanPerReconcile: 500,
+
+          maxStartsPerReconcile: 8,
+
+          lockTtlMs:
+            workerEnv.LOG_COLLECTOR_LOCK_TTL_MS,
+
+          renewIntervalMs:
+            workerEnv.LOG_COLLECTOR_RENEW_MS,
+
+          maxHistoricalMs:
+            workerEnv.LOG_RUNTIME_HISTORICAL_MS,
+        },
+      })
+    : null;
 
 // ==================================================
 // Sanitized error utilities
@@ -1115,6 +1217,13 @@ function refreshHeartbeats(): Promise<void> {
 
     await refreshWorkspaceStorage();
 
+    if (
+      shuttingDown ||
+      workerConnection.status !== "ready"
+    ) {
+      return;
+    }
+
     await Promise.all([
       publishHeartbeat(
         "diagnostic",
@@ -1140,14 +1249,28 @@ function refreshHeartbeats(): Promise<void> {
 }
 
 function scheduleHeartbeat(): void {
-  if (shuttingDown) {
+  if (shuttingDown || heartbeatTimer) {
     return;
   }
 
   heartbeatTimer = setTimeout(() => {
-    void refreshHeartbeats().finally(() => {
-      scheduleHeartbeat();
-    });
+    heartbeatTimer = undefined;
+
+    void refreshHeartbeats()
+      .catch((error: unknown) => {
+        workerLogger.warn(
+          {
+            workerId,
+
+            ...sanitizedError(error),
+          },
+
+          "Worker heartbeat refresh failed",
+        );
+      })
+      .finally(() => {
+        scheduleHeartbeat();
+      });
   }, workerEnv.WORKER_HEARTBEAT_INTERVAL_MS);
 
   heartbeatTimer.unref();
@@ -1213,11 +1336,13 @@ function runWorkspaceMaintenance(
 }
 
 function scheduleWorkspaceCleanup(): void {
-  if (shuttingDown) {
+  if (shuttingDown || cleanupTimer) {
     return;
   }
 
   cleanupTimer = setTimeout(() => {
+    cleanupTimer = undefined;
+
     void runWorkspaceMaintenance(
       "expiration",
     ).finally(() => {
@@ -1226,6 +1351,177 @@ function scheduleWorkspaceCleanup(): void {
   }, workerEnv.SOURCE_CLEANUP_INTERVAL_SECONDS * 1000);
 
   cleanupTimer.unref();
+}
+
+// ==================================================
+// Runtime log collector reconciliation
+// ==================================================
+
+const LOG_RECONCILE_INTERVAL_MS = 15_000;
+
+/**
+ * Reconciliation is serialized at the worker lifecycle
+ * level in addition to manager-level protection.
+ *
+ * Failed reconciliation must not permanently disable
+ * future collector discovery.
+ */
+function runLogReconcile(): Promise<void> {
+  const manager = runtimeLogManager;
+
+  if (
+    shuttingDown ||
+    shutdownController.signal.aborted ||
+    !manager
+  ) {
+    return Promise.resolve();
+  }
+
+  if (logReconcileTask) {
+    return logReconcileTask;
+  }
+
+  const task = Promise.resolve()
+    .then(async () => {
+      if (
+        shuttingDown ||
+        shutdownController.signal.aborted
+      ) {
+        return;
+      }
+
+      await manager.reconcile();
+    })
+    .catch((error: unknown) => {
+      if (!shuttingDown) {
+        workerLogger.warn(
+          {
+            workerId,
+
+            ...sanitizedError(error),
+          },
+
+          "Runtime log collector reconciliation failed",
+        );
+      }
+    })
+    .finally(() => {
+      if (logReconcileTask === task) {
+        logReconcileTask = null;
+      }
+    });
+
+  logReconcileTask = task;
+
+  return task;
+}
+
+function scheduleLogReconcile(): void {
+  if (
+    shuttingDown ||
+    !runtimeLogManager ||
+    logReconcileTimer
+  ) {
+    return;
+  }
+
+  logReconcileTimer = setTimeout(() => {
+    logReconcileTimer = undefined;
+
+    void runLogReconcile().finally(() => {
+      scheduleLogReconcile();
+    });
+  }, LOG_RECONCILE_INTERVAL_MS);
+
+  logReconcileTimer.unref();
+}
+
+// ==================================================
+// Log retention cleanup
+// ==================================================
+
+const LOG_RETENTION_INTERVAL_MS = 60 * 60_000;
+
+/**
+ * Track retention so shutdown can wait for active
+ * database maintenance before terminating the process.
+ */
+function runTrackedLogRetention(): Promise<void> {
+  if (
+    shuttingDown ||
+    shutdownController.signal.aborted ||
+    !workerEnv.DEPLOYMENT_LOGS_ENABLED
+  ) {
+    return Promise.resolve();
+  }
+
+  if (logRetentionTask) {
+    return logRetentionTask;
+  }
+
+  const task = Promise.resolve()
+    .then(async () => {
+      if (
+        shuttingDown ||
+        shutdownController.signal.aborted
+      ) {
+        return;
+      }
+
+      const { deletedEntries } = await runLogRetention();
+
+      if (deletedEntries > 0) {
+        workerLogger.info(
+          {
+            workerId,
+
+            deletedEntries,
+          },
+
+          "Expired deployment logs removed",
+        );
+      }
+    })
+    .catch((error: unknown) => {
+      workerLogger.warn(
+        {
+          workerId,
+
+          ...sanitizedError(error),
+        },
+
+        "Log retention cleanup failed",
+      );
+    })
+    .finally(() => {
+      if (logRetentionTask === task) {
+        logRetentionTask = null;
+      }
+    });
+
+  logRetentionTask = task;
+
+  return task;
+}
+
+function scheduleLogRetention(): void {
+  if (
+    shuttingDown ||
+    !workerEnv.DEPLOYMENT_LOGS_ENABLED ||
+    logRetentionTimer
+  ) {
+    return;
+  }
+
+  logRetentionTimer = setTimeout(() => {
+    logRetentionTimer = undefined;
+
+    void runTrackedLogRetention().finally(() => {
+      scheduleLogRetention();
+    });
+  }, LOG_RETENTION_INTERVAL_MS);
+
+  logRetentionTimer.unref();
 }
 
 // ==================================================
@@ -1299,6 +1595,28 @@ function validateWorkerConfiguration(): void {
       "Invalid build execution timeout.",
     );
   }
+
+  if (
+    workerEnv.RUNTIME_ENABLED &&
+    (
+      !Number.isSafeInteger(runtimeExecutionTimeoutMs) ||
+      runtimeExecutionTimeoutMs <= 0 ||
+      runtimeExecutionTimeoutMs > 2_147_483_647
+    )
+  ) {
+    throw new Error(
+      "Invalid runtime execution timeout.",
+    );
+  }
+
+  if (
+    workerEnv.LOG_RUNTIME_COLLECTION_ENABLED &&
+    !workerEnv.DEPLOYMENT_LOGS_ENABLED
+  ) {
+    throw new Error(
+      "Runtime log collection requires deployment logging.",
+    );
+  }
 }
 
 // ==================================================
@@ -1333,19 +1651,25 @@ async function start(): Promise<void> {
   // Wait until all registered BullMQ workers have
   // established their required Redis connections.
 
-  await Promise.all([
-    worker.waitUntilReady(),
+  await withTimeout(
+    Promise.all([
+      worker.waitUntilReady(),
 
-    deploymentWorker.waitUntilReady(),
+      deploymentWorker.waitUntilReady(),
 
-    ...(buildWorker
-      ? [buildWorker.waitUntilReady()]
-      : []),
+      ...(buildWorker
+        ? [buildWorker.waitUntilReady()]
+        : []),
 
-    ...(runtimeWorker
-      ? [runtimeWorker.waitUntilReady()]
-      : []),
-  ]);
+      ...(runtimeWorker
+        ? [runtimeWorker.waitUntilReady()]
+        : []),
+    ]),
+
+    STARTUP_TIMEOUT_MS,
+
+    "Worker Redis readiness timed out.",
+  );
 
   if (shuttingDown) {
     return;
@@ -1353,7 +1677,13 @@ async function start(): Promise<void> {
 
   startupCompleted = true;
 
-  await refreshHeartbeats();
+  await withTimeout(
+    refreshHeartbeats(),
+
+    STARTUP_TIMEOUT_MS,
+
+    "Initial worker heartbeat timed out.",
+  );
 
   if (shuttingDown) {
     return;
@@ -1411,6 +1741,33 @@ async function start(): Promise<void> {
     );
   }
 
+  if (shuttingDown) {
+    return;
+  }
+
+  /**
+   * Logging is auxiliary infrastructure.
+   *
+   * Collector discovery must not block worker startup.
+   * Schedule the next reconciliation even if the first
+   * reconciliation fails.
+   */
+  if (runtimeLogManager) {
+    void runLogReconcile().finally(() => {
+      scheduleLogReconcile();
+    });
+  }
+
+  if (workerEnv.DEPLOYMENT_LOGS_ENABLED) {
+    void runTrackedLogRetention().finally(() => {
+      scheduleLogRetention();
+    });
+  }
+
+  if (shuttingDown) {
+    return;
+  }
+
   workerLogger.info(
     {
       workerId,
@@ -1448,6 +1805,18 @@ function stopBackgroundTimers(): void {
 
     cleanupTimer = undefined;
   }
+
+  if (logReconcileTimer) {
+    clearTimeout(logReconcileTimer);
+
+    logReconcileTimer = undefined;
+  }
+
+  if (logRetentionTimer) {
+    clearTimeout(logRetentionTimer);
+
+    logRetentionTimer = undefined;
+  }
 }
 
 async function publishDrainingHeartbeats():
@@ -1461,13 +1830,29 @@ async function publishDrainingHeartbeats():
     // overwrite the final draining heartbeat.
 
     if (heartbeatTask) {
-      await withTimeout(
-        heartbeatTask,
+      try {
+        await withTimeout(
+          heartbeatTask,
 
-        HEARTBEAT_SHUTDOWN_TIMEOUT_MS,
+          HEARTBEAT_SHUTDOWN_TIMEOUT_MS,
 
-        "Pending heartbeat did not finish.",
-      );
+          "Pending heartbeat did not finish.",
+        );
+      } catch (error) {
+        workerLogger.warn(
+          {
+            workerId,
+
+            ...sanitizedError(error),
+          },
+
+          "Pending heartbeat could not be confirmed before draining",
+        );
+      }
+    }
+
+    if (workerConnection.status !== "ready") {
+      return;
     }
 
     await withTimeout(
@@ -1590,6 +1975,22 @@ function shutdown(
 
       shutdownController.abort();
 
+      /**
+       * Start collector shutdown immediately.
+       *
+       * Keep Redis available until collector locks
+       * and buffered writes have been handled.
+       */
+      const collectorShutdownTask = shutdownStep(
+        "stop-runtime-log-collectors",
+
+        async () => {
+          if (runtimeLogManager) {
+            await runtimeLogManager.stopAll();
+          }
+        },
+      );
+
       // Stop accepting new work without waiting
       // for current jobs at this stage.
 
@@ -1637,32 +2038,88 @@ function shutdown(
         "close-queue-manager",
 
         async () => {
-          await queueManager.close();
+          const managers = [
+            queueManager,
 
-          if (buildQueueManager) {
-            await buildQueueManager.close();
-          }
+            ...(buildQueueManager
+              ? [buildQueueManager]
+              : []),
 
-          if (runtimeQueueManager) {
-            await runtimeQueueManager.close();
+            ...(runtimeQueueManager
+              ? [runtimeQueueManager]
+              : []),
+          ];
+
+          const results = await Promise.allSettled(
+            managers.map((manager) =>
+              Promise.resolve().then(() =>
+                manager.close(),
+              ),
+            ),
+          );
+
+          if (
+            results.some(
+              (result) => result.status === "rejected",
+            )
+          ) {
+            throw new Error(
+              "One or more queue managers failed to close.",
+            );
           }
         },
       );
 
-      // Do not disconnect Redis while workspace
-      // maintenance may still be using dependencies.
-
+      /**
+       * Wait for background tasks and collector shutdown.
+       *
+       * The outer process deadline remains authoritative.
+       * If this shorter waiting budget expires, report
+       * incomplete shutdown instead of claiming success.
+       */
       await shutdownStep(
-        "finish-workspace-maintenance",
+        "finish-background-maintenance",
 
         async () => {
+          const pendingTasks: Promise<unknown>[] = [
+            collectorShutdownTask,
+          ];
+
           if (maintenanceTask) {
-            await maintenanceTask;
+            pendingTasks.push(maintenanceTask);
+          }
+
+          if (logReconcileTask) {
+            pendingTasks.push(logReconcileTask);
+          }
+
+          if (logRetentionTask) {
+            pendingTasks.push(logRetentionTask);
+          }
+
+          if (heartbeatTask) {
+            pendingTasks.push(heartbeatTask);
+          }
+
+          const results = await withTimeout(
+            Promise.allSettled(pendingTasks),
+
+            BACKGROUND_SHUTDOWN_TIMEOUT_MS,
+
+            "Background maintenance shutdown timed out.",
+          );
+
+          if (
+            results.some(
+              (result) => result.status === "rejected",
+            )
+          ) {
+            throw new Error(
+              "One or more background tasks failed to finish.",
+            );
           }
         },
       );
-
-      // Redis is closed only after workers finish.
 
       await shutdownStep(
         "close-redis-connection",
@@ -1673,7 +2130,13 @@ function shutdown(
           }
 
           try {
-            await workerConnection.quit();
+            await withTimeout(
+              workerConnection.quit(),
+
+              REDIS_SHUTDOWN_TIMEOUT_MS,
+
+              "Redis graceful disconnect timed out.",
+            );
           } catch {
             workerConnection.disconnect();
 
@@ -1684,17 +2147,31 @@ function shutdown(
         },
       );
 
-      workerLogger.info(
-        {
-          workerId,
+      if (shutdownExitCode === 0) {
+        workerLogger.info(
+          {
+            workerId,
 
-          reason,
+            reason,
 
-          exitCode: shutdownExitCode,
-        },
+            exitCode: shutdownExitCode,
+          },
 
-        "Worker graceful shutdown completed",
-      );
+          "Worker graceful shutdown completed",
+        );
+      } else {
+        workerLogger.error(
+          {
+            workerId,
+
+            reason,
+
+            exitCode: shutdownExitCode,
+          },
+
+          "Worker shutdown completed with errors or incomplete cleanup",
+        );
+      }
     } catch (error) {
       shutdownExitCode = 1;
 

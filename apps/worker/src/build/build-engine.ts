@@ -1,4 +1,3 @@
-
 /**
  * CloudPilot — Build Engine
  *
@@ -13,11 +12,25 @@
  *   -> finalize logs
  *   -> return verified metadata
  *
+ * Phase 5.6 integration:
+ *
+ * - Bounded real-time build log collection.
+ * - Registered secret redaction.
+ * - Explicit live subscriber lifecycle.
+ * - Late executor callback protection.
+ * - Subscriber failure diagnostics.
+ * - Cancellation-aware log collection.
+ * - Final deadline verification.
+ * - Legacy build log snapshot compatibility.
+ *
  * The engine never publishes images externally.
  *
  * Database ownership, execution leases, trusted repository
  * authorization and artifact lifecycle management remain
  * responsibilities of the orchestration layer.
+ *
+ * Log streaming is best effort. Successful collection
+ * does not establish successful database persistence.
  */
 
 import { performance } from "node:perf_hooks";
@@ -69,6 +82,15 @@ const MAX_BUILD_LOG_BYTES =
   100 * 1024 * 1024;
 
 const MAX_BUILD_LOG_ENTRIES = 100_000;
+
+const MAX_REGISTERED_SECRETS = 64;
+
+const MIN_REGISTERED_SECRET_BYTES = 4;
+
+const MAX_REGISTERED_SECRET_BYTES = 4_096;
+
+const MAX_REGISTERED_SECRET_TOTAL_BYTES =
+  256 * 1024;
 
 // ==================================================
 // Public contracts
@@ -124,6 +146,31 @@ export interface BuildEngineInput {
    * Defaults to false.
    */
   trustedRepository?: boolean;
+
+  /**
+   * Optional synchronous live streaming sink invoked
+   * for sanitized build log entries.
+   *
+   * The sink must perform bounded synchronous work.
+   *
+   * Database persistence belongs in the bounded
+   * unified log writer, not directly in this callback.
+   *
+   * Local BuildLogEntry sequence numbers are not
+   * deployment-wide database sequence numbers.
+   */
+  onLogEntry?: (entry: BuildLogEntry) => void;
+
+  /**
+   * Optional sensitive values supplied by trusted
+   * orchestration for defensive log redaction.
+   *
+   * These values are not forwarded to the executor.
+   *
+   * Infrastructure credentials must never be passed
+   * to repository builds.
+   */
+  registeredLogSecrets?: readonly string[];
 }
 
 export interface BuildEngineResult {
@@ -148,6 +195,15 @@ export interface BuildEngineResult {
   logEntries: BuildLogEntry[];
 
   logsTruncated: boolean;
+
+  /**
+   * Optional diagnostic count for synchronous
+   * live subscriber failures.
+   *
+   * Does not represent asynchronous persistence
+   * failures inside the unified log writer.
+   */
+  logSubscriberFailures?: number;
 }
 
 // ==================================================
@@ -182,6 +238,11 @@ export interface BuildEngineFailureDetails {
    * nor does it prove that the backend has stopped.
    */
   executorReturnedSuccessfully: boolean;
+
+  /**
+   * Synchronous live subscriber failures.
+   */
+  logSubscriberFailures?: number;
 }
 
 /**
@@ -272,6 +333,103 @@ function validateLimits(
       MAX_BUILD_LOG_ENTRIES,
     );
   }
+}
+
+function validateLiveLogSink(
+  listener:
+    | BuildEngineInput["onLogEntry"]
+    | undefined,
+): void {
+  if (
+    listener !== undefined &&
+    typeof listener !== "function"
+  ) {
+    throw new BuildError(
+      "BUILD_CONTEXT_INVALID",
+      "Invalid build log streaming configuration.",
+    );
+  }
+}
+
+/**
+ * Validate explicitly registered log secrets.
+ *
+ * Never include rejected secret values in errors.
+ *
+ * Short or multiline secrets cannot safely be
+ * supported by the current line-oriented redactor.
+ */
+function validateRegisteredLogSecrets(
+  secrets: readonly string[],
+): string[] {
+  if (
+    !Array.isArray(secrets) ||
+    secrets.length >
+      MAX_REGISTERED_SECRETS
+  ) {
+    throw new BuildError(
+      "BUILD_CONTEXT_INVALID",
+      "Invalid build log redaction configuration.",
+    );
+  }
+
+  const uniqueSecrets =
+    new Set<string>();
+
+  let totalBytes = 0;
+
+  for (const secret of secrets) {
+    if (
+      typeof secret !== "string" ||
+      !secret.trim() ||
+      /[\u0000\r\n]/u.test(secret)
+    ) {
+      throw new BuildError(
+        "BUILD_CONTEXT_INVALID",
+        "Invalid registered build log secret.",
+      );
+    }
+
+    const bytes = Buffer.byteLength(
+      secret,
+      "utf8",
+    );
+
+    if (
+      bytes <
+        MIN_REGISTERED_SECRET_BYTES ||
+      bytes >
+        MAX_REGISTERED_SECRET_BYTES
+    ) {
+      throw new BuildError(
+        "BUILD_CONTEXT_INVALID",
+        "Invalid registered build log secret size.",
+      );
+    }
+
+    if (uniqueSecrets.has(secret)) {
+      continue;
+    }
+
+    totalBytes += bytes;
+
+    if (
+      totalBytes >
+      MAX_REGISTERED_SECRET_TOTAL_BYTES
+    ) {
+      throw new BuildError(
+        "BUILD_CONTEXT_INVALID",
+        "Build log redaction capacity exceeded.",
+      );
+    }
+
+    /**
+     * Preserve the exact original value.
+     */
+    uniqueSecrets.add(secret);
+  }
+
+  return [...uniqueSecrets];
 }
 
 // ==================================================
@@ -568,6 +726,8 @@ export async function runBuild(
 
   validateLimits(input.limits);
 
+  validateLiveLogSink(input.onLogEntry);
+
   const deadline =
     startedAt + input.limits.timeoutMs;
 
@@ -580,9 +740,16 @@ export async function runBuild(
     timeoutController.signal,
   ]);
 
+  const registeredSecrets =
+    validateRegisteredLogSecrets(
+      input.registeredLogSecrets ?? [],
+    );
+
   const collector = new BuildLogCollector({
     maxLogBytes:
       input.limits.maxLogBytes,
+
+    registeredSecrets,
 
     ...(input.limits.maxLogEntries !==
     undefined
@@ -592,6 +759,28 @@ export async function runBuild(
         }
       : {}),
   });
+
+  /**
+   * The collector now owns its registered redaction
+   * state. Release this temporary array's references.
+   *
+   * JavaScript strings cannot be reliably zeroized.
+   */
+  registeredSecrets.length = 0;
+
+  let unsubscribeLogEntry:
+    | (() => void)
+    | undefined;
+
+  /**
+   * Executor callbacks are accepted only while
+   * the active executor invocation is running.
+   */
+  let acceptingExecutorLogs = false;
+
+  let timer:
+    | ReturnType<typeof setTimeout>
+    | undefined;
 
   const policy =
     input.policy ?? defaultBuildPolicy;
@@ -626,6 +815,13 @@ export async function runBuild(
       ),
     );
 
+  /**
+   * Only trusted internal messages are passed
+   * to this helper.
+   *
+   * Never pass raw executor errors, environment
+   * variables, build arguments or credentials.
+   */
   const logSystem = (
     message: string,
   ): void => {
@@ -635,22 +831,71 @@ export async function runBuild(
     );
   };
 
-  const timer = setTimeout(
-    () => {
-      timeoutController.abort(
-        createTimeoutError(),
-      );
-    },
-    Math.max(
-      0,
-      deadline - performance.now(),
-    ),
-  );
-
-  timer.unref();
+  /**
+   * Stop accepting executor logs as soon as
+   * cancellation is observed.
+   *
+   * This does not establish that the underlying
+   * executor or BuildKit solver has stopped.
+   */
+  const stopExecutorLogs = (): void => {
+    acceptingExecutorLogs = false;
+  };
 
   try {
-    assertActive(signal);
+    /**
+     * Register before emitting the first system
+     * log so the live sink can observe the full
+     * authorized build lifecycle.
+     */
+    if (input.onLogEntry !== undefined) {
+      const listener = input.onLogEntry;
+
+      unsubscribeLogEntry =
+        collector.subscribe((entry) => {
+          /**
+           * Cancellation may represent lease loss.
+           *
+           * Do not forward additional live records
+           * after cancellation has been observed.
+           *
+           * The processor must independently fence
+           * persistence of already accepted records.
+           */
+          if (signal.aborted) {
+            return;
+          }
+
+          listener(entry);
+        });
+    }
+
+    signal.addEventListener(
+      "abort",
+      stopExecutorLogs,
+      { once: true },
+    );
+
+    timer = setTimeout(
+      () => {
+        timeoutController.abort(
+          createTimeoutError(),
+        );
+      },
+      Math.max(
+        0,
+        deadline - performance.now(),
+      ),
+    );
+
+    /**
+     * Keep the deadline timer referenced while
+     * the engine is responsible for active work.
+     *
+     * The finally block always clears it.
+     */
+
+    remainingTime(deadline, signal);
 
     // ==========================================
     // 1. Authorize repository execution
@@ -667,6 +912,8 @@ export async function runBuild(
       "Build execution authorized.",
     );
 
+    remainingTime(deadline, signal);
+
     // ==========================================
     // 2. Validate the build context
     // ==========================================
@@ -674,6 +921,8 @@ export async function runBuild(
     logSystem(
       "Validating build context.",
     );
+
+    remainingTime(deadline, signal);
 
     const context =
       await prepareBuildContext({
@@ -721,6 +970,8 @@ export async function runBuild(
       "Validating Dockerfile and build policy.",
     );
 
+    remainingTime(deadline, signal);
+
     await validateDockerfile(
       context.dockerfileAbsolutePath,
       {
@@ -742,6 +993,8 @@ export async function runBuild(
     // 4. Generate deployment-scoped image tag
     // ==========================================
 
+    remainingTime(deadline, signal);
+
     imageTag = generateImageTag(identity);
 
     assertImageOwnership(
@@ -756,6 +1009,8 @@ export async function runBuild(
     logSystem(
       "Checking build backend availability.",
     );
+
+    remainingTime(deadline, signal);
 
     const capabilities =
       await awaitReadOperation(
@@ -777,6 +1032,8 @@ export async function runBuild(
     // ==========================================
     // 6. Reject pre-existing image references
     // ==========================================
+
+    remainingTime(deadline, signal);
 
     const existingImage =
       await awaitReadOperation(
@@ -817,8 +1074,19 @@ export async function runBuild(
      */
     artifactMayExist = true;
 
-    const result =
-      await input.executor.build({
+    acceptingExecutorLogs = true;
+
+    let result: BuildExecutorResult;
+
+    try {
+      /**
+       * Never race the mutating build promise
+       * against a timeout promise.
+       *
+       * The executor must observe cancellation
+       * and settle its own operation.
+       */
+      result = await input.executor.build({
         contextDir: context.contextDir,
 
         dockerfileRelativePath:
@@ -837,6 +1105,40 @@ export async function runBuild(
         signal,
 
         onLog: (stream, chunk) => {
+          /**
+           * Ignore callbacks from cancelled,
+           * completed or otherwise closed
+           * executor invocations.
+           */
+          if (
+            !acceptingExecutorLogs ||
+            signal.aborted ||
+            collector.isFinalized ||
+            collector.isTruncated
+          ) {
+            return;
+          }
+
+          /**
+           * The timer callback may be delayed
+           * by synchronous work.
+           *
+           * Observe the monotonic deadline
+           * independently before accepting
+           * another executor chunk.
+           */
+          if (
+            performance.now() >= deadline
+          ) {
+            acceptingExecutorLogs = false;
+
+            timeoutController.abort(
+              createTimeoutError(),
+            );
+
+            return;
+          }
+
           collector.append(
             stream,
             chunk,
@@ -844,7 +1146,14 @@ export async function runBuild(
         },
       });
 
-    executorReturnedSuccessfully = true;
+      executorReturnedSuccessfully = true;
+    } finally {
+      /**
+       * Reject callbacks occurring after the
+       * executor's build promise settles.
+       */
+      acceptingExecutorLogs = false;
+    }
 
     remainingTime(deadline, signal);
 
@@ -855,6 +1164,8 @@ export async function runBuild(
     logSystem(
       "Verifying produced image artifact.",
     );
+
+    remainingTime(deadline, signal);
 
     const inspection =
       await awaitReadOperation(
@@ -885,6 +1196,8 @@ export async function runBuild(
       "Image artifact verification completed.",
     );
 
+    remainingTime(deadline, signal);
+
     logSystem(
       "Image build completed successfully.",
     );
@@ -894,6 +1207,20 @@ export async function runBuild(
     // ==========================================
 
     collector.finalize();
+
+    /**
+     * Subscriber callbacks and final pending-line
+     * normalization may perform synchronous work.
+     *
+     * Do not return successful metadata when the
+     * deadline or cancellation has been observed.
+     */
+    remainingTime(deadline, signal);
+
+    const logEntries =
+      collector.snapshot();
+
+    remainingTime(deadline, signal);
 
     // ==========================================
     // 10. Return verified build metadata
@@ -920,12 +1247,17 @@ export async function runBuild(
 
       fileCount: context.fileCount,
 
-      logEntries: collector.snapshot(),
+      logEntries,
 
       logsTruncated:
         collector.isTruncated,
+
+      logSubscriberFailures:
+        collector.subscriberFailureCount,
     };
   } catch (error) {
+    acceptingExecutorLogs = false;
+
     const failure = normalizeFailure(
       error,
       signal,
@@ -934,6 +1266,9 @@ export async function runBuild(
     /**
      * Persist only the known failure code in
      * system logs, not arbitrary backend errors.
+     *
+     * When the collector has already finalized,
+     * this append is intentionally ignored.
      */
     logSystem(
       `Build failed: ${failure.code}`,
@@ -970,11 +1305,37 @@ export async function runBuild(
         artifactMayExist,
 
         executorReturnedSuccessfully,
+
+        logSubscriberFailures:
+          collector.subscriberFailureCount,
       },
     );
   } finally {
-    clearTimeout(timer);
+    acceptingExecutorLogs = false;
 
-    collector.finalize();
+    if (timer !== undefined) {
+      clearTimeout(timer);
+
+      timer = undefined;
+    }
+
+    signal.removeEventListener(
+      "abort",
+      stopExecutorLogs,
+    );
+
+    try {
+      /**
+       * Flush final pending records before removing
+       * the live subscriber.
+       *
+       * Finalization is idempotent.
+       */
+      collector.finalize();
+    } finally {
+      unsubscribeLogEntry?.();
+
+      unsubscribeLogEntry = undefined;
+    }
   }
 }

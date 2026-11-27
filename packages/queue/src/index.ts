@@ -5,5 +5,6 @@ export * from "./contracts/jobs.js";
 export * from "./contracts/source.js";
 export * from "./contracts/build.js";
 export * from "./contracts/runtime.js";
+export * from "./contracts/logs.js";
 export * from "./queues/queue-manager.js";
 export * from "./workers/worker-registry.js";

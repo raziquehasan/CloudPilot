@@ -4,12 +4,16 @@ import { createServer } from "node:http";
 
 import { disconnectDatabase } from "@cloudpilot/database";
 
+import { createRedisConnection } from "@cloudpilot/queue";
+
 import {
   disconnectQueueProducer,
   queueEnv,
 } from "./services/queue-producer.js";
 
 import { deploymentOutboxRuntime } from "./services/deployment-outbox-runtime.js";
+import { LogDistributionRuntime } from "./services/log-distribution.service.js";
+import { LogGateway } from "./realtime/log-gateway.js";
 import { createApp } from "./app.js";
 import { env } from "./config/env.js";
 import { logger } from "./config/logger.js";
@@ -20,6 +24,36 @@ import { logger } from "./config/logger.js";
 
 const app = createApp();
 const httpServer: Server = createServer(app);
+
+// --------------------------------------------------
+// Real-time log distribution (Phase 5.6)
+// --------------------------------------------------
+//
+// A dedicated subscriber connection is required because a
+// Redis client in subscriber mode cannot issue other
+// commands. Distribution and the Socket.IO gateway are only
+// created when deployment logging is enabled.
+// --------------------------------------------------
+
+const logsEnabled = env.DEPLOYMENT_LOGS_ENABLED;
+
+const logSubscriber = logsEnabled
+  ? createRedisConnection({
+      url: env.REDIS_URL,
+      timeoutMs: 5_000,
+      maxRetriesPerRequest: null,
+      name: "cloudpilot-log-subscriber",
+    })
+  : null;
+
+const logDistribution = logsEnabled
+  ? new LogDistributionRuntime()
+  : null;
+
+const logGateway =
+  logSubscriber && logsEnabled
+    ? new LogGateway(httpServer, logSubscriber)
+    : null;
 
 const SHUTDOWN_TIMEOUT_MS = 10_000;
 
@@ -113,6 +147,30 @@ async function shutdown(
     // disconnecting its database and queue dependencies.
     await cleanup("Deployment outbox runtime", async () => {
       await deploymentOutboxRuntime.stop();
+    });
+
+    // 2b. Stop real-time log distribution and the Socket.IO
+    // gateway before disconnecting Redis.
+    await cleanup("Log gateway", async () => {
+      if (logGateway) {
+        await logGateway.close();
+      }
+    });
+
+    await cleanup("Log distribution runtime", async () => {
+      if (logDistribution) {
+        await logDistribution.stop();
+      }
+    });
+
+    await cleanup("Log subscriber", async () => {
+      if (logSubscriber) {
+        try {
+          await logSubscriber.quit();
+        } catch {
+          logSubscriber.disconnect();
+        }
+      }
     });
 
     // 3. Disconnect BullMQ queue producer and Redis.
@@ -214,6 +272,12 @@ httpServer.listen(env.PORT, env.HOST, () => {
     deploymentOutboxRuntime.start(
       queueEnv.DEPLOYMENT_OUTBOX_PUBLISH_INTERVAL_MS,
     );
+
+    if (logDistribution) {
+      logDistribution.start(
+        env.LOG_NOTIFICATION_PUBLISH_INTERVAL_MS,
+      );
+    }
 
     logger.info(
       {

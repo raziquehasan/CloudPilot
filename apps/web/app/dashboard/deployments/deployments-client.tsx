@@ -1,5 +1,9 @@
-
 "use client";
+
+// ==================================================
+// CloudPilot — Deployments Dashboard
+// Phase 5.6 — Realtime Logs Integration
+// ==================================================
 
 import {
   useCallback,
@@ -7,6 +11,8 @@ import {
   useRef,
   useState,
 } from "react";
+
+import Link from "next/link";
 
 import {
   Activity,
@@ -24,11 +30,12 @@ import {
   Rocket,
   RotateCcw,
   Square,
+  Terminal,
   XCircle,
 } from "lucide-react";
 
 import { DashboardPageShell } from "@/components/dashboard/page-shell";
-import { apiFetch } from "@/lib/api";
+import { apiFetch, ApiError } from "@/lib/api";
 import { useDashboard } from "@/components/dashboard/dashboard-provider";
 
 // ==================================================
@@ -118,6 +125,7 @@ type PendingAction = {
   previousStatus: RuntimeStatus;
   previousRestartCount: number;
   requestedAt: number;
+  timeoutReported: boolean;
 };
 
 type PendingActionState = Record<
@@ -126,7 +134,7 @@ type PendingActionState = Record<
 >;
 
 type DeploymentSnapshot = {
-  workspaceId: string | null;
+  workspaceId: string;
   items: Deployment[];
   loaded: boolean;
   loading: boolean;
@@ -146,10 +154,38 @@ type RuntimeActionError = {
 
 const POLLING_INTERVAL_MS = 5_000;
 
+const IDLE_POLLING_INTERVAL_MS = 30_000;
+
+const REQUEST_TIMEOUT_MS = 15_000;
+
+const ACTION_REQUEST_TIMEOUT_MS = 20_000;
+
 const ACTION_CONFIRMATION_TIMEOUT_MS = 60_000;
+
+const MAX_SNAPSHOT_AGE_MS = 45_000;
+
+const MAX_DEPLOYMENTS = 10_000;
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const BUILD_STATUSES = new Set<string>([
+  "QUEUED",
+  "RUNNING",
+  "SUCCEEDED",
+  "FAILED",
+  "CANCELLED",
+]);
+
+const RUNTIME_STATUSES = new Set<string>([
+  "QUEUED",
+  "CREATING",
+  "STARTING",
+  "RUNNING",
+  "STOPPED",
+  "FAILED",
+  "CANCELLED",
+]);
 
 const ACTIVE_DEPLOYMENT_STATUSES =
   new Set<string>([
@@ -203,6 +239,283 @@ const ACTION_ICONS = {
   restart: RotateCcw,
 } as const;
 
+const BUTTON_CLASS = [
+  "inline-flex min-h-9 items-center",
+  "justify-center gap-1.5 rounded-md border",
+  "px-3 py-1.5 text-xs font-medium",
+  "transition-colors",
+  "hover:bg-zinc-100 dark:hover:bg-zinc-800",
+  "focus-visible:outline-none",
+  "focus-visible:ring-2 focus-visible:ring-blue-500",
+  "disabled:cursor-not-allowed disabled:opacity-50",
+].join(" ");
+
+// ==================================================
+// API response validation
+// ==================================================
+
+function isObject(
+  value: unknown,
+): value is Record<string, unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value)
+  );
+}
+
+function isUuid(
+  value: unknown,
+): value is string {
+  return (
+    typeof value === "string" &&
+    value.length === 36 &&
+    UUID_PATTERN.test(value)
+  );
+}
+
+function isText(
+  value: unknown,
+  maxLength = 4096,
+): value is string {
+  return (
+    typeof value === "string" &&
+    value.length <= maxLength &&
+    !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/u.test(
+      value,
+    )
+  );
+}
+
+function isNullableText(
+  value: unknown,
+  maxLength = 4096,
+): boolean {
+  return (
+    value === null ||
+    isText(value, maxLength)
+  );
+}
+
+function isStatus(
+  value: unknown,
+): value is string {
+  return (
+    typeof value === "string" &&
+    /^[A-Z][A-Z0-9_]{0,79}$/.test(value)
+  );
+}
+
+function isNonNegativeInteger(
+  value: unknown,
+): value is number {
+  return (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0
+  );
+}
+
+function isPositiveInteger(
+  value: unknown,
+): value is number {
+  return (
+    isNonNegativeInteger(value) &&
+    value > 0
+  );
+}
+
+function isNullableInteger(
+  value: unknown,
+): boolean {
+  return (
+    value === null ||
+    isNonNegativeInteger(value)
+  );
+}
+
+function isNullablePositiveNumber(
+  value: unknown,
+): boolean {
+  return (
+    value === null ||
+    (
+      typeof value === "number" &&
+      Number.isFinite(value) &&
+      value > 0
+    )
+  );
+}
+
+function isNullablePort(
+  value: unknown,
+): boolean {
+  return (
+    value === null ||
+    (
+      isNonNegativeInteger(value) &&
+      value <= 65535
+    )
+  );
+}
+
+function isDateString(
+  value: unknown,
+): value is string {
+  return (
+    typeof value === "string" &&
+    value.length <= 64 &&
+    Number.isFinite(Date.parse(value))
+  );
+}
+
+function isNullableDate(
+  value: unknown,
+): boolean {
+  return (
+    value === null ||
+    isDateString(value)
+  );
+}
+
+function isBuild(
+  value: unknown,
+): value is DeploymentBuild {
+  if (value === null) {
+    return true;
+  }
+
+  if (!isObject(value)) {
+    return false;
+  }
+
+  return (
+    isUuid(value.id) &&
+    isPositiveInteger(value.buildAttempt) &&
+    typeof value.status === "string" &&
+    BUILD_STATUSES.has(value.status) &&
+    isNullableText(value.dockerfilePath) &&
+    isNullableText(value.imageTag, 1024) &&
+    (
+      value.imageSizeBytes === null ||
+      (
+        typeof value.imageSizeBytes === "string" &&
+        /^[0-9]{1,30}$/.test(
+          value.imageSizeBytes,
+        )
+      )
+    ) &&
+    isNullableText(value.failureCode, 128) &&
+    isNullableText(value.failureMessage) &&
+    isNullableInteger(value.durationMs)
+  );
+}
+
+function isRuntime(
+  value: unknown,
+): value is DeploymentRuntime {
+  if (value === null) {
+    return true;
+  }
+
+  if (!isObject(value)) {
+    return false;
+  }
+
+  return (
+    isUuid(value.id) &&
+    isPositiveInteger(value.runtimeAttempt) &&
+    typeof value.status === "string" &&
+    RUNTIME_STATUSES.has(value.status) &&
+    isNullableText(value.containerName, 512) &&
+    isNullablePort(value.containerPort) &&
+    isNullablePort(value.hostPort) &&
+    isNullableText(value.hostBindingAddress, 128) &&
+    isNullablePositiveNumber(value.cpuLimit) &&
+    isNullableInteger(value.memoryLimitMb) &&
+    isNullableInteger(value.pidsLimit) &&
+    isNonNegativeInteger(value.restartCount) &&
+    isNullableText(value.failureCode, 128) &&
+    isNullableText(value.failureMessage) &&
+    isNullableText(value.applicationUrl, 2048)
+  );
+}
+
+function isDeployment(
+  value: unknown,
+): value is Deployment {
+  if (!isObject(value)) {
+    return false;
+  }
+
+  const project = value.project;
+
+  return (
+    isUuid(value.id) &&
+    isStatus(value.status) &&
+    isText(value.environment, 128) &&
+    isText(value.triggerSource, 128) &&
+    (
+      value.commitSha === null ||
+      (
+        typeof value.commitSha === "string" &&
+        /^[0-9a-f]{40,64}$/i.test(
+          value.commitSha,
+        )
+      )
+    ) &&
+    isDateString(value.createdAt) &&
+    isNullableDate(value.startedAt) &&
+    isNullableDate(value.finishedAt) &&
+    isNullableText(value.failureCode, 128) &&
+    isBuild(value.build) &&
+    isRuntime(value.runtime) &&
+    isObject(project) &&
+    isUuid(project.id) &&
+    isText(project.name, 512) &&
+    project.name.trim().length > 0
+  );
+}
+
+function validateDeployments(
+  value: unknown,
+): Deployment[] {
+  if (
+    !Array.isArray(value) ||
+    value.length > MAX_DEPLOYMENTS
+  ) {
+    throw new Error(
+      "Invalid deployment response.",
+    );
+  }
+
+  const ids = new Set<string>();
+
+  const deployments: Deployment[] = [];
+
+  for (const item of value) {
+    if (!isDeployment(item)) {
+      throw new Error(
+        "Invalid deployment record.",
+      );
+    }
+
+    const id = item.id.toLowerCase();
+
+    if (ids.has(id)) {
+      throw new Error(
+        "Duplicate deployment identity.",
+      );
+    }
+
+    ids.add(id);
+
+    deployments.push(item);
+  }
+
+  return deployments;
+}
+
 // ==================================================
 // Formatting helpers
 // ==================================================
@@ -238,9 +551,7 @@ function formatDuration(
 
   const hours = Math.floor(minutes / 60);
 
-  const remainingMinutes = minutes % 60;
-
-  return `${hours}h ${remainingMinutes}m`;
+  return `${hours}h ${minutes % 60}m`;
 }
 
 function formatDeploymentDuration(
@@ -259,23 +570,9 @@ function formatDeploymentDuration(
     return "—";
   }
 
-  const startedAt = Date.parse(
-    item.startedAt,
-  );
-
-  const finishedAt = Date.parse(
-    item.finishedAt,
-  );
-
-  if (
-    !Number.isFinite(startedAt) ||
-    !Number.isFinite(finishedAt)
-  ) {
-    return "—";
-  }
-
   return formatDuration(
-    finishedAt - startedAt,
+    Date.parse(item.finishedAt) -
+      Date.parse(item.startedAt),
   );
 }
 
@@ -284,10 +581,7 @@ function formatImageSize(
 ): string {
   if (
     value === null ||
-    typeof value !== "string" ||
-    value.length === 0 ||
-    value.length > 30 ||
-    /[^0-9]/u.test(value)
+    !/^[0-9]{1,30}$/.test(value)
   ) {
     return "—";
   }
@@ -313,6 +607,7 @@ function formatImageSize(
       bytes >= divisor * BigInt(1024)
     ) {
       divisor *= BigInt(1024);
+
       unitIndex += 1;
     }
 
@@ -326,14 +621,9 @@ function formatImageSize(
         divisor / BigInt(2)
       ) / divisor;
 
-    const whole = rounded / BigInt(10);
-
-    const fraction =
-      rounded % BigInt(10);
-
     return (
-      `${whole.toString()}.` +
-      `${fraction.toString()} ` +
+      `${rounded / BigInt(10)}.` +
+      `${rounded % BigInt(10)} ` +
       units[unitIndex]
     );
   } catch {
@@ -400,14 +690,45 @@ function getErrorMessage(
   cause: unknown,
   fallback: string,
 ): string {
-  if (
-    cause instanceof Error &&
-    cause.message.trim().length > 0
-  ) {
-    return cause.message.slice(0, 500);
+  if (cause instanceof ApiError) {
+    switch (cause.status) {
+      case 400:
+      case 422:
+        return "The request was rejected as invalid.";
+
+      case 401:
+        return "Your session has expired. Please sign in again.";
+
+      case 403:
+        return "You do not have permission to perform this operation.";
+
+      case 404:
+        return "The requested deployment is no longer available.";
+
+      case 409:
+        return "The deployment state has changed. Refresh and try again.";
+
+      case 429:
+        return "Too many requests. Please wait before trying again.";
+
+      default:
+        return fallback;
+    }
   }
 
   return fallback;
+}
+
+function isPermissionError(
+  cause: unknown,
+): boolean {
+  return (
+    cause instanceof ApiError &&
+    (
+      cause.status === 401 ||
+      cause.status === 403
+    )
+  );
 }
 
 // ==================================================
@@ -524,7 +845,8 @@ function isActionConfirmed(
  * CloudPilot currently supports trusted local
  * runtime execution with numeric loopback binding.
  *
- * Do not render arbitrary URLs returned by the API.
+ * Arbitrary API-provided URLs must not be rendered
+ * as application links.
  */
 function getSafeApplicationUrl(
   runtime: DeploymentRuntime,
@@ -577,11 +899,8 @@ function getSafeApplicationUrl(
   const expectedAuthority =
     `http://${hostname}:${port}`;
 
-  /**
-   * Reject alternate IP representations,
-   * external hosts and unexpected authorities
-   * before URL normalization.
-   */
+  // Reject alternate host representations before
+  // browser URL normalization.
   if (
     rawUrl !== expectedAuthority &&
     !rawUrl.startsWith(
@@ -620,6 +939,37 @@ function getSafeApplicationUrl(
 }
 
 // ==================================================
+// Logs navigation
+// ==================================================
+
+function ViewLogsLink({
+  item,
+}: {
+  item: Deployment;
+}) {
+  const query = new URLSearchParams({
+    deployment: item.id,
+    project: item.project.id,
+  });
+
+  return (
+    <Link
+      href={`/dashboard/logs?${query.toString()}`}
+      prefetch={false}
+      aria-label={`View logs for ${item.project.name}`}
+      className={`${BUTTON_CLASS} w-fit max-w-full`}
+    >
+      <Terminal
+        aria-hidden="true"
+        className="size-3.5 shrink-0"
+      />
+
+      View Logs
+    </Link>
+  );
+}
+
+// ==================================================
 // Status presentation
 // ==================================================
 
@@ -628,19 +978,15 @@ function getStatusClasses(
 ): string {
   if (FAILED_STATUSES.has(status)) {
     return [
-      "border-red-200",
-      "bg-red-50",
-      "text-red-700",
+      "border-red-200 bg-red-50 text-red-700",
       "dark:border-red-900/60",
-      "dark:bg-red-950/40",
-      "dark:text-red-400",
+      "dark:bg-red-950/40 dark:text-red-400",
     ].join(" ");
   }
 
   if (SUCCESS_STATUSES.has(status)) {
     return [
-      "border-emerald-200",
-      "bg-emerald-50",
+      "border-emerald-200 bg-emerald-50",
       "text-emerald-700",
       "dark:border-emerald-900/60",
       "dark:bg-emerald-950/40",
@@ -649,31 +995,31 @@ function getStatusClasses(
   }
 
   if (
-    status === "BUILDING" ||
-    status === "DEPLOYING" ||
-    status === "STARTING" ||
-    status === "CREATING" ||
-    status === "HEALTH_CHECKING" ||
-    status === "SOURCE_PREPARING"
+    [
+      "BUILDING",
+      "DEPLOYING",
+      "STARTING",
+      "CREATING",
+      "HEALTH_CHECKING",
+      "SOURCE_PREPARING",
+    ].includes(status)
   ) {
     return [
-      "border-blue-200",
-      "bg-blue-50",
-      "text-blue-700",
+      "border-blue-200 bg-blue-50 text-blue-700",
       "dark:border-blue-900/60",
-      "dark:bg-blue-950/40",
-      "dark:text-blue-400",
+      "dark:bg-blue-950/40 dark:text-blue-400",
     ].join(" ");
   }
 
   if (
-    status === "QUEUED" ||
-    status === "PENDING" ||
-    status === "CANCELLING"
+    [
+      "QUEUED",
+      "PENDING",
+      "CANCELLING",
+    ].includes(status)
   ) {
     return [
-      "border-amber-200",
-      "bg-amber-50",
+      "border-amber-200 bg-amber-50",
       "text-amber-700",
       "dark:border-amber-900/60",
       "dark:bg-amber-950/40",
@@ -682,12 +1028,10 @@ function getStatusClasses(
   }
 
   return [
-    "border-zinc-200",
-    "bg-zinc-100",
+    "border-zinc-200 bg-zinc-100",
     "text-zinc-700",
     "dark:border-zinc-800",
-    "dark:bg-zinc-900",
-    "dark:text-zinc-300",
+    "dark:bg-zinc-900 dark:text-zinc-300",
   ].join(" ");
 }
 
@@ -712,7 +1056,7 @@ function StatusBadge({
         className="size-1.5 shrink-0 rounded-full bg-current"
       />
 
-      <span className="break-words">
+      <span className="min-w-0 break-words">
         {buildStatusLabel(status)}
       </span>
     </span>
@@ -742,8 +1086,7 @@ function DeploymentSummary({
       label: "Running applications",
       value: items.filter(
         (item) =>
-          item.runtime?.status ===
-          "RUNNING",
+          item.runtime?.status === "RUNNING",
       ).length,
       icon: CheckCircle2,
       color:
@@ -776,7 +1119,7 @@ function DeploymentSummary({
   ];
 
   return (
-    <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
+    <div className="grid min-w-0 grid-cols-2 gap-3 xl:grid-cols-4">
       {statistics.map((statistic) => {
         const Icon = statistic.icon;
 
@@ -785,8 +1128,8 @@ function DeploymentSummary({
             key={statistic.label}
             className="min-w-0 rounded-xl border bg-white p-3 shadow-sm dark:bg-zinc-950 sm:p-4"
           >
-            <div className="flex items-start justify-between gap-2">
-              <p className="min-w-0 text-xs font-medium text-zinc-500 dark:text-zinc-400">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <p className="min-w-0 break-words text-xs font-medium text-zinc-500 dark:text-zinc-400">
                 {statistic.label}
               </p>
 
@@ -824,6 +1167,7 @@ interface RuntimeControlsProps {
   item: Deployment;
   acting: RuntimeAction | undefined;
   pending: PendingAction | undefined;
+  controlsDisabled: boolean;
   onAction: (
     deploymentId: string,
     action: RuntimeAction,
@@ -834,6 +1178,7 @@ function RuntimeControls({
   item,
   acting,
   pending,
+  controlsDisabled,
   onAction,
 }: RuntimeControlsProps) {
   const runtime = item.runtime;
@@ -847,7 +1192,9 @@ function RuntimeControls({
   }
 
   const applicationUrl =
-    getSafeApplicationUrl(runtime);
+    controlsDisabled
+      ? null
+      : getSafeApplicationUrl(runtime);
 
   const allowedActions =
     getAllowedRuntimeActions(runtime);
@@ -878,19 +1225,19 @@ function RuntimeControls({
           href={applicationUrl}
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-flex min-h-8 items-center gap-1.5 rounded-md text-xs font-medium text-blue-600 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:text-blue-400"
+          className="inline-flex min-h-8 max-w-full items-center gap-1.5 rounded-md text-xs font-medium text-blue-600 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 dark:text-blue-400"
         >
           Open application
 
           <ExternalLink
             aria-hidden="true"
-            className="size-3"
+            className="size-3 shrink-0"
           />
         </a>
       )}
 
       {runtime.failureCode && (
-        <span className="max-w-full break-words text-[11px] font-medium text-red-600 dark:text-red-400">
+        <span className="max-w-full break-all text-[11px] font-medium text-red-600 dark:text-red-400">
           {buildStatusLabel(
             runtime.failureCode,
           )}
@@ -899,21 +1246,22 @@ function RuntimeControls({
 
       {runtime.failureMessage && (
         <p className="max-w-full break-words text-xs leading-relaxed text-red-600 dark:text-red-400">
-          {runtime.failureMessage}
+          Runtime execution reported an
+          error. Check deployment logs for
+          details.
         </p>
       )}
 
       {runtime.restartCount > 0 && (
         <span className="text-[11px] text-zinc-500 dark:text-zinc-400">
-          Restarts:{" "}
-          {runtime.restartCount}
+          Restarts: {runtime.restartCount}
         </span>
       )}
 
       {(allowedActions.length > 0 ||
         busy) && (
         <div
-          className="flex w-full flex-wrap gap-1.5"
+          className="flex w-full min-w-0 flex-wrap gap-1.5"
           aria-label={`Runtime controls for ${item.project.name}`}
         >
           {runtimeActions.map((action) => {
@@ -944,7 +1292,9 @@ function RuntimeControls({
                 key={action}
                 type="button"
                 disabled={
-                  busy || !allowed
+                  controlsDisabled ||
+                  busy ||
+                  !allowed
                 }
                 aria-label={`${ACTION_LABELS[action]} ${item.project.name}`}
                 aria-busy={
@@ -957,32 +1307,21 @@ function RuntimeControls({
                   )
                 }
                 className={[
-                  "inline-flex min-h-9",
-                  "items-center justify-center",
-                  "gap-1.5 rounded-md border",
-                  "px-2.5 py-1.5",
-                  "text-xs font-medium",
-                  "transition-colors",
-                  "focus-visible:outline-none",
-                  "focus-visible:ring-2",
-                  "focus-visible:ring-blue-500",
-                  "disabled:cursor-not-allowed",
-                  "disabled:opacity-50",
+                  BUTTON_CLASS,
                   action === "stop"
-                    ? "border-red-200 text-red-600 hover:bg-red-50 dark:border-red-900/60 dark:text-red-400 dark:hover:bg-red-950/40"
-                    : "hover:bg-zinc-100 dark:hover:bg-zinc-800",
+                    ? "border-red-200 text-red-600 dark:border-red-900/60 dark:text-red-400"
+                    : "",
                 ].join(" ")}
               >
-                {isActing ||
-                isPending ? (
+                {isActing || isPending ? (
                   <Loader2
                     aria-hidden="true"
-                    className="size-3 animate-spin"
+                    className="size-3 shrink-0 animate-spin motion-reduce:animate-none"
                   />
                 ) : (
                   <Icon
                     aria-hidden="true"
-                    className="size-3"
+                    className="size-3 shrink-0"
                   />
                 )}
 
@@ -990,9 +1329,7 @@ function RuntimeControls({
                   ? "Sending..."
                   : isPending
                     ? "Pending..."
-                    : ACTION_LABELS[
-                        action
-                      ]}
+                    : ACTION_LABELS[action]}
               </button>
             );
           })}
@@ -1004,10 +1341,20 @@ function RuntimeControls({
           role="status"
           className="text-[11px] leading-relaxed text-zinc-500 dark:text-zinc-400"
         >
-          Waiting for the worker to
-          confirm the runtime action.
+          {pending.timeoutReported
+            ? "Confirmation delayed. Controls remain locked to prevent duplicate operations."
+            : "Waiting for the worker to confirm the runtime action."}
         </p>
       )}
+
+      {controlsDisabled &&
+        !busy &&
+        allowedActions.length > 0 && (
+          <p className="text-[11px] text-amber-600 dark:text-amber-400">
+            Refresh deployment data before
+            performing runtime actions.
+          </p>
+        )}
     </div>
   );
 }
@@ -1049,7 +1396,7 @@ function BuildInformation({
       )}
 
       {build.failureCode && (
-        <span className="break-words text-[11px] text-red-600 dark:text-red-400">
+        <span className="max-w-full break-all text-[11px] text-red-600 dark:text-red-400">
           {buildStatusLabel(
             build.failureCode,
           )}
@@ -1080,10 +1427,7 @@ function ImageInformation({
     <div className="flex min-w-0 flex-col gap-1">
       {build.imageTag && (
         <>
-          <span
-            title={build.imageTag}
-            className="inline-flex items-center gap-1.5 font-medium"
-          >
+          <span className="inline-flex flex-wrap items-center gap-1.5 font-medium">
             <Package
               aria-hidden="true"
               className="size-3.5 shrink-0 text-zinc-500"
@@ -1105,7 +1449,8 @@ function ImageInformation({
 
       {build.failureMessage && (
         <span className="break-words text-xs leading-relaxed text-red-600 dark:text-red-400">
-          {build.failureMessage}
+          Build execution reported an
+          error. Check deployment logs.
         </span>
       )}
 
@@ -1120,6 +1465,86 @@ function ImageInformation({
 }
 
 // ==================================================
+// Commit information
+// ==================================================
+
+function CommitInformation({
+  commitSha,
+}: {
+  commitSha: string | null;
+}) {
+  return (
+    <span className="inline-flex min-w-0 items-center gap-1.5">
+      <GitCommitHorizontal
+        aria-hidden="true"
+        className="size-3.5 shrink-0 text-zinc-500"
+      />
+
+      <span
+        title={commitSha ?? undefined}
+        className="min-w-0 break-all font-mono"
+      >
+        {commitSha
+          ? commitSha.slice(0, 7)
+          : "—"}
+      </span>
+    </span>
+  );
+}
+
+// ==================================================
+// Runtime resource information
+// ==================================================
+
+function RuntimeResources({
+  runtime,
+}: {
+  runtime: DeploymentRuntime;
+}) {
+  if (!runtime) {
+    return null;
+  }
+
+  return (
+    <div className="grid min-w-0 grid-cols-3 gap-2 rounded-lg bg-zinc-50 p-3 dark:bg-zinc-900">
+      <div className="min-w-0">
+        <p className="text-[10px] text-zinc-500 dark:text-zinc-400">
+          CPU
+        </p>
+
+        <p className="mt-1 break-words text-xs font-medium">
+          {runtime.cpuLimit !== null
+            ? `${runtime.cpuLimit} CPU`
+            : "—"}
+        </p>
+      </div>
+
+      <div className="min-w-0">
+        <p className="text-[10px] text-zinc-500 dark:text-zinc-400">
+          Memory
+        </p>
+
+        <p className="mt-1 break-words text-xs font-medium">
+          {runtime.memoryLimitMb !== null
+            ? `${runtime.memoryLimitMb} MB`
+            : "—"}
+        </p>
+      </div>
+
+      <div className="min-w-0">
+        <p className="text-[10px] text-zinc-500 dark:text-zinc-400">
+          PID limit
+        </p>
+
+        <p className="mt-1 break-words text-xs font-medium">
+          {runtime.pidsLimit ?? "—"}
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ==================================================
 // Mobile deployment card
 // ==================================================
 
@@ -1127,12 +1552,13 @@ function MobileDeploymentCard({
   item,
   acting,
   pending,
+  controlsDisabled,
   onAction,
 }: RuntimeControlsProps) {
   return (
-    <article className="min-w-0 overflow-hidden rounded-xl border bg-white p-4 shadow-sm dark:bg-zinc-950">
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex min-w-0 items-start gap-3">
+    <article className="min-w-0 overflow-hidden rounded-xl border bg-white p-3 shadow-sm dark:bg-zinc-950 sm:p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="flex min-w-0 flex-1 items-start gap-3">
           <div className="flex size-10 shrink-0 items-center justify-center rounded-lg border bg-zinc-50 dark:bg-zinc-900">
             <Rocket
               aria-hidden="true"
@@ -1141,7 +1567,7 @@ function MobileDeploymentCard({
           </div>
 
           <div className="min-w-0">
-            <h3 className="break-words text-sm font-semibold">
+            <h3 className="break-all text-sm font-semibold">
               {item.project.name}
             </h3>
 
@@ -1159,22 +1585,24 @@ function MobileDeploymentCard({
           </div>
         </div>
 
-        <div className="shrink-0">
-          <StatusBadge
-            status={item.status}
-          />
-        </div>
+        <StatusBadge
+          status={item.status}
+        />
+      </div>
+
+      <div className="mt-3">
+        <ViewLogsLink item={item} />
       </div>
 
       {item.failureCode && (
-        <div className="mt-3 rounded-md border border-red-200 bg-red-50 p-2 text-xs text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-400">
+        <div className="mt-3 break-all rounded-md border border-red-200 bg-red-50 p-2 text-xs text-red-700 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-400">
           {buildStatusLabel(
             item.failureCode,
           )}
         </div>
       )}
 
-      <div className="mt-4 grid grid-cols-2 gap-4 border-y py-4">
+      <div className="mt-4 grid min-w-0 grid-cols-2 gap-3 border-y py-4 sm:gap-4">
         <div className="min-w-0">
           <p className="mb-2 text-[11px] font-medium text-zinc-500 dark:text-zinc-400">
             Build
@@ -1200,26 +1628,10 @@ function MobileDeploymentCard({
             Commit
           </p>
 
-          <div className="flex items-center gap-1.5 text-xs">
-            <GitCommitHorizontal
-              aria-hidden="true"
-              className="size-3.5 shrink-0 text-zinc-500"
+          <div className="text-xs">
+            <CommitInformation
+              commitSha={item.commitSha}
             />
-
-            <span
-              title={
-                item.commitSha ??
-                undefined
-              }
-              className="font-mono"
-            >
-              {item.commitSha
-                ? item.commitSha.slice(
-                    0,
-                    7,
-                  )
-                : "—"}
-            </span>
           </div>
         </div>
 
@@ -1255,54 +1667,23 @@ function MobileDeploymentCard({
           item={item}
           acting={acting}
           pending={pending}
+          controlsDisabled={
+            controlsDisabled
+          }
           onAction={onAction}
         />
       </div>
 
       {item.runtime && (
-        <div className="mt-4 grid grid-cols-3 gap-2 rounded-lg bg-zinc-50 p-3 dark:bg-zinc-900">
-          <div className="min-w-0">
-            <p className="text-[10px] text-zinc-500 dark:text-zinc-400">
-              CPU
-            </p>
-
-            <p className="mt-1 break-words text-xs font-medium">
-              {item.runtime.cpuLimit !==
-              null
-                ? `${item.runtime.cpuLimit} CPU`
-                : "—"}
-            </p>
-          </div>
-
-          <div className="min-w-0">
-            <p className="text-[10px] text-zinc-500 dark:text-zinc-400">
-              Memory
-            </p>
-
-            <p className="mt-1 break-words text-xs font-medium">
-              {item.runtime
-                .memoryLimitMb !== null
-                ? `${item.runtime.memoryLimitMb} MB`
-                : "—"}
-            </p>
-          </div>
-
-          <div className="min-w-0">
-            <p className="text-[10px] text-zinc-500 dark:text-zinc-400">
-              PID limit
-            </p>
-
-            <p className="mt-1 text-xs font-medium">
-              {item.runtime.pidsLimit ??
-                "—"}
-            </p>
-          </div>
+        <div className="mt-4">
+          <RuntimeResources
+            runtime={item.runtime}
+          />
         </div>
       )}
 
       <p className="mt-4 border-t pt-3 text-[11px] text-zinc-500 dark:text-zinc-400">
-        Created{" "}
-        {formatDate(item.createdAt)}
+        Created {formatDate(item.createdAt)}
       </p>
     </article>
   );
@@ -1316,6 +1697,7 @@ interface DeploymentTableProps {
   items: Deployment[];
   acting: ActionState;
   pending: PendingActionState;
+  controlsDisabled: boolean;
   onAction: (
     deploymentId: string,
     action: RuntimeAction,
@@ -1326,6 +1708,7 @@ function DeploymentTable({
   items,
   acting,
   pending,
+  controlsDisabled,
   onAction,
 }: DeploymentTableProps) {
   const headers = [
@@ -1339,8 +1722,8 @@ function DeploymentTable({
   ];
 
   return (
-    <div className="hidden overflow-hidden rounded-xl border bg-white shadow-sm dark:bg-zinc-950 xl:block">
-      <div className="overflow-x-auto">
+    <div className="hidden min-w-0 overflow-hidden rounded-xl border bg-white shadow-sm dark:bg-zinc-950 xl:block">
+      <div className="max-w-full overflow-x-auto">
         <table className="w-full min-w-[1000px] table-fixed text-left text-xs">
           <caption className="sr-only">
             Deployment records and
@@ -1379,7 +1762,7 @@ function DeploymentTable({
               >
                 <td className="px-3 py-4">
                   <div className="flex min-w-0 flex-col gap-1.5">
-                    <span className="break-words font-semibold">
+                    <span className="break-all font-semibold">
                       {item.project.name}
                     </span>
 
@@ -1394,6 +1777,10 @@ function DeploymentTable({
                         item.createdAt,
                       )}
                     </span>
+
+                    <ViewLogsLink
+                      item={item}
+                    />
                   </div>
                 </td>
 
@@ -1404,7 +1791,7 @@ function DeploymentTable({
                     />
 
                     {item.failureCode && (
-                      <span className="break-words text-[11px] text-red-600 dark:text-red-400">
+                      <span className="max-w-full break-all text-[11px] text-red-600 dark:text-red-400">
                         {buildStatusLabel(
                           item.failureCode,
                         )}
@@ -1428,25 +1815,19 @@ function DeploymentTable({
                     pending={
                       pending[item.id]
                     }
+                    controlsDisabled={
+                      controlsDisabled
+                    }
                     onAction={onAction}
                   />
                 </td>
 
                 <td className="px-3 py-4">
-                  <span
-                    title={
-                      item.commitSha ??
-                      undefined
+                  <CommitInformation
+                    commitSha={
+                      item.commitSha
                     }
-                    className="font-mono"
-                  >
-                    {item.commitSha
-                      ? item.commitSha.slice(
-                          0,
-                          7,
-                        )
-                      : "—"}
-                  </span>
+                  />
                 </td>
 
                 <td className="px-3 py-4">
@@ -1534,10 +1915,9 @@ function EmptyDeployments() {
       </h3>
 
       <p className="mx-auto mt-2 max-w-sm text-xs leading-relaxed text-zinc-500 dark:text-zinc-400">
-        This workspace has no
-        deployments yet. Deployment
-        records will appear here when
-        a project deployment is
+        This workspace has no deployments
+        yet. Deployment records will appear
+        here when a project deployment is
         created.
       </p>
     </div>
@@ -1577,6 +1957,11 @@ function WorkspaceDeployments({
     [],
   );
 
+  const [
+    snapshotStale,
+    setSnapshotStale,
+  ] = useState(true);
+
   // ================================================
   // Request and action references
   // ================================================
@@ -1587,15 +1972,28 @@ function WorkspaceDeployments({
 
   const requestIdRef = useRef(0);
 
-  const itemsRef = useRef<
-    Deployment[]
-  >([]);
+  const itemsRef =
+    useRef<Deployment[]>([]);
 
   const loadedRef = useRef(false);
 
-  const requestRef = useRef<
-    Promise<void> | null
-  >(null);
+  const lastUpdatedRef =
+    useRef<number | null>(null);
+
+  const staleRef = useRef(true);
+
+  const permissionDeniedRef =
+    useRef(false);
+
+  const requestRef =
+    useRef<Promise<void> | null>(null);
+
+  const requestControllerRef =
+    useRef<AbortController | null>(null);
+
+  const actionControllersRef = useRef(
+    new Map<string, AbortController>(),
+  );
 
   const actionLocksRef = useRef(
     new Set<string>(),
@@ -1618,21 +2016,71 @@ function WorkspaceDeployments({
           return;
         }
 
-        setActionErrors(
-          (previous) => [
-            ...previous.filter(
-              (error) =>
-                error.deploymentId !==
-                deploymentId,
-            ),
-            {
+        setActionErrors((previous) => [
+          ...previous.filter(
+            (error) =>
+              error.deploymentId !==
               deploymentId,
-              message,
-            },
-          ],
+          ),
+          {
+            deploymentId,
+            message,
+          },
+        ]);
+      },
+      [],
+    );
+
+  const clearActionError =
+    useCallback(
+      (deploymentId: string) => {
+        setActionErrors((previous) =>
+          previous.filter(
+            (error) =>
+              error.deploymentId !==
+              deploymentId,
+          ),
         );
       },
       [],
+    );
+
+  // ================================================
+  // Permission failure handling
+  // ================================================
+
+  const invalidateAccess =
+    useCallback(
+      (message: string) => {
+        permissionDeniedRef.current = true;
+
+        staleRef.current = true;
+
+        itemsRef.current = [];
+
+        loadedRef.current = false;
+
+        lastUpdatedRef.current = null;
+
+        // Keep unresolved operation identities
+        // internally until access is restored.
+        // Never retry mutations automatically.
+
+        setSnapshotStale(true);
+
+        setActionErrors([]);
+
+        setSnapshot({
+          workspaceId,
+          items: [],
+          loaded: false,
+          loading: false,
+          refreshing: false,
+          error: message,
+          lastUpdatedAt: null,
+        });
+      },
+      [workspaceId],
     );
 
   // ================================================
@@ -1646,6 +2094,13 @@ function WorkspaceDeployments({
           ...pendingRef.current,
         };
 
+        const deploymentMap = new Map(
+          nextItems.map((item) => [
+            item.id,
+            item,
+          ]),
+        );
+
         let changed = false;
 
         for (const [
@@ -1658,17 +2113,17 @@ function WorkspaceDeployments({
             continue;
           }
 
-          const item = nextItems.find(
-            (deployment) =>
-              deployment.id ===
+          const item =
+            deploymentMap.get(
               deploymentId,
-          );
+            );
 
+          // A different runtime identity is not
+          // proof of successful execution.
           if (
-            isActionConfirmed(
-              item,
-              operation,
-            )
+            item?.runtime &&
+            item.runtime.id !==
+              operation.runtimeId
           ) {
             delete nextPending[
               deploymentId
@@ -1676,19 +2131,43 @@ function WorkspaceDeployments({
 
             changed = true;
 
-            if (
-              item?.runtime?.status ===
-                "FAILED" ||
-              item?.runtime?.status ===
-                "CANCELLED"
-            ) {
-              reportActionError(
-                deploymentId,
-                item.runtime
-                  .failureMessage ??
-                  "The runtime action did not complete successfully.",
-              );
-            }
+            reportActionError(
+              deploymentId,
+              "The runtime instance changed before the previous action was confirmed. Review the new runtime state.",
+            );
+
+            continue;
+          }
+
+          if (
+            !isActionConfirmed(
+              item,
+              operation,
+            )
+          ) {
+            continue;
+          }
+
+          delete nextPending[
+            deploymentId
+          ];
+
+          changed = true;
+
+          if (
+            item?.runtime?.status ===
+              "FAILED" ||
+            item?.runtime?.status ===
+              "CANCELLED"
+          ) {
+            reportActionError(
+              deploymentId,
+              "The runtime action did not complete successfully. Check deployment logs.",
+            );
+          } else {
+            clearActionError(
+              deploymentId,
+            );
           }
         }
 
@@ -1699,7 +2178,10 @@ function WorkspaceDeployments({
           setPending(nextPending);
         }
       },
-      [reportActionError],
+      [
+        reportActionError,
+        clearActionError,
+      ],
     );
 
   // ================================================
@@ -1712,12 +2194,8 @@ function WorkspaceDeployments({
         return;
       }
 
-      /**
-       * Reuse the in-flight request.
-       *
-       * Polling and manual refresh must not
-       * create overlapping list requests.
-       */
+      // Polling and manual refresh share
+      // the same in-flight request.
       if (requestRef.current) {
         return requestRef.current;
       }
@@ -1728,6 +2206,12 @@ function WorkspaceDeployments({
       const requestId =
         ++requestIdRef.current;
 
+      const controller =
+        new AbortController();
+
+      requestControllerRef.current =
+        controller;
+
       const isCurrentRequest =
         (): boolean =>
           mountedRef.current &&
@@ -1736,83 +2220,109 @@ function WorkspaceDeployments({
           requestIdRef.current ===
             requestId;
 
+      const timeout = window.setTimeout(
+        () => {
+          controller.abort();
+        },
+        REQUEST_TIMEOUT_MS,
+      );
+
       setSnapshot((previous) => ({
         ...previous,
-
         loading: !loadedRef.current,
-
-        refreshing:
-          loadedRef.current,
+        refreshing: loadedRef.current,
       }));
 
       const task = (async () => {
         try {
           const response =
-            await apiFetch<
-              Deployment[]
-            >("/deployments");
+            await apiFetch<unknown>(
+              "/deployments",
+              {
+                signal: controller.signal,
+              },
+            );
 
           if (!isCurrentRequest()) {
             return;
           }
 
-          if (
-            !Array.isArray(response)
-          ) {
-            throw new Error(
-              "Invalid deployment response.",
-            );
-          }
+          const deployments =
+            validateDeployments(response);
 
-          itemsRef.current = response;
+          const updatedAt = Date.now();
+
+          itemsRef.current =
+            deployments;
 
           loadedRef.current = true;
 
+          staleRef.current = false;
+
+          permissionDeniedRef.current =
+            false;
+
+          lastUpdatedRef.current =
+            updatedAt;
+
+          setSnapshotStale(false);
+
           setSnapshot({
             workspaceId,
-
-            items: response,
-
+            items: deployments,
             loaded: true,
-
             loading: false,
-
             refreshing: false,
-
             error: "",
-
-            lastUpdatedAt: Date.now(),
+            lastUpdatedAt: updatedAt,
           });
 
           reconcilePendingActions(
-            response,
+            deployments,
           );
         } catch (cause) {
           if (!isCurrentRequest()) {
             return;
           }
 
-          /**
-           * Preserve the last successful
-           * response during refresh failures.
-           */
-          setSnapshot(
-            (previous) => ({
-              ...previous,
-
-              loading: false,
-
-              refreshing: false,
-
-              error: getErrorMessage(
+          if (isPermissionError(cause)) {
+            invalidateAccess(
+              getErrorMessage(
                 cause,
-                "Could not load deployments.",
+                "Deployment access is unavailable.",
               ),
-            }),
-          );
+            );
+
+            return;
+          }
+
+          staleRef.current = true;
+
+          setSnapshotStale(true);
+
+          // Preserve the last successful
+          // response for temporary failures,
+          // but disable runtime controls.
+
+          setSnapshot((previous) => ({
+            ...previous,
+            loading: false,
+            refreshing: false,
+            error: controller.signal.aborted
+              ? "The deployment request timed out."
+              : getErrorMessage(
+                  cause,
+                  "Could not load deployments. Please try again.",
+                ),
+          }));
         } finally {
+          window.clearTimeout(timeout);
+
           if (isCurrentRequest()) {
             requestRef.current = null;
+
+            requestControllerRef.current =
+              null;
           }
         }
       })();
@@ -1824,6 +2334,7 @@ function WorkspaceDeployments({
     [
       workspaceId,
       reconcilePendingActions,
+      invalidateAccess,
     ],
   );
 
@@ -1836,10 +2347,6 @@ function WorkspaceDeployments({
 
     generationRef.current += 1;
 
-    /**
-     * Delay the first request until the
-     * workspace-scoped component is mounted.
-     */
     const timer = window.setTimeout(
       () => {
         void load();
@@ -1856,16 +2363,35 @@ function WorkspaceDeployments({
 
       requestIdRef.current += 1;
 
+      requestControllerRef.current?.abort();
+
+      requestControllerRef.current = null;
+
       requestRef.current = null;
+
+      for (const controller of
+        actionControllersRef.current.values()) {
+        controller.abort();
+      }
+
+      actionControllersRef.current.clear();
 
       actionLocksRef.current.clear();
 
       pendingRef.current = {};
+
+      itemsRef.current = [];
+
+      loadedRef.current = false;
+
+      staleRef.current = true;
+
+      lastUpdatedRef.current = null;
     };
   }, [load]);
 
   // ================================================
-  // Automatic polling
+  // Adaptive automatic polling
   // ================================================
 
   useEffect(() => {
@@ -1878,53 +2404,60 @@ function WorkspaceDeployments({
         return;
       }
 
+      const hasActiveDeployments =
+        itemsRef.current.some(
+          isDeploymentActive,
+        );
+
+      const hasRunningApplications =
+        itemsRef.current.some(
+          (item) =>
+            item.runtime?.status ===
+            "RUNNING",
+        );
+
+      const hasPendingActions =
+        Object.values(
+          pendingRef.current,
+        ).some(Boolean);
+
+      const requiresFastPolling =
+        !loadedRef.current ||
+        staleRef.current ||
+        hasActiveDeployments ||
+        hasRunningApplications ||
+        hasPendingActions;
+
+      const interval =
+        requiresFastPolling
+          ? POLLING_INTERVAL_MS
+          : IDLE_POLLING_INTERVAL_MS;
+
       timer = window.setTimeout(
         async () => {
           if (stopped) {
             return;
           }
 
-          const hasActiveDeployments =
-            itemsRef.current.some(
-              isDeploymentActive,
-            );
-
-          const hasPendingActions =
-            Object.values(
-              pendingRef.current,
-            ).some(Boolean);
-
           if (
             document.visibilityState ===
               "visible" &&
-            (
-              hasActiveDeployments ||
-              hasPendingActions
-            )
+            !permissionDeniedRef.current
           ) {
             await load();
           }
 
           schedule();
         },
-        POLLING_INTERVAL_MS,
+        interval,
       );
     };
 
-    const handleVisibilityChange =
-      () => {
-        if (
-          document.visibilityState ===
-          "visible"
-        ) {
-          void load();
-        }
-      };
-
-    const handleFocus = () => {
+    const refreshVisible = () => {
       if (
         document.visibilityState ===
-        "visible"
+          "visible" &&
+        !permissionDeniedRef.current
       ) {
         void load();
       }
@@ -1934,12 +2467,17 @@ function WorkspaceDeployments({
 
     document.addEventListener(
       "visibilitychange",
-      handleVisibilityChange,
+      refreshVisible,
     );
 
     window.addEventListener(
       "focus",
-      handleFocus,
+      refreshVisible,
+    );
+
+    window.addEventListener(
+      "online",
+      refreshVisible,
     );
 
     return () => {
@@ -1951,18 +2489,23 @@ function WorkspaceDeployments({
 
       document.removeEventListener(
         "visibilitychange",
-        handleVisibilityChange,
+        refreshVisible,
       );
 
       window.removeEventListener(
         "focus",
-        handleFocus,
+        refreshVisible,
+      );
+
+      window.removeEventListener(
+        "online",
+        refreshVisible,
       );
     };
   }, [load]);
 
   // ================================================
-  // Pending action confirmation timeout
+  // Snapshot freshness and action timeout
   // ================================================
 
   useEffect(() => {
@@ -1970,38 +2513,70 @@ function WorkspaceDeployments({
       () => {
         const now = Date.now();
 
+        const lastUpdated =
+          lastUpdatedRef.current;
+
+        if (
+          lastUpdated === null ||
+          now - lastUpdated >
+            MAX_SNAPSHOT_AGE_MS
+        ) {
+          staleRef.current = true;
+
+          setSnapshotStale(true);
+        }
+
+        if (
+          permissionDeniedRef.current
+        ) {
+          return;
+        }
+
+        const nextPending = {
+          ...pendingRef.current,
+        };
+
+        let changed = false;
+
         for (const [
           deploymentId,
           operation,
         ] of Object.entries(
-          pendingRef.current,
+          nextPending,
         )) {
-          if (!operation) {
-            continue;
-          }
-
           if (
-            now -
-              operation.requestedAt <
-            ACTION_CONFIRMATION_TIMEOUT_MS
+            !operation ||
+            operation.timeoutReported ||
+            now - operation.requestedAt <
+              ACTION_CONFIRMATION_TIMEOUT_MS
           ) {
             continue;
           }
 
-          /**
-           * A timeout is not proof that the
-           * operation failed.
-           *
-           * Keep the operation locked instead
-           * of automatically submitting it again.
-           */
+          nextPending[deploymentId] = {
+            ...operation,
+            timeoutReported: true,
+          };
+
+          changed = true;
+
+          // Report once. Timeout does not
+          // prove that the operation failed.
+
           reportActionError(
             deploymentId,
-            "The runtime action has not been confirmed yet. Refresh the deployment and check worker status before attempting another operation.",
+            "The runtime action has not been confirmed yet. Check worker status and deployment logs. Automatic retries are disabled.",
           );
         }
+
+        if (changed) {
+          pendingRef.current =
+            nextPending;
+
+          setPending(nextPending);
+        }
       },
-      POLLING_INTERVAL_MS,
+      1_000,
     );
 
     return () => {
@@ -2023,31 +2598,38 @@ function WorkspaceDeployments({
       }
 
       if (
-        deploymentId.length !== 36 ||
-        !UUID_PATTERN.test(
-          deploymentId,
-        )
+        !isUuid(deploymentId) ||
+        !runtimeActions.includes(action)
       ) {
-        reportActionError(
-          deploymentId,
-          "Invalid deployment identity.",
-        );
-
         return;
       }
 
-      /**
-       * Synchronous locking prevents rapid
-       * double-clicks before React re-renders.
-       */
+      // Synchronous locking prevents rapid
+      // double-clicks before React re-renders.
       if (
         actionLocksRef.current.has(
           deploymentId,
         ) ||
-        pendingRef.current[
-          deploymentId
-        ]
+        pendingRef.current[deploymentId]
       ) {
+        return;
+      }
+
+      const lastUpdated =
+        lastUpdatedRef.current;
+
+      if (
+        permissionDeniedRef.current ||
+        staleRef.current ||
+        lastUpdated === null ||
+        Date.now() - lastUpdated >
+          MAX_SNAPSHOT_AGE_MS
+      ) {
+        reportActionError(
+          deploymentId,
+          "Deployment information is stale. Refresh before performing a runtime action.",
+        );
+
         return;
       }
 
@@ -2082,21 +2664,24 @@ function WorkspaceDeployments({
           generationRef.current ===
             generation;
 
-      const operation: PendingAction =
-        {
-          action,
+      const operation: PendingAction = {
+        action,
+        runtimeId: item.runtime.id,
+        previousStatus:
+          item.runtime.status,
+        previousRestartCount:
+          item.runtime.restartCount,
+        requestedAt: Date.now(),
+        timeoutReported: false,
+      };
 
-          runtimeId:
-            item.runtime.id,
+      const controller =
+        new AbortController();
 
-          previousStatus:
-            item.runtime.status,
-
-          previousRestartCount:
-            item.runtime.restartCount,
-
-          requestedAt: Date.now(),
-        };
+      actionControllersRef.current.set(
+        deploymentId,
+        controller,
+      );
 
       actionLocksRef.current.add(
         deploymentId,
@@ -2104,17 +2689,19 @@ function WorkspaceDeployments({
 
       setActing((previous) => ({
         ...previous,
-
         [deploymentId]: action,
       }));
 
-      setActionErrors((previous) =>
-        previous.filter(
-          (error) =>
-            error.deploymentId !==
-            deploymentId,
-        ),
+      clearActionError(deploymentId);
+
+      const timeout = window.setTimeout(
+        () => {
+          controller.abort();
+        },
+        ACTION_REQUEST_TIMEOUT_MS,
       );
+
+      let requiresConfirmation = false;
 
       try {
         await apiFetch(
@@ -2123,6 +2710,7 @@ function WorkspaceDeployments({
           )}/runtime/${action}`,
           {
             method: "POST",
+            signal: controller.signal,
           },
         );
 
@@ -2130,84 +2718,63 @@ function WorkspaceDeployments({
           return;
         }
 
-        /**
-         * The API may acknowledge queue
-         * acceptance before execution completes.
-         *
-         * Keep lifecycle controls locked until
-         * the worker outcome is observed.
-         */
-        const nextPending = {
-          ...pendingRef.current,
-
-          [deploymentId]: operation,
-        };
-
-        pendingRef.current =
-          nextPending;
-
-        setPending(nextPending);
-
-        /**
-         * An existing GET request may have
-         * started before the POST completed.
-         * Wait for it before requesting a fresh
-         * deployment snapshot.
-         */
-        const inFlight =
-          requestRef.current;
-
-        if (inFlight) {
-          await inFlight;
-        }
-
-        if (isCurrentAction()) {
-          await load();
-        }
+        // A successful HTTP response may only
+        // acknowledge queue acceptance.
+        requiresConfirmation = true;
       } catch (cause) {
         if (!isCurrentAction()) {
           return;
         }
 
-        /**
-         * A network failure can occur after
-         * the server accepts a lifecycle job.
-         *
-         * Treat the outcome as uncertain rather
-         * than immediately allowing duplicate
-         * runtime operations.
-         */
-        const nextPending = {
-          ...pendingRef.current,
+        if (isPermissionError(cause)) {
+          // Preserve uncertainty until the
+          // API authorization contract has
+          // been verified end-to-end.
+          requiresConfirmation = true;
 
-          [deploymentId]: operation,
-        };
+          invalidateAccess(
+            getErrorMessage(
+              cause,
+              "Runtime access is unavailable.",
+            ),
+          );
+        } else {
+          // HTTP errors, network failures,
+          // timeouts and invalid responses
+          // may have ambiguous side effects.
+          //
+          // Do not automatically retry
+          // lifecycle mutations.
+          requiresConfirmation = true;
 
-        pendingRef.current =
-          nextPending;
-
-        setPending(nextPending);
-
-        reportActionError(
-          deploymentId,
-          `${getErrorMessage(
-            cause,
-            "Runtime action failed.",
-          )} The action outcome could not be confirmed.`,
-        );
-
-        const inFlight =
-          requestRef.current;
-
-        if (inFlight) {
-          await inFlight;
-        }
-
-        if (isCurrentAction()) {
-          await load();
+          reportActionError(
+            deploymentId,
+            `${getErrorMessage(
+              cause,
+              "The runtime request could not be completed.",
+            )} The action outcome could not be confirmed.`,
+          );
         }
       } finally {
+        window.clearTimeout(timeout);
+
         if (isCurrentAction()) {
+          actionControllersRef.current.delete(
+            deploymentId,
+          );
+
+          if (requiresConfirmation) {
+            const nextPending = {
+              ...pendingRef.current,
+              [deploymentId]: operation,
+            };
+
+            pendingRef.current =
+              nextPending;
+
+            setPending(nextPending);
+          }
+
           actionLocksRef.current.delete(
             deploymentId,
           );
@@ -2217,16 +2784,44 @@ function WorkspaceDeployments({
               ...previous,
             };
 
-            delete next[
-              deploymentId
-            ];
+            delete next[deploymentId];
 
             return next;
           });
         }
       }
+
+      if (
+        !isCurrentAction() ||
+        permissionDeniedRef.current
+      ) {
+        return;
+      }
+
+      // An existing GET may have started
+      // before the mutation completed.
+      // Wait for it, then request fresh data.
+
+      const inFlight =
+        requestRef.current;
+
+      if (inFlight) {
+        await inFlight;
+      }
+
+      if (
+        isCurrentAction() &&
+        !permissionDeniedRef.current
+      ) {
+        await load();
+      }
     },
-    [load, reportActionError],
+    [
+      load,
+      reportActionError,
+      clearActionError,
+      invalidateAccess,
+    ],
   );
 
   // ================================================
@@ -2234,22 +2829,32 @@ function WorkspaceDeployments({
   // ================================================
 
   const items =
-    snapshot.workspaceId ===
-    workspaceId
+    snapshot.workspaceId === workspaceId
       ? snapshot.items
       : [];
 
   const hasActiveDeployments =
     items.some(isDeploymentActive);
 
-  const hasPendingActions =
-    Object.values(pending).some(
-      Boolean,
+  const hasRunningApplications =
+    items.some(
+      (item) =>
+        item.runtime?.status === "RUNNING",
     );
 
-  const isPolling =
+  const hasPendingActions =
+    Object.values(pending).some(Boolean);
+
+  const fastPolling =
     hasActiveDeployments ||
-    hasPendingActions;
+    hasRunningApplications ||
+    hasPendingActions ||
+    snapshotStale;
+
+  const controlsDisabled =
+    snapshotStale ||
+    !snapshot.loaded ||
+    Boolean(snapshot.error);
 
   const showInitialLoading =
     snapshot.loading &&
@@ -2259,6 +2864,16 @@ function WorkspaceDeployments({
     snapshot.loaded &&
     !snapshot.loading &&
     items.length === 0;
+
+  const handleRuntimeAction = (
+    deploymentId: string,
+    action: RuntimeAction,
+  ) => {
+    void runAction(
+      deploymentId,
+      action,
+    );
+  };
 
   // ================================================
   // Render workspace deployments
@@ -2271,7 +2886,7 @@ function WorkspaceDeployments({
       {snapshot.error && (
         <div
           role="alert"
-          className="flex flex-col gap-3 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300 sm:flex-row sm:items-center sm:justify-between"
+          className="flex min-w-0 flex-col gap-3 rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900/60 dark:bg-red-950/40 dark:text-red-300 sm:flex-row sm:items-center sm:justify-between"
         >
           <div className="flex min-w-0 items-start gap-2">
             <AlertCircle
@@ -2288,7 +2903,8 @@ function WorkspaceDeployments({
                 <p className="mt-1 text-xs opacity-80">
                   Showing the last
                   successfully loaded
-                  deployment records.
+                  records. Runtime controls
+                  are temporarily disabled.
                 </p>
               )}
             </div>
@@ -2301,7 +2917,7 @@ function WorkspaceDeployments({
               snapshot.refreshing
             }
             onClick={() => void load()}
-            className="inline-flex min-h-9 shrink-0 items-center justify-center gap-2 rounded-md border border-red-200 px-3 text-xs font-medium hover:bg-red-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 disabled:opacity-50 dark:border-red-900 dark:hover:bg-red-950"
+            className={`${BUTTON_CLASS} shrink-0 border-red-200 dark:border-red-900`}
           >
             <RefreshCw
               aria-hidden="true"
@@ -2309,7 +2925,7 @@ function WorkspaceDeployments({
                 "size-3.5",
                 snapshot.loading ||
                 snapshot.refreshing
-                  ? "animate-spin"
+                  ? "animate-spin motion-reduce:animate-none"
                   : "",
               ].join(" ")}
             />
@@ -2325,7 +2941,7 @@ function WorkspaceDeployments({
         <div
           key={error.deploymentId}
           role="alert"
-          className="flex items-start justify-between gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-300"
+          className="flex min-w-0 items-start justify-between gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/40 dark:text-amber-300"
         >
           <div className="flex min-w-0 items-start gap-2">
             <AlertCircle
@@ -2348,13 +2964,8 @@ function WorkspaceDeployments({
             type="button"
             aria-label="Dismiss runtime action notice"
             onClick={() =>
-              setActionErrors(
-                (previous) =>
-                  previous.filter(
-                    (entry) =>
-                      entry.deploymentId !==
-                      error.deploymentId,
-                  ),
+              clearActionError(
+                error.deploymentId,
               )
             }
             className="shrink-0 rounded-md p-1 hover:bg-amber-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-500 dark:hover:bg-amber-950"
@@ -2383,7 +2994,7 @@ function WorkspaceDeployments({
 
               {/* Deployment toolbar */}
 
-              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div className="min-w-0">
                   <h2 className="text-sm font-semibold">
                     Deployment history
@@ -2397,14 +3008,22 @@ function WorkspaceDeployments({
                         : "deployments"}
                     </span>
 
-                    {isPolling && (
-                      <span className="inline-flex items-center gap-1.5">
-                        <span className="size-1.5 animate-pulse rounded-full bg-emerald-500 motion-reduce:animate-none" />
+                    <span className="inline-flex items-center gap-1.5">
+                      <span
+                        className={[
+                          "size-1.5 rounded-full",
+                          snapshotStale
+                            ? "bg-amber-500"
+                            : "bg-emerald-500",
+                        ].join(" ")}
+                      />
 
-                        Auto-refresh
-                        enabled
-                      </span>
-                    )}
+                      {snapshotStale
+                        ? "Refresh required"
+                        : fastPolling
+                          ? "Auto-refresh · 5s"
+                          : "Auto-refresh · 30s"}
+                    </span>
 
                     {snapshot.lastUpdatedAt !==
                       null && (
@@ -2431,14 +3050,14 @@ function WorkspaceDeployments({
                   onClick={() =>
                     void load()
                   }
-                  className="inline-flex min-h-9 w-full shrink-0 items-center justify-center gap-2 rounded-lg border bg-white px-3 text-xs font-medium shadow-sm transition-colors hover:bg-zinc-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 disabled:cursor-not-allowed disabled:opacity-60 dark:bg-zinc-950 dark:hover:bg-zinc-900 sm:w-auto"
+                  className={`${BUTTON_CLASS} w-full shrink-0 bg-white shadow-sm dark:bg-zinc-950 sm:w-auto`}
                 >
                   <RefreshCw
                     aria-hidden="true"
                     className={[
                       "size-3.5",
                       snapshot.refreshing
-                        ? "animate-spin"
+                        ? "animate-spin motion-reduce:animate-none"
                         : "",
                     ].join(" ")}
                   />
@@ -2456,33 +3075,24 @@ function WorkspaceDeployments({
                   {/* Mobile and tablet */}
 
                   <div className="grid min-w-0 grid-cols-1 gap-3 md:grid-cols-2 xl:hidden">
-                    {items.map(
-                      (item) => (
-                        <MobileDeploymentCard
-                          key={item.id}
-                          item={item}
-                          acting={
-                            acting[
-                              item.id
-                            ]
-                          }
-                          pending={
-                            pending[
-                              item.id
-                            ]
-                          }
-                          onAction={(
-                            deploymentId,
-                            action,
-                          ) => {
-                            void runAction(
-                              deploymentId,
-                              action,
-                            );
-                          }}
-                        />
-                      ),
-                    )}
+                    {items.map((item) => (
+                      <MobileDeploymentCard
+                        key={item.id}
+                        item={item}
+                        acting={
+                          acting[item.id]
+                        }
+                        pending={
+                          pending[item.id]
+                        }
+                        controlsDisabled={
+                          controlsDisabled
+                        }
+                        onAction={
+                          handleRuntimeAction
+                        }
+                      />
+                    ))}
                   </div>
 
                   {/* Laptop and desktop */}
@@ -2491,15 +3101,12 @@ function WorkspaceDeployments({
                     items={items}
                     acting={acting}
                     pending={pending}
-                    onAction={(
-                      deploymentId,
-                      action,
-                    ) => {
-                      void runAction(
-                        deploymentId,
-                        action,
-                      );
-                    }}
+                    controlsDisabled={
+                      controlsDisabled
+                    }
+                    onAction={
+                      handleRuntimeAction
+                    }
                   />
                 </>
               )}
@@ -2520,7 +3127,7 @@ function WorkspaceDeployments({
             "BUILD_SUCCEEDED" &&
           !item.runtime,
       ) && (
-        <div className="flex items-start gap-3 rounded-xl border border-dashed p-4">
+        <div className="flex min-w-0 items-start gap-3 rounded-xl border border-dashed p-4">
           <Package
             aria-hidden="true"
             className="mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-400"
@@ -2545,7 +3152,7 @@ function WorkspaceDeployments({
 
       {/* Runtime security information */}
 
-      <div className="flex items-start gap-3 rounded-xl border border-dashed p-4">
+      <div className="flex min-w-0 items-start gap-3 rounded-xl border border-dashed p-4">
         <Container
           aria-hidden="true"
           className="mt-0.5 size-4 shrink-0 text-zinc-500"
@@ -2557,25 +3164,23 @@ function WorkspaceDeployments({
           </p>
 
           <p className="mt-1 text-xs leading-relaxed text-zinc-500 dark:text-zinc-400">
-            CloudPilot is designed to
-            run trusted applications
-            using loopback-bound Docker
-            containers, configured
-            resource limits, read-only
-            filesystems and restricted
-            capabilities. These
-            controls do not provide
-            strong multi-tenant
-            isolation.
+            CloudPilot is designed to run
+            trusted applications using
+            loopback-bound Docker containers,
+            configured resource limits,
+            read-only filesystems and
+            restricted capabilities. These
+            controls do not provide strong
+            multi-tenant isolation.
           </p>
 
           <p className="mt-2 text-[11px] leading-relaxed text-zinc-500 dark:text-zinc-400">
-            Application links are
-            available only for verified
-            numeric loopback addresses.
-            The application must be
-            accessible from the machine
-            running your browser.
+            Application links are available
+            only for validated numeric
+            loopback addresses. The
+            application must be accessible
+            from the machine running your
+            browser.
           </p>
         </div>
       </div>
@@ -2591,8 +3196,13 @@ export default function DeploymentsPage() {
   const { activeWorkspace } =
     useDashboard();
 
-  const workspaceId =
+  const candidateWorkspaceId =
     activeWorkspace?.id ?? null;
+
+  const workspaceId =
+    isUuid(candidateWorkspaceId)
+      ? candidateWorkspaceId
+      : null;
 
   return (
     <DashboardPageShell
@@ -2604,14 +3214,11 @@ export default function DeploymentsPage() {
       }.`}
     >
       {workspaceId ? (
-        /**
-         * Remount all workspace-scoped state
-         * when the active workspace changes.
-         *
-         * Old deployment records, errors,
-         * requests and runtime action states
-         * cannot carry into the new component.
-         */
+        // Remount workspace-scoped state
+        // whenever the active workspace
+        // changes. Old requests and records
+        // cannot update the new component.
+
         <WorkspaceDeployments
           key={workspaceId}
           workspaceId={workspaceId}
@@ -2630,8 +3237,8 @@ export default function DeploymentsPage() {
           </h3>
 
           <p className="mx-auto mt-2 max-w-sm text-xs leading-relaxed text-zinc-500 dark:text-zinc-400">
-            Select a workspace to view
-            deployment records and
+            Select a valid workspace to
+            view deployment records and
             manage runtime instances.
           </p>
         </div>

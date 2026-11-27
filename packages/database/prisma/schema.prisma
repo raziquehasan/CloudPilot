@@ -1,3 +1,4 @@
+
 generator client {
   provider     = "prisma-client"
   output       = "../src/generated/prisma"
@@ -60,6 +61,26 @@ enum LogLevel {
   INFO
   WARN
   ERROR
+}
+
+enum DeploymentLogSource {
+  BUILD
+  RUNTIME
+  SYSTEM
+}
+
+enum DeploymentLogStream {
+  STDOUT
+  STDERR
+  SYSTEM
+}
+
+enum DeploymentLogLevel {
+  DEBUG
+  INFO
+  WARN
+  ERROR
+  UNKNOWN
 }
 
 enum DeploymentEnvironment {
@@ -386,6 +407,9 @@ model Deployment {
   sourcePreparation DeploymentSourcePreparation?
   deploymentBuilds  DeploymentBuild[]
   runtimeInstances  DeploymentRuntimeInstance[]
+  logEntries        DeploymentLogEntry[]
+  logSequence       DeploymentLogSequence?
+  logNotifications  DeploymentLogNotificationOutbox[]
   createdAt      DateTime                @default(now())
   updatedAt      DateTime                @updatedAt
   startedAt      DateTime?
@@ -489,6 +513,7 @@ model DeploymentBuild {
   deployment           Deployment                @relation(fields: [workspaceId, projectId, deploymentId], references: [workspaceId, projectId, id], onDelete: Cascade)
   logs                 DeploymentBuildLog[]
   runtimeInstances DeploymentRuntimeInstance[]
+  logEntries DeploymentLogEntry[] @relation("DeploymentLogBuild")
 
   @@unique([workspaceId, projectId, deploymentId, buildAttempt])
   @@unique([workspaceId, projectId, deploymentId, id])
@@ -624,6 +649,7 @@ model DeploymentRuntimeInstance {
   updatedAt            DateTime                @updatedAt
   deployment Deployment @relation(fields: [workspaceId, projectId, deploymentId], references: [workspaceId, projectId, id], onDelete: Cascade, onUpdate: Cascade, map: "dri_deployment_fkey")
   build DeploymentBuild @relation(fields: [workspaceId, projectId, deploymentId, buildId], references: [workspaceId, projectId, deploymentId, id], onDelete: NoAction, onUpdate: Cascade, map: "dri_build_fkey")
+  logEntries DeploymentLogEntry[] @relation("DeploymentLogRuntime")
 
   @@unique([workspaceId, projectId, deploymentId, runtimeAttempt], map: "dri_ws_proj_dep_attempt_key")
   @@unique([workspaceId, projectId, deploymentId, id], map: "dri_ws_proj_dep_id_key")
@@ -632,4 +658,83 @@ model DeploymentRuntimeInstance {
   @@index([status, executionLeaseExpiresAt], map: "dri_status_lease_expires_idx")
   @@index([workspaceId, projectId, deploymentId, buildId], map: "dri_ws_proj_dep_build_idx")
   @@map("deployment_runtime_instances")
+}
+
+/// Unified, authoritative deployment log history.
+/// Persisted before publication.
+/// Sequence uniqueness prevents duplicate cursors.
+/// Stable record identities are required for idempotent
+/// ingestion across ambiguous transaction retries.
+model DeploymentLogEntry {
+  id                String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId       String               @db.Uuid
+  projectId         String               @db.Uuid
+  deploymentId      String               @db.Uuid
+  buildId           String?              @db.Uuid
+  runtimeInstanceId String?              @db.Uuid
+  source            DeploymentLogSource
+  stream            DeploymentLogStream
+  level             DeploymentLogLevel
+  message           String               @db.Text
+  sequence          BigInt
+  eventTimestamp    DateTime
+  persistedAt       DateTime             @default(now())
+  createdAt         DateTime             @default(now())
+  deployment Deployment @relation(fields: [workspaceId, projectId, deploymentId], references: [workspaceId, projectId, id], onDelete: Cascade, onUpdate: Cascade, map: "dle_deployment_fkey")
+
+  build DeploymentBuild? @relation("DeploymentLogBuild", fields: [workspaceId, projectId, deploymentId, buildId], references: [workspaceId, projectId, deploymentId, id], onDelete: NoAction, onUpdate: Cascade, map: "dle_build_fkey")
+
+  runtimeInstance DeploymentRuntimeInstance? @relation("DeploymentLogRuntime", fields: [workspaceId, projectId, deploymentId, runtimeInstanceId], references: [workspaceId, projectId, deploymentId, id], onDelete: NoAction, onUpdate: Cascade, map: "dle_runtime_fkey")
+
+  @@unique([workspaceId, deploymentId, sequence], map: "dle_ws_dep_seq_key")
+  @@index([workspaceId, deploymentId, source, sequence], map: "dle_ws_dep_source_seq_idx")
+  @@index([workspaceId, deploymentId, level, sequence], map: "dle_ws_dep_level_seq_idx")
+  @@index([createdAt], map: "dle_created_idx")
+  @@index([workspaceId, deploymentId, stream, sequence], map: "dle_ws_dep_stream_seq_idx")
+  @@index([workspaceId, projectId, deploymentId, buildId], map: "dle_ws_proj_dep_build_idx")
+  @@index([workspaceId, projectId, deploymentId, runtimeInstanceId], map: "dle_ws_proj_dep_runtime_idx")
+  @@map("deployment_log_entries")
+}
+
+/// Per-deployment concurrency-safe sequence allocator.
+/// Incremented atomically inside the writer transaction so
+/// that sequence order matches commit order.
+model DeploymentLogSequence {
+  workspaceId  String     @db.Uuid
+  deploymentId String     @db.Uuid
+  value        BigInt     @default(0)
+  updatedAt DateTime @default(now()) @updatedAt
+  deployment Deployment @relation(fields: [workspaceId, deploymentId], references: [workspaceId, id], onDelete: Cascade, onUpdate: Cascade, map: "dls_deployment_fkey")
+
+  @@id([workspaceId, deploymentId], map: "dls_ws_dep_pk")
+  @@map("deployment_log_sequences")
+}
+
+/// Bounded, batched notification outbox. One row per committed
+/// log batch (never one row per log line). Drives Redis
+/// publication of committed cursor ranges.
+model DeploymentLogNotificationOutbox {
+  id             String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId    String                 @db.Uuid
+  projectId      String                 @db.Uuid
+  deploymentId   String                 @db.Uuid
+  fromSequence   BigInt
+  toSequence     BigInt
+  status         DeploymentOutboxStatus @default(PENDING)
+  attemptCount   Int                    @default(0)
+  nextAttemptAt  DateTime               @default(now())
+  leaseToken     String?                @db.Uuid
+  leaseExpiresAt DateTime?
+  publishedAt    DateTime?
+  lastErrorCode  String?                @db.VarChar(80)
+  createdAt      DateTime               @default(now())
+  updatedAt DateTime @default(now()) @updatedAt
+  deployment Deployment @relation(fields: [workspaceId, projectId, deploymentId], references: [workspaceId, projectId, id], onDelete: Cascade, onUpdate: Cascade, map: "dlno_deployment_fkey")
+
+  @@index([status, nextAttemptAt, createdAt], map: "dlno_status_next_idx")
+  @@index([status, leaseExpiresAt], map: "dlno_status_lease_idx")
+  @@index([workspaceId, deploymentId, createdAt], map: "dlno_ws_dep_created_idx")
+  @@unique([workspaceId, deploymentId, fromSequence, toSequence], map: "dlno_ws_dep_range_key")
+  @@index([status, createdAt], map: "dlno_status_created_idx")
+  @@map("deployment_log_notification_outbox")
 }

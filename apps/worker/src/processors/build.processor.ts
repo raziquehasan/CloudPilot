@@ -40,11 +40,22 @@ import { workerLogger } from "../config/logger.js";
 
 import { WorkspaceManager } from "../source/workspace.js";
 
-import { runBuild } from "../build/build-engine.js";
+import {
+  BuildEngineError,
+  runBuild,
+} from "../build/build-engine.js";
 
 import type { BuildExecutor } from "../build/build-executor.js";
 
 import type { BuildLogEntry } from "../build/build-logs.js";
+
+import type { CollectedLogRecord } from "@cloudpilot/queue";
+
+import { DeploymentLogWriter } from "../logging/log-writer.js";
+
+import { inferLogLevel } from "../logging/normalize.js";
+
+import { emitSystemLog } from "../logging/system-logs.js";
 
 // ==================================================
 // Constants
@@ -63,6 +74,7 @@ const BUILD_TERMINAL_DEPLOYMENT_STATUSES = new Set<string>([
   "BUILD_SUCCEEDED",
   "DEPLOYING",
   "HEALTH_CHECKING",
+  "RUNTIME_FAILED",
   "RUNNING",
 ]);
 
@@ -1915,6 +1927,47 @@ export async function processBuildJob(
 
   let logs: BuildLogEntry[] = [];
 
+  let logWriter: DeploymentLogWriter | null = null;
+
+  let logWriterOwnershipLost = false;
+
+  /**
+   * Stop ingestion and drain accepted records before
+   * releasing the build execution lease.
+   *
+   * Logging failures must not trigger another Docker
+   * build or override an authoritative build result.
+   */
+  async function closeBuildLogWriter(): Promise<void> {
+    const writer = logWriter;
+
+    logWriter = null;
+
+    if (!writer) {
+      return;
+    }
+
+    try {
+      await writer.stop();
+    } catch {
+      workerLogger.warn(
+        {
+          deploymentId: payload.deploymentId,
+
+          buildId: claim.buildId,
+
+          buildAttempt: claim.buildAttempt,
+        },
+
+        "Build log writer shutdown failed",
+      );
+    } finally {
+      if (writer.hasLostOwnership) {
+        logWriterOwnershipLost = true;
+      }
+    }
+  }
+
   let artifact:
     | VerifiedBuildArtifact
     | undefined;
@@ -1975,6 +2028,89 @@ export async function processBuildJob(
        *
        * Do not retry uncertain external side effects.
        */
+      // External execution is marked immediately
+      // before invoking runBuild.
+
+      // ==============================================
+      // Live build log streaming (Phase 5.6)
+      // ==============================================
+      //
+      // Persist sanitized build output to the unified log
+      // store as it is produced. This does not block the
+      // build and does not retry Docker on log failures.
+      // ==============================================
+
+      if (workerEnv.DEPLOYMENT_LOGS_ENABLED) {
+        try {
+          logWriter = new DeploymentLogWriter({
+            workspaceId: payload.workspaceId,
+
+            projectId: payload.projectId,
+
+            deploymentId: payload.deploymentId,
+
+            buildId: claim.buildId,
+
+            buildExecutionFence: {
+              buildAttempt: claim.buildAttempt,
+
+              executionLeaseToken: claim.leaseToken,
+            },
+
+            maxEntryBytes:
+              workerEnv.LOG_MAX_ENTRY_BYTES,
+
+            batchSize: workerEnv.LOG_BATCH_SIZE,
+
+            flushIntervalMs:
+              workerEnv.LOG_FLUSH_INTERVAL_MS,
+
+            maxBufferedBytes: Math.min(
+              workerEnv.LOG_MAX_DEPLOYMENT_BYTES,
+              8 * 1024 * 1024,
+            ),
+
+            maxBufferedEntries: 20_000,
+          });
+
+          emitSystemLog(
+            logWriter,
+            "Build execution starting.",
+          );
+        } catch {
+          await closeBuildLogWriter();
+
+          workerLogger.warn(
+            {
+              deploymentId: payload.deploymentId,
+
+              buildId: claim.buildId,
+
+              buildAttempt: claim.buildAttempt,
+            },
+
+            "Live build logging unavailable; continuing with bounded build log collection",
+          );
+        }
+      }
+
+      if (
+        monitor.signal.aborted ||
+        logWriterOwnershipLost
+      ) {
+        throw new BuildError(
+          monitor.state === "cancelling"
+            ? "BUILD_CANCELLED"
+            : "BUILD_LEASE_LOST",
+        );
+      }
+
+      /**
+       * External execution boundary.
+       *
+       * Never retry automatically once Docker may
+       * have received an execution request.
+       */
       executionMayHaveStarted = true;
 
       const result = await runBuild({
@@ -2028,6 +2164,46 @@ export async function processBuildJob(
 
         signal:
           monitor.signal,
+
+        ...(logWriter
+          ? {
+              onLogEntry: (
+                entry: BuildLogEntry,
+              ) => {
+                const record: CollectedLogRecord = {
+                  source: "BUILD",
+
+                  stream:
+                    entry.stream === "stderr"
+                      ? "STDERR"
+                      : entry.stream === "system"
+                        ? "SYSTEM"
+                        : "STDOUT",
+
+                  level: inferLogLevel(
+                    entry.message,
+                    entry.stream,
+                  ),
+
+                  message: entry.message,
+
+                  eventTimestamp: new Date(),
+                };
+
+                const writer = logWriter;
+
+                if (
+                  !writer ||
+                  writer.hasLostOwnership ||
+                  monitor.signal.aborted
+                ) {
+                  return;
+                }
+
+                writer.enqueue(record);
+              },
+            }
+          : {}),
       });
 
       logs = result.logEntries;
@@ -2054,6 +2230,10 @@ export async function processBuildJob(
 
       assertVerifiedArtifact(artifact);
     } catch (error) {
+      if (error instanceof BuildEngineError) {
+        logs = error.details.logEntries;
+      }
+
       const code =
         getBuildFailureCode(error);
 
@@ -2065,6 +2245,34 @@ export async function processBuildJob(
 
               buildFailureMessage(code),
             );
+    }
+
+    // ==============================================
+    // Drain live logs before releasing execution
+    // ownership through authoritative settlement
+    // ==============================================
+
+    if (logWriter && !monitor.signal.aborted) {
+      emitSystemLog(
+        logWriter,
+        "Build execution ended; verifying final deployment state.",
+      );
+    }
+
+    await closeBuildLogWriter();
+
+    if (logWriterOwnershipLost) {
+      workerLogger.warn(
+        {
+          deploymentId: payload.deploymentId,
+
+          buildId: claim.buildId,
+
+          buildAttempt: claim.buildAttempt,
+        },
+
+        "Build log writer rejected stale execution ownership",
+      );
     }
 
     // ==============================================
@@ -2173,6 +2381,9 @@ export async function processBuildJob(
       }
 
       if (settled === "succeeded") {
+        // Authoritative success has been committed.
+        // The execution-scoped writer is already closed.
+
         workerLogger.info(
           {
             deploymentId:
@@ -2200,6 +2411,9 @@ export async function processBuildJob(
       }
 
       if (settled === "cancelled") {
+        // Cancellation has been committed.
+        // Do not write using the released execution lease.
+
         reportDeferredCleanup(
           claim,
           "CANCELLED_AFTER_BUILD_COMPLETION",
@@ -2243,6 +2457,10 @@ export async function processBuildJob(
 
         claim.buildAttempt,
       );
+
+    // Failure, cancellation and retry outcomes are
+    // determined by the fenced settlement transaction.
+    // Do not emit an uncommitted terminal log event.
 
     let settled: SettlementResult;
 
@@ -2300,6 +2518,24 @@ export async function processBuildJob(
       `Build failed: ${buildError.code}`,
     );
   } finally {
-    await monitor.stop();
+    try {
+      await closeBuildLogWriter();
+    } finally {
+      try {
+        await monitor.stop();
+      } catch {
+        workerLogger.warn(
+          {
+            deploymentId: payload.deploymentId,
+
+            buildId: claim.buildId,
+
+            buildAttempt: claim.buildAttempt,
+          },
+
+          "Build execution monitor shutdown failed",
+        );
+      }
+    }
   }
 }

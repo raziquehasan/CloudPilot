@@ -1,21 +1,38 @@
-
 /**
  * CloudPilot — Build Log Collection
  *
- * Collects bounded, sanitized build logs.
+ * Collects bounded, sanitized build logs for legacy
+ * build snapshots and real-time unified log persistence.
  *
- * Security controls:
- * - Per-stream chunk buffering
- * - Best-effort credential redaction
- * - Terminal escape sanitization
- * - UTF-8 aware byte limits
- * - Bounded log entry count
- * - Oversized line rejection
- * - Explicit stream finalization
+ * Security and reliability controls:
+ *
+ * - Independent per-stream normalization.
+ * - Incremental UTF-8 decoding for Buffer inputs.
+ * - Shared credential redaction implementation.
+ * - Registered secret redaction.
+ * - Stateful terminal escape sanitization.
+ * - Multiline private key protection.
+ * - Bounded log message sizes.
+ * - Bounded aggregate log bytes.
+ * - Bounded log entry counts.
+ * - Bounded live subscriber counts.
+ * - Oversized line protection.
+ * - Explicit truncation notifications.
+ * - Reentrant callback protection.
+ * - Idempotent stream finalization.
+ * - Subscriber cleanup after finalization.
  *
  * Redaction is defense in depth, not a guarantee.
  * Infrastructure secrets must never be passed to builds.
+ *
+ * Local sequence numbers are for legacy build snapshots.
+ * Unified deployment log sequence numbers must be
+ * allocated transactionally by the persistence layer.
  */
+
+import { SecretRedactor } from "../logging/redact.js";
+
+import { LogNormalizer } from "../logging/normalize.js";
 
 // ==================================================
 // Constants
@@ -25,95 +42,70 @@ const DEFAULT_MAX_LOG_BYTES = 10 * 1024 * 1024;
 
 const MAX_ALLOWED_LOG_BYTES = 100 * 1024 * 1024;
 
-const MAX_LINE_BYTES = 64 * 1024;
+/**
+ * Must remain compatible with the unified log contract
+ * and PostgreSQL message byte constraint.
+ */
+const MAX_LINE_BYTES = 16 * 1024;
 
-const MAX_PENDING_LINE_BYTES = 128 * 1024;
+const MAX_PENDING_LINE_BYTES = 64 * 1024;
 
 const DEFAULT_MAX_LOG_ENTRIES = 20_000;
 
 const MAX_ALLOWED_LOG_ENTRIES = 100_000;
 
-const REDACTED = "[REDACTED]";
+const DEFAULT_MAX_SUBSCRIBERS = 8;
 
-const OVERSIZED_LINE_MESSAGE =
-  "[Oversized log line omitted]";
+const MAX_ALLOWED_SUBSCRIBERS = 32;
+
+const MAX_REGISTERED_SECRETS = 64;
+
+const MAX_SECRET_BYTES = 4_096;
+
+const MIN_SECRET_BYTES = 4;
+
+const REDACTED = "[REDACTED]";
 
 const TRUNCATION_MESSAGE =
   "[Build log limit reached]";
 
+const NORMALIZATION_FAILURE_MESSAGE =
+  "[Build log collection stopped safely]";
+
+const BUILD_LOG_STREAMS = [
+  "stdout",
+  "stderr",
+  "system",
+] as const;
+
 // ==================================================
-// Terminal sanitization patterns
+// Terminal sanitization
 // ==================================================
 
-// OSC sequences, including terminal hyperlinks.
+/**
+ * Compatibility sanitizer for standalone complete lines.
+ *
+ * The collector itself uses the shared stateful
+ * LogNormalizer for incremental stream sanitization.
+ */
+
 const OSC_PATTERN =
   /\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\|$)/gu;
 
-// DCS, SOS, PM and APC sequences.
 const TERMINAL_STRING_PATTERN =
-  /\u001b[P X^_][^\u001b]*(?:\u001b\\|$)/gu;
+  /\u001b[PX^_][^\u001b]*(?:\u001b\\|$)/gu;
 
-// ANSI CSI sequences.
 const ANSI_PATTERN =
   /(?:\u001b\[|\u009b)[0-?]*[ -/]*[@-~]/gu;
 
-// Remaining short escape sequences.
 const ESCAPE_PATTERN =
   /\u001b[ -/]*[@-_]/gu;
 
-// Preserve tabs and line separators.
 const CONTROL_PATTERN =
-  /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/gu;
+  /[\u0000-\u0008\u000a-\u001f\u007f-\u009f]/gu;
 
-// Bidirectional and invisible formatting controls.
 const FORMAT_CONTROL_PATTERN =
   /[\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\uFEFF]/gu;
-
-// ==================================================
-// Credential redaction
-// ==================================================
-
-const TOKEN_PATTERNS: readonly RegExp[] = [
-  // GitHub classic and installation tokens.
-  /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/gu,
-
-  // GitHub fine-grained personal access tokens.
-  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/gu,
-
-  // AWS access key identifiers.
-  /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/gu,
-
-  // Common OpenAI-style API keys.
-  /\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{16,}\b/gu,
-
-  // Google API keys.
-  /\bAIza[A-Za-z0-9_-]{30,}\b/gu,
-
-  // Slack tokens.
-  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/gu,
-
-  // JWT-like compact tokens.
-  /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/gu,
-];
-
-const AUTHORIZATION_PATTERN =
-  /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{4,}/giu;
-
-const URL_CREDENTIAL_PATTERN =
-  /([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^\s/@]+@[^\s/]+/gu;
-
-const SENSITIVE_ASSIGNMENT_PATTERN =
-  /(["']?\b(?:[A-Za-z0-9_-]*(?:token|password|passwd|secret|api[_-]?key|access[_-]?key|private[_-]?key|credential)[A-Za-z0-9_-]*|database_url|redis_url|authorization|cookie|set-cookie)["']?\s*[:=]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;]+)/giu;
-
-const PRIVATE_KEY_START_PATTERN =
-  /-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/u;
-
-const PRIVATE_KEY_END_PATTERN =
-  /-----END (?:[A-Z0-9 ]+ )?PRIVATE KEY-----/u;
-
-// ==================================================
-// Sanitization
-// ==================================================
 
 function stripTerminalControls(
   value: string,
@@ -127,69 +119,33 @@ function stripTerminalControls(
     .replace(FORMAT_CONTROL_PATTERN, "");
 }
 
-/**
- * Sanitize a complete logical log line.
- *
- * The collector buffers incomplete lines before
- * calling this function to reduce chunk-boundary
- * credential leakage.
- */
-export function sanitizeBuildLogLine(
-  line: string,
-): string {
-  let sanitized = stripTerminalControls(line);
-
-  if (
-    PRIVATE_KEY_START_PATTERN.test(sanitized) ||
-    PRIVATE_KEY_END_PATTERN.test(sanitized)
-  ) {
-    return REDACTED;
-  }
-
-  for (const pattern of TOKEN_PATTERNS) {
-    sanitized = sanitized.replace(
-      pattern,
-      REDACTED,
-    );
-  }
-
-  sanitized = sanitized.replace(
-    AUTHORIZATION_PATTERN,
-    (_match: string, scheme: string) =>
-      `${scheme} ${REDACTED}`,
-  );
-
-  sanitized = sanitized.replace(
-    URL_CREDENTIAL_PATTERN,
-    (_match: string, scheme: string) =>
-      `${scheme}${REDACTED}`,
-  );
-
-  sanitized = sanitized.replace(
-    SENSITIVE_ASSIGNMENT_PATTERN,
-    (_match: string, prefix: string) =>
-      `${prefix}${REDACTED}`,
-  );
-
-  return sanitized;
-}
-
 // ==================================================
 // UTF-8 byte helpers
 // ==================================================
 
-function byteLength(value: string): number {
-  return Buffer.byteLength(value, "utf8");
+function byteLength(
+  value: string,
+): number {
+  return Buffer.byteLength(
+    value,
+    "utf8",
+  );
 }
 
 /**
  * Truncate without splitting a Unicode code point.
+ *
+ * The caller must redact the complete logical line
+ * before applying this function.
  */
 function truncateUtf8(
   value: string,
   maxBytes: number,
 ): string {
-  if (maxBytes <= 0) {
+  if (
+    !Number.isSafeInteger(maxBytes) ||
+    maxBytes <= 0
+  ) {
     return "";
   }
 
@@ -208,7 +164,7 @@ function truncateUtf8(
   const availableBytes =
     maxBytes - suffixBytes;
 
-  let result = "";
+  const characters: string[] = [];
 
   let usedBytes = 0;
 
@@ -223,12 +179,67 @@ function truncateUtf8(
       break;
     }
 
-    result += character;
+    characters.push(character);
 
     usedBytes += characterBytes;
   }
 
-  return `${result}${suffix}`;
+  return `${characters.join("")}${suffix}`;
+}
+
+// ==================================================
+// Standalone compatibility sanitizer
+// ==================================================
+
+/**
+ * Sanitize a standalone complete logical log line.
+ *
+ * This compatibility function is intentionally
+ * stateless across calls.
+ *
+ * Multiline and chunked logs must use BuildLogCollector
+ * instead, which maintains independent stream state.
+ */
+export function sanitizeBuildLogLine(
+  line: string,
+): string {
+  if (
+    typeof line !== "string" ||
+    byteLength(line) >
+      MAX_PENDING_LINE_BYTES
+  ) {
+    return REDACTED;
+  }
+
+  /**
+   * A standalone line sanitizer cannot safely track
+   * multiline private key state across separate calls.
+   */
+  if (
+    /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/u
+      .test(line) ||
+    /-----END [A-Z0-9 ]*PRIVATE KEY-----/u
+      .test(line)
+  ) {
+    return REDACTED;
+  }
+
+  const redactor = new SecretRedactor();
+
+  try {
+    const sanitized =
+      stripTerminalControls(line);
+
+    return redactor.redact(sanitized).message;
+  } catch {
+    /**
+     * Never return unsanitized input after a
+     * normalization or redaction failure.
+     */
+    return REDACTED;
+  } finally {
+    redactor.dispose();
+  }
 }
 
 // ==================================================
@@ -248,6 +259,10 @@ export interface BuildLogEntry {
   message: string;
 }
 
+export type BuildLogListener = (
+  entry: BuildLogEntry,
+) => void;
+
 export interface BuildLogCollectorOptions {
   maxLogBytes?: number;
 
@@ -255,36 +270,49 @@ export interface BuildLogCollectorOptions {
 
   /**
    * Retained for compatibility with existing callers.
-   * Log timestamps are managed by the persistence layer.
+   *
+   * The normalizer may use this clock when creating
+   * normalized records.
    */
   now?: () => Date;
+
+  /**
+   * Optional known sensitive values.
+   *
+   * These values are registered before collection
+   * begins and must never be emitted in logs.
+   */
+  registeredSecrets?: readonly string[];
+
+  /**
+   * Maximum simultaneous live log subscribers.
+   */
+  maxSubscribers?: number;
 }
 
 // ==================================================
-// Internal stream state
+// Internal contracts
 // ==================================================
 
-interface StreamState {
-  pending: string;
+type CollectorState =
+  | "OPEN"
+  | "FINALIZING"
+  | "FINALIZED";
 
-  pendingBytes: number;
+interface ListenerRegistration {
+  listener: BuildLogListener;
 
-  discardingOversizedLine: boolean;
-
-  insidePrivateKey: boolean;
+  active: boolean;
 }
 
-function createStreamState(): StreamState {
-  return {
-    pending: "",
+type StreamRedactors = Record<
+  BuildLogStream,
+  SecretRedactor
+>;
 
-    pendingBytes: 0,
-
-    discardingOversizedLine: false,
-
-    insidePrivateKey: false,
-  };
-}
+// ==================================================
+// Validation
+// ==================================================
 
 function validateLimit(
   value: number,
@@ -302,6 +330,133 @@ function validateLimit(
   }
 }
 
+function isBuildLogStream(
+  value: unknown,
+): value is BuildLogStream {
+  return (
+    value === "stdout" ||
+    value === "stderr" ||
+    value === "system"
+  );
+}
+
+function toBuildLogStream(
+  stream: unknown,
+): BuildLogStream | null {
+  switch (stream) {
+    case "STDOUT":
+    case "stdout":
+      return "stdout";
+
+    case "STDERR":
+    case "stderr":
+      return "stderr";
+
+    case "SYSTEM":
+    case "system":
+      return "system";
+
+    default:
+      return null;
+  }
+}
+
+function validateRegisteredSecrets(
+  secrets: readonly string[],
+): string[] {
+  if (
+    !Array.isArray(secrets) ||
+    secrets.length >
+      MAX_REGISTERED_SECRETS
+  ) {
+    throw new RangeError(
+      "Invalid build log registered secret count.",
+    );
+  }
+
+  const uniqueSecrets = new Set<string>();
+
+  for (const secret of secrets) {
+    if (
+      typeof secret !== "string" ||
+      !secret.trim() ||
+      /[\u0000\r\n]/u.test(secret)
+    ) {
+      throw new Error(
+        "Invalid build log registered secret.",
+      );
+    }
+
+    const bytes = byteLength(secret);
+
+    if (
+      bytes < MIN_SECRET_BYTES ||
+      bytes > MAX_SECRET_BYTES
+    ) {
+      throw new RangeError(
+        "Invalid build log registered secret size.",
+      );
+    }
+
+    /**
+     * Preserve the original secret value, including
+     * leading or trailing whitespace.
+     */
+    uniqueSecrets.add(secret);
+  }
+
+  return [...uniqueSecrets];
+}
+
+// ==================================================
+// Shared stream redactors
+// ==================================================
+
+function disposeStreamRedactors(
+  redactors: StreamRedactors,
+): void {
+  for (const stream of BUILD_LOG_STREAMS) {
+    redactors[stream].dispose();
+  }
+}
+
+function createStreamRedactors(
+  secrets: readonly string[],
+): StreamRedactors {
+  const redactors: StreamRedactors = {
+    stdout: new SecretRedactor(),
+
+    stderr: new SecretRedactor(),
+
+    system: new SecretRedactor(),
+  };
+
+  try {
+    for (
+      const stream of BUILD_LOG_STREAMS
+    ) {
+      const redactor = redactors[stream];
+
+      for (const secret of secrets) {
+        const registered =
+          redactor.registerSecret(secret);
+
+        if (!registered) {
+          throw new Error(
+            "Build log secret registration failed.",
+          );
+        }
+      }
+    }
+
+    return redactors;
+  } catch (error) {
+    disposeStreamRedactors(redactors);
+
+    throw error;
+  }
+}
+
 // ==================================================
 // Build log collector
 // ==================================================
@@ -311,26 +466,36 @@ export class BuildLogCollector {
 
   private readonly maxLogEntries: number;
 
+  private readonly maxSubscribers: number;
+
+  private readonly redactors: StreamRedactors;
+
+  private readonly normalizer: LogNormalizer;
+
   private sequence = 0;
 
   private totalBytes = 0;
 
   private truncated = false;
 
-  private finalized = false;
+  private state: CollectorState = "OPEN";
+
+  /**
+   * Protect mutable collection state against
+   * reentrant subscriber callbacks.
+   */
+  private processing = false;
+
+  private notifying = false;
+
+  private finalizationRequested = false;
+
+  private subscriberFailures = 0;
 
   private readonly entries: BuildLogEntry[] = [];
 
-  private readonly streams: Record<
-    BuildLogStream,
-    StreamState
-  > = {
-    stdout: createStreamState(),
-
-    stderr: createStreamState(),
-
-    system: createStreamState(),
-  };
+  private readonly listeners =
+    new Set<ListenerRegistration>();
 
   constructor(
     options?: BuildLogCollectorOptions,
@@ -343,6 +508,10 @@ export class BuildLogCollector {
       options?.maxLogEntries ??
       DEFAULT_MAX_LOG_ENTRIES;
 
+    this.maxSubscribers =
+      options?.maxSubscribers ??
+      DEFAULT_MAX_SUBSCRIBERS;
+
     validateLimit(
       this.maxLogBytes,
       MAX_ALLOWED_LOG_BYTES,
@@ -354,6 +523,77 @@ export class BuildLogCollector {
       MAX_ALLOWED_LOG_ENTRIES,
       "Build log entry limit",
     );
+
+    validateLimit(
+      this.maxSubscribers,
+      MAX_ALLOWED_SUBSCRIBERS,
+      "Build log subscriber limit",
+    );
+
+    if (
+      options?.now !== undefined &&
+      typeof options.now !== "function"
+    ) {
+      throw new TypeError(
+        "Invalid build log clock.",
+      );
+    }
+
+    const secrets =
+      validateRegisteredSecrets(
+        options?.registeredSecrets ?? [],
+      );
+
+    this.redactors =
+      createStreamRedactors(secrets);
+
+    try {
+      /**
+       * Independent stream redactors prevent
+       * stdout and stderr private-key state from
+       * interfering with each other.
+       */
+      this.normalizer = new LogNormalizer({
+        source: "BUILD",
+
+        redactor: this.redactors.stdout,
+
+        streamRedactors: this.redactors,
+
+        maxLineBytes: MAX_LINE_BYTES,
+
+        maxPendingLineBytes:
+          MAX_PENDING_LINE_BYTES,
+
+        ...(options?.now !== undefined
+          ? { now: options.now }
+          : {}),
+
+        onRecord: (record) => {
+          const stream =
+            toBuildLogStream(record.stream);
+
+          if (stream === null) {
+            this.markTruncated(
+              NORMALIZATION_FAILURE_MESSAGE,
+            );
+
+            return;
+          }
+
+          this.pushLine(
+            stream,
+            record.message,
+          );
+        },
+      });
+    } catch (error) {
+      disposeStreamRedactors(
+        this.redactors,
+      );
+
+      throw error;
+    }
   }
 
   // ================================================
@@ -373,7 +613,15 @@ export class BuildLogCollector {
   }
 
   get isFinalized(): boolean {
-    return this.finalized;
+    return this.state === "FINALIZED";
+  }
+
+  get subscriberCount(): number {
+    return this.listeners.size;
+  }
+
+  get subscriberFailureCount(): number {
+    return this.subscriberFailures;
   }
 
   // ================================================
@@ -381,193 +629,77 @@ export class BuildLogCollector {
   // ================================================
 
   /**
-   * Append a raw chunk.
+   * Append a raw string or Buffer chunk.
    *
-   * Incomplete lines remain buffered separately
-   * for stdout, stderr and system streams.
+   * Existing string-based BuildKit callers remain
+   * supported.
+   *
+   * Buffer input allows the shared normalizer to
+   * perform incremental UTF-8 decoding.
+   *
+   * A single stream must not switch between string
+   * and Buffer input modes during collection.
    */
   append(
     stream: BuildLogStream,
-    chunk: string,
+    chunk: string | Buffer,
   ): void {
     if (
-      this.finalized ||
+      this.state !== "OPEN" ||
       this.truncated ||
-      !chunk
+      this.processing ||
+      this.notifying
     ) {
       return;
     }
 
-    const state = this.streams[stream];
-
-    let offset = 0;
-
-    while (offset < chunk.length) {
-      if (this.truncated) {
-        return;
-      }
-
-      const newlineIndex =
-        chunk.indexOf("\n", offset);
-
-      const hasNewline =
-        newlineIndex !== -1;
-
-      const end = hasNewline
-        ? newlineIndex
-        : chunk.length;
-
-      const segment = chunk.slice(
-        offset,
-        end,
+    if (!isBuildLogStream(stream)) {
+      this.markTruncated(
+        NORMALIZATION_FAILURE_MESSAGE,
       );
 
-      this.appendSegment(
+      return;
+    }
+
+    if (
+      typeof chunk !== "string" &&
+      !Buffer.isBuffer(chunk)
+    ) {
+      this.markTruncated(
+        NORMALIZATION_FAILURE_MESSAGE,
+      );
+
+      return;
+    }
+
+    if (chunk.length === 0) {
+      return;
+    }
+
+    this.processing = true;
+
+    try {
+      this.normalizer.push(
         stream,
-        state,
-        segment,
+        chunk,
       );
-
-      if (hasNewline) {
-        this.completeLine(
-          stream,
-          state,
-        );
-
-        offset = newlineIndex + 1;
-      } else {
-        break;
-      }
-    }
-  }
-
-  // ================================================
-  // Pending line buffering
-  // ================================================
-
-  private appendSegment(
-    stream: BuildLogStream,
-    state: StreamState,
-    segment: string,
-  ): void {
-    if (
-      this.truncated ||
-      state.discardingOversizedLine ||
-      !segment
-    ) {
-      return;
-    }
-
-    const segmentBytes =
-      byteLength(segment);
-
-    if (
-      segmentBytes >
-      MAX_PENDING_LINE_BYTES -
-        state.pendingBytes
-    ) {
+    } catch {
       /**
-       * Do not store a partial oversized line.
-       * A partial credential could otherwise
-       * escape complete-line redaction.
+       * Do not expose raw chunks or exception details.
+       *
+       * A log collection failure should not expose
+       * credentials or automatically fail the build.
        */
-      state.pending = "";
-
-      state.pendingBytes = 0;
-
-      state.discardingOversizedLine = true;
-
-      this.pushLine(
-        stream,
-        OVERSIZED_LINE_MESSAGE,
+      this.markTruncated(
+        NORMALIZATION_FAILURE_MESSAGE,
       );
+    } finally {
+      this.processing = false;
 
-      // Stop collection conservatively.
-      this.markTruncated();
-
-      return;
-    }
-
-    state.pending += segment;
-
-    state.pendingBytes += segmentBytes;
-
-    /**
-     * Reject pending lines that cannot fit within
-     * the configured log budget.
-     */
-    if (
-      state.pendingBytes >
-      this.maxLogBytes
-    ) {
-      this.markTruncated();
-    }
-  }
-
-  // ================================================
-  // Complete logical lines
-  // ================================================
-
-  private completeLine(
-    stream: BuildLogStream,
-    state: StreamState,
-  ): void {
-    if (this.truncated) {
-      return;
-    }
-
-    if (state.discardingOversizedLine) {
-      state.discardingOversizedLine = false;
-
-      state.pending = "";
-
-      state.pendingBytes = 0;
-
-      return;
-    }
-
-    const rawLine = state.pending;
-
-    state.pending = "";
-
-    state.pendingBytes = 0;
-
-    const line = stripTerminalControls(
-      rawLine.replace(/\r$/u, ""),
-    );
-
-    // Suppress multiline private key blocks.
-    if (state.insidePrivateKey) {
-      if (
-        PRIVATE_KEY_END_PATTERN.test(line)
-      ) {
-        state.insidePrivateKey = false;
+      if (this.finalizationRequested) {
+        this.finalize();
       }
-
-      return;
     }
-
-    if (
-      PRIVATE_KEY_START_PATTERN.test(line)
-    ) {
-      state.insidePrivateKey =
-        !PRIVATE_KEY_END_PATTERN.test(line);
-
-      this.pushLine(
-        stream,
-        "[REDACTED PRIVATE KEY]",
-      );
-
-      return;
-    }
-
-    const sanitized =
-      sanitizeBuildLogLine(line);
-
-    this.pushLine(
-      stream,
-      sanitized,
-    );
   }
 
   // ================================================
@@ -580,11 +712,25 @@ export class BuildLogCollector {
   ): void {
     if (
       this.truncated ||
+      this.state === "FINALIZED"
+    ) {
+      return;
+    }
+
+    if (
+      typeof line !== "string" ||
       !line.trim()
     ) {
       return;
     }
 
+    /**
+     * The shared normalizer has already sanitized
+     * and redacted the complete logical line.
+     *
+     * Apply a defensive final message byte limit
+     * before storing or notifying subscribers.
+     */
     const message = truncateUtf8(
       line,
       MAX_LINE_BYTES,
@@ -597,77 +743,306 @@ export class BuildLogCollector {
     const messageBytes =
       byteLength(message);
 
+    const markerBytes =
+      byteLength(TRUNCATION_MESSAGE);
+
+    /**
+     * Reserve space for a truncation marker whenever
+     * the configured limits are large enough.
+     *
+     * Extremely small legacy configurations remain
+     * supported, but may not fit a marker.
+     */
+    const reserveMarker =
+      this.maxLogEntries > 1 &&
+      this.maxLogBytes > markerBytes;
+
+    const usableEntryLimit =
+      this.maxLogEntries -
+      (reserveMarker ? 1 : 0);
+
+    const usableByteLimit =
+      this.maxLogBytes -
+      (reserveMarker ? markerBytes : 0);
+
     if (
       this.entries.length >=
-        this.maxLogEntries ||
+        usableEntryLimit ||
       messageBytes >
-        this.maxLogBytes -
-          this.totalBytes
+        usableByteLimit - this.totalBytes
     ) {
       this.markTruncated();
 
       return;
     }
 
+    this.storeEntry(
+      stream,
+      message,
+    );
+  }
+
+  /**
+   * Store a completed sanitized entry.
+   *
+   * This method also handles trusted internal
+   * truncation markers.
+   */
+  private storeEntry(
+    stream: BuildLogStream,
+    message: string,
+  ): boolean {
+    if (
+      this.state === "FINALIZED" ||
+      !message
+    ) {
+      return false;
+    }
+
+    const messageBytes =
+      byteLength(message);
+
+    if (
+      messageBytes <= 0 ||
+      messageBytes > MAX_LINE_BYTES ||
+      this.entries.length >=
+        this.maxLogEntries ||
+      messageBytes >
+        this.maxLogBytes - this.totalBytes
+    ) {
+      return false;
+    }
+
     this.sequence += 1;
 
     this.totalBytes += messageBytes;
 
-    this.entries.push({
+    const entry: BuildLogEntry = {
       sequence: this.sequence,
 
       stream,
 
       message,
-    });
+    };
+
+    this.entries.push(entry);
+
+    this.notifySubscribers(entry);
+
+    return true;
+  }
+
+  // ================================================
+  // Live streaming subscriptions
+  // ================================================
+
+  /**
+   * Subscribe to future sanitized entries.
+   *
+   * Existing snapshot entries are not replayed.
+   * Callers requiring historical entries must use
+   * snapshot() or the unified history API.
+   *
+   * Listeners must perform bounded synchronous work.
+   * Asynchronous persistence belongs in the bounded
+   * unified log writer.
+   */
+  subscribe(
+    listener: BuildLogListener,
+  ): () => void {
+    if (typeof listener !== "function") {
+      throw new TypeError(
+        "Invalid build log listener.",
+      );
+    }
+
+    if (
+      this.state !== "OPEN" ||
+      this.truncated
+    ) {
+      return () => {
+        // Collection is no longer accepting listeners.
+      };
+    }
+
+    if (this.notifying) {
+      throw new Error(
+        "Reentrant build log subscription is not supported.",
+      );
+    }
+
+    if (
+      this.listeners.size >=
+      this.maxSubscribers
+    ) {
+      throw new RangeError(
+        "Build log subscriber limit reached.",
+      );
+    }
+
+    const registration:
+      ListenerRegistration = {
+        listener,
+
+        active: true,
+      };
+
+    this.listeners.add(registration);
+
+    /**
+     * Unsubscribe is idempotent and removes only
+     * the specific registration owned by this call.
+     */
+    return () => {
+      if (!registration.active) {
+        return;
+      }
+
+      registration.active = false;
+
+      this.listeners.delete(
+        registration,
+      );
+    };
+  }
+
+  private notifySubscribers(
+    entry: BuildLogEntry,
+  ): void {
+    if (
+      this.notifying ||
+      this.listeners.size === 0
+    ) {
+      return;
+    }
+
+    this.notifying = true;
+
+    try {
+      /**
+       * Snapshot registrations so listener removal
+       * does not corrupt the iteration order.
+       */
+      const registrations = [
+        ...this.listeners,
+      ];
+
+      for (
+        const registration of registrations
+      ) {
+        if (!registration.active) {
+          continue;
+        }
+
+        try {
+          /**
+           * Each listener receives an independent
+           * copy, preventing mutation of the stored
+           * entry or another listener's payload.
+           */
+          registration.listener({
+            ...entry,
+          });
+        } catch {
+          /**
+           * A failing streaming sink must not abort
+           * build execution or other subscribers.
+           *
+           * Remove the failed listener to avoid
+           * repeatedly invoking a broken sink.
+           */
+          registration.active = false;
+
+          this.listeners.delete(
+            registration,
+          );
+
+          if (
+            this.subscriberFailures <
+            Number.MAX_SAFE_INTEGER
+          ) {
+            this.subscriberFailures += 1;
+          }
+        }
+      }
+    } finally {
+      this.notifying = false;
+    }
+  }
+
+  private clearSubscribers(): void {
+    for (
+      const registration of this.listeners
+    ) {
+      registration.active = false;
+    }
+
+    this.listeners.clear();
   }
 
   // ================================================
   // Truncation
   // ================================================
 
-  private markTruncated(): void {
-    if (this.truncated) {
+  private markTruncated(
+    reason: string = TRUNCATION_MESSAGE,
+  ): void {
+    if (
+      this.truncated ||
+      this.state === "FINALIZED"
+    ) {
       return;
     }
 
     this.truncated = true;
 
     /**
-     * Never retain raw incomplete lines after
-     * the collection budget is exhausted.
+     * Only trusted internal marker constants are
+     * permitted here. Raw executor messages must
+     * never bypass the normalizer.
      */
-    for (const state of Object.values(
-      this.streams,
-    )) {
-      state.pending = "";
+    const marker =
+      reason === NORMALIZATION_FAILURE_MESSAGE
+        ? NORMALIZATION_FAILURE_MESSAGE
+        : TRUNCATION_MESSAGE;
 
-      state.pendingBytes = 0;
+    const stored = this.storeEntry(
+      "system",
+      marker,
+    );
 
-      state.discardingOversizedLine = false;
+    /**
+     * The normal truncation marker is shorter and
+     * may fit when the failure marker does not.
+     */
+    if (
+      !stored &&
+      marker !== TRUNCATION_MESSAGE
+    ) {
+      this.storeEntry(
+        "system",
+        TRUNCATION_MESSAGE,
+      );
     }
 
-    const markerBytes =
-      byteLength(TRUNCATION_MESSAGE);
+    /**
+     * Truncation is terminal for this collector.
+     * Release subscriber references immediately.
+     */
+    this.clearSubscribers();
+
+    /**
+     * Finalize after the current normalizer operation
+     * completes. Do not reenter the normalizer from
+     * inside its record callback.
+     */
+    this.finalizationRequested = true;
 
     if (
-      this.entries.length <
-        this.maxLogEntries &&
-      markerBytes <=
-        this.maxLogBytes -
-          this.totalBytes
+      !this.processing &&
+      !this.notifying
     ) {
-      this.sequence += 1;
-
-      this.totalBytes += markerBytes;
-
-      this.entries.push({
-        sequence: this.sequence,
-
-        stream: "system",
-
-        message: TRUNCATION_MESSAGE,
-      });
+      this.finalize();
     }
   }
 
@@ -676,48 +1051,58 @@ export class BuildLogCollector {
   // ================================================
 
   /**
-   * Flush final unterminated lines after the
-   * executor has finished emitting logs.
+   * Flush final unterminated lines after the executor
+   * has finished emitting logs.
    *
    * Safe to call more than once.
    */
   finalize(): void {
-    if (this.finalized) {
+    if (
+      this.state === "FINALIZED" ||
+      this.state === "FINALIZING"
+    ) {
       return;
     }
 
-    if (!this.truncated) {
-      const streams: BuildLogStream[] = [
-        "stdout",
-        "stderr",
-        "system",
-      ];
+    if (
+      this.processing ||
+      this.notifying
+    ) {
+      this.finalizationRequested = true;
 
-      for (const stream of streams) {
-        if (this.truncated) {
-          break;
-        }
-
-        this.completeLine(
-          stream,
-          this.streams[stream],
-        );
-      }
+      return;
     }
 
-    for (const state of Object.values(
-      this.streams,
-    )) {
-      state.pending = "";
+    this.state = "FINALIZING";
 
-      state.pendingBytes = 0;
+    this.finalizationRequested = false;
 
-      state.insidePrivateKey = false;
+    this.processing = true;
 
-      state.discardingOversizedLine = false;
+    try {
+      /**
+       * When truncated, pushLine rejects additional
+       * records while the normalizer releases its
+       * pending stream state.
+       */
+      this.normalizer.finalize();
+    } catch {
+      this.markTruncated(
+        NORMALIZATION_FAILURE_MESSAGE,
+      );
+    } finally {
+      this.processing = false;
+
+      this.finalizationRequested = false;
+
+      this.state = "FINALIZED";
+
+      this.clearSubscribers();
+
+      disposeStreamRedactors(
+        this.redactors,
+      );
     }
-
-    this.finalized = true;
   }
 
   // ================================================
@@ -728,11 +1113,14 @@ export class BuildLogCollector {
    * Return an independent copy of completed,
    * sanitized log entries.
    *
-   * Pending raw chunks are never exposed.
+   * Pending raw chunks and registered secret values
+   * are never exposed.
    */
   snapshot(): BuildLogEntry[] {
     return this.entries.map(
-      (entry) => ({ ...entry }),
+      (entry) => ({
+        ...entry,
+      }),
     );
   }
 }
