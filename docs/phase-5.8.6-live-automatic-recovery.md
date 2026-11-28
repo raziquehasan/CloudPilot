@@ -75,3 +75,59 @@ Each of the four validated workers shut down gracefully with exit 0. The tagged-
 - Live Redis interruption during the Docker restart.
 - Live PostgreSQL interruption after restart and before finalization.
 - Real worker termination during an in-flight Docker operation.
+
+## Phase 5.8.6.B — Live infrastructure fault injection
+
+Baseline `7bb40ab`. This section validates the first two activation gates above with real Docker, PostgreSQL, Redis, BullMQ and isolated worker processes. The third gate (worker termination) remains 5.8.6.C.
+
+### Isolation configuration
+`apps/worker/test/automatic-recovery-fault.live.ts` reuses the 5.8.6.A harness isolation: a uniquely named PostgreSQL 16 container + database, a Redis 7 container, a per-run BullMQ prefix, a dedicated workspace/project/deployment/runtime, a dedicated application container on a fixed unused loopback port, and a child running the normal worker entry point. Automatic recovery is enabled only in the child environment (`AUTO_RECOVERY_ENABLED=true`); the caller shell and primary worker remain disabled. The harness asserts every connection target equals the disposable Docker port binding, rejects protected ports (3000/8000/5433/6379/53143/63299), and snapshots the protected `cloudpilot-postgres`/`cloudpilot-redis` containers before and after (must be identical).
+
+### Fault injection boundaries (test-only, strictly gated)
+`recovery-processor.ts` adds `maybeFault(stage)` + `releaseRecoveryFault()` + `recoveryFaultArmed(stage)`. It is inert unless `NODE_ENV==="test"` AND `CLOUDPILOT_RECOVERY_FAULT_TEST==="1"` AND `CLOUDPILOT_RECOVERY_FAULT_BOUNDARY===stage`; it only holds execution at an existing boundary and never bypasses identity, ownership, trust or restart fencing. The child's IPC handler calls `releaseRecoveryFault()` on `release-fault`.
+- B1 pauses at `after-intent` (durable `restartIssuedAt` committed, before the Docker restart call). The harness pauses the disposable Redis, then releases; the real Docker restart runs and completes while Redis is down.
+- B2 pauses at `after-restart` (Docker restart completed, before finalization). The harness pauses the disposable PostgreSQL, then releases; finalization blocks until restore.
+
+### Scenario B1 — Redis interruption during Docker restart (3 runs, all pass)
+Redis was paused before Docker issuance and held through completion; the single Docker restart event timestamp falls inside the Redis fault window in every run. BullMQ reported `completed` with `attemptsStarted=1`/`attemptsMade=1` — redelivery did **not** occur (Redis was restored before the stalled-job threshold; the already-active job completed on first attempt after restore). No duplicate reservation, no second restart, identity/image/port unchanged, generation 0→1, HEALTHY, budget 2/3, circuit CLOSED.
+
+| Run | Recovery ID | Redis fault window (ms) | Docker restart at | Intent at | Final StartedAt | Restarts | Job |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| cp586b-b1-7d676717 | 6e833729-cb47-4a9c-947f-fd802fc62ab7 | 17852 | 15:21:54.000 (inside) | 15:21:39.480 | 15:21:53.363 | 1 | completed/1 |
+| cp586b-b1-03ae395a | 2ad13c19-8a14-49bc-bc00-3cf89dd43254 | 17025 | 15:23:59.000 (inside) | 15:23:44.748 | 15:23:58.381 | 1 | completed/1 |
+| cp586b-b1-a13baae4 | 16dee004-717c-4493-a027-1e55768fa015 | 17327 | 15:25:51.000 (inside) | 15:25:37.153 | 15:25:50.915 | 1 | completed/1 |
+
+### Scenario B2 — PostgreSQL interruption after restart, before finalization (3 runs, all pass)
+PostgreSQL was paused only after the Docker restart completed (`restartAt < faultStart`) and before finalization committed (`finishedAt > faultEnd`). While paused the worker issued no second restart (StartedAt unchanged) and fabricated no success. After restore the existing intent was reused, the source epoch was preserved, and the attempt reached SUCCEEDED only after authoritative verification. `attemptsStarted=1` (no redelivery). Identity/image/port unchanged, generation 0→1, HEALTHY, budget 2/3, circuit CLOSED.
+
+| Run | Recovery ID | PG fault window (ms) | Restart at (< fault) | Finalized at (> restore) | Intent at | Restarts | Job |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| cp586b-b2-ebd9e89e | e8aa5b1e-6c33-4a6c-9895-3700aad2dc46 | 5370 | 15:30:50.000 | 15:31:33.544 | 15:30:38.918 | 1 | completed/1 |
+| cp586b-b2-43afd766 | dd8a2888-89fe-49b4-b93f-df4d9d93cbcc | 6753 | 15:34:10.000 | 15:34:53.700 | 15:33:58.738 | 1 | completed/1 |
+| cp586b-b2-1e390921 | db9d410d-33e9-4a2a-b31c-aa1e76bfb941 | 5367 | 15:36:43.000 | 15:37:25.677 | 15:36:31.738 | 1 | completed/1 |
+
+### Defects and fixes
+One preliminary B2 run (`cp586b-b2-4b450625`) exited 1 on a **harness assertion** that required the Docker restart to fall inside the fault window; for B2 the PostgreSQL window is after the restart, so the correct proof is `restartAt < faultStart` and `finishedAt > faultEnd`. The recovery itself succeeded (worker logged `Automatic recovery settled`, `failureReason:null`). The harness assertion was corrected to be mode-specific and the scenario re-run. No product/runtime/schema code defect was found; the only source change is the test-only fault gate.
+
+### Commands and exit codes
+```powershell
+$env:CLOUDPILOT_RUN_LIVE_RECOVERY='1'
+node --import tsx apps/worker/test/automatic-recovery-fault.live.ts b1   # x3, exit 0
+node --import tsx apps/worker/test/automatic-recovery-fault.live.ts b2   # x3, exit 0
+npm run worker:typecheck                                                 # exit 0
+node node_modules/typescript/bin/tsc --noEmit --module NodeNext --target ES2023 --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --esModuleInterop --skipLibCheck apps/worker/test/automatic-recovery-fault.live.ts  # exit 0
+node --import tsx --test apps/worker/test/recovery-fault-gate.test.ts    # 3 pass, exit 0
+# Focused integration (disposable DB, sequential per file):
+node --import tsx --test apps/worker/test/auto-recovery-scheduling.integration.test.ts   # 12 pass / 4 skip, exit 0
+node --import tsx --test apps/worker/test/auto-recovery-circuit.integration.test.ts      # 4 pass, exit 0
+node --import tsx --test apps/worker/test/auto-recovery-candidates.integration.test.ts apps/worker/test/recovery.integration.test.ts  # 6 pass, exit 0
+node --import tsx --test apps/worker/test/recovery-fault-gate.test.ts apps/worker/test/auto-recovery-reservation.test.ts apps/worker/test/auto-recovery-policy.test.ts apps/worker/test/auto-recovery-candidates.test.ts apps/worker/test/health-monitor.test.ts  # 43 pass, exit 0
+```
+
+A single parallel multi-file integration run showed one transient failure in the auto-exec success test caused by concurrent files sharing one Redis/DB; the same test passes deterministically in isolation and in the intended per-file sequential mode (documented, not a product defect).
+
+### Protected infrastructure and cleanup
+Before/after snapshots of `cloudpilot-postgres` (127.0.0.1:5433) and `cloudpilot-redis` (127.0.0.1:6379) were identical; demo (53143), validation (63299), API (8000) and frontend (3000) stayed reachable; root `.env` unchanged with `AUTO_RECOVERY_ENABLED=false`; primary worker untouched. Each run's `finally` unpaused any paused disposable service, shut down the child (exit 0), closed the queue, disconnected Prisma, removed all `cloudpilot.validation=cp586b-*` containers/volumes (label-asserted) and the temp workspace. Post-run inventory of disposable containers was 0; the regression database was dropped and test queue keys purged.
+
+### Remaining limitations
+Exactly-once Docker execution is not claimed. BullMQ redelivery was not exercised because bounded interruptions restored the service before the stalled-job threshold; reconciliation of a truly stalled/terminal job remains covered by the 5.8.4 integration tests, not by a live stall in this phase. Real worker termination during an in-flight Docker operation (5.8.6.C) and final activation readiness (5.8.6.D) remain open.

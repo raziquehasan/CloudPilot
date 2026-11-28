@@ -45,6 +45,35 @@ function maybeCrash(stage: "after-claim" | "after-intent" | "after-restart" | "a
   }
 }
 
+// Test-only fault-injection gate (Phase 5.8.6.B). Strictly gated so it
+// can never fire outside an explicit test run: NODE_ENV must be "test",
+// the arm flag must be set, and the boundary must match. When armed it
+// pauses the worker at a named recovery boundary until
+// releaseRecoveryFault() is called (or a bounded timeout elapses). It
+// never bypasses runtime identity, ownership, trust, or restart fencing;
+// it only holds execution at an existing boundary.
+let releaseFault: (() => void) | null = null;
+export function releaseRecoveryFault() {
+  releaseFault?.();
+  releaseFault = null;
+}
+export function recoveryFaultArmed(stage: string): boolean {
+  return process.env.NODE_ENV === "test" && process.env.CLOUDPILOT_RECOVERY_FAULT_TEST === "1" &&
+    process.env.CLOUDPILOT_RECOVERY_FAULT_BOUNDARY === stage;
+}
+async function maybeFault(stage: "after-intent" | "after-restart") {
+  if (!recoveryFaultArmed(stage)) return;
+  workerLogger.warn({ stage }, "Recovery fault pause (test only)");
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, 30_000);
+    releaseFault = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+  });
+  releaseFault = null;
+}
+
 function runtimeTarget(runtime: Awaited<ReturnType<typeof currentRecoveryRuntime>>, buildId?: string): HealthRuntime | null {
   if (!workerEnv.RUNTIME_TRUSTED_LOCAL_ONLY || !isRecoveryRuntimeEligible(runtime) ||
       (buildId && runtime.buildId !== buildId)) return null;
@@ -325,9 +354,10 @@ export async function processRecoveryJob(jobId: string | undefined, job: Runtime
       const result = await verifyRecoveryRestart({
         scope: claim.scope, runtime: claim.runtime, executor, signal, sourceEpoch: claim.sourceEpoch,
         timeoutMs: Math.min(15_000, workerEnv.RUNTIME_STOP_TIMEOUT_MS),
-        markIntent: async (epoch) => { const ok = await markRestart(claim, epoch, signal); if (ok) maybeCrash("after-intent"); return ok; },
+        markIntent: async (epoch) => { const ok = await markRestart(claim, epoch, signal); if (ok) { maybeCrash("after-intent"); await maybeFault("after-intent"); } return ok; },
       });
       maybeCrash("after-restart");
+      await maybeFault("after-restart");
       if (workerSignal.aborted) throw new Error("Recovery interrupted");
       const settled = await finishRecovery(claim, result);
       maybeCrash("after-finish");
