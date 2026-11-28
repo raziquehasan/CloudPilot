@@ -2,13 +2,15 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import test, { after } from "node:test";
-import { Queue } from "bullmq";
+import { Queue, Worker } from "bullmq";
+import { setTimeout as delay } from "node:timers/promises";
 import {
-  prisma, disconnectDatabase, recoverySchemaReady, reserveManualRecovery, reserveAutomaticRecovery,
+  prisma, disconnectDatabase, lockRecoveryRuntime, recoverySchemaReady, reserveManualRecovery, reserveAutomaticRecovery,
   type RecoveryScope,
 } from "@cloudpilot/database";
 import { type RuntimeJob } from "@cloudpilot/queue";
-import { processRecoveryJob } from "../src/health/recovery-processor.js";
+import { cancelUnstartedAutomatic, processRecoveryJob } from "../src/health/recovery-processor.js";
+import { discoverAutoRecoveryCandidates, evaluateCandidateRows } from "../src/health/auto-recovery-candidates.js";
 import { DockerRuntimeExecutor } from "../src/runtime/docker-runtime-client.js";
 import {
   publishRecoveryJob, reconcileUnpublishedAutoRecoveries, type RecoveryJobQueue,
@@ -220,7 +222,8 @@ test("queue publication is idempotent and reconciles after a Redis outage", { sk
     assert.ok(await f.queue.getJob(`recovery-${reserve.attempt.id}`));
 
     // Reconciliation re-publishes any REQUESTED automatic attempt.
-    const result = await reconcileUnpublishedAutoRecoveries(f.recoveryQueue, 16);
+    await (await f.queue.getJob(`recovery-${reserve.attempt.id}`))?.remove();
+    const result = await reconcileUnpublishedAutoRecoveries(f.recoveryQueue, 16, { deploymentId: f.scope.deploymentId, autoEnabled: true });
     assert.ok(result.published >= 1);
     assert.ok(await f.queue.getJob(`recovery-${reserve.attempt.id}`));
   }, true));
@@ -301,6 +304,122 @@ test("existing manual recovery remains compatible", { skip: !manualEnabled }, ()
     const outcome = await runJob(autoJob(f, reserve.attempt.id, "MANUAL"), f.executor);
     assert.equal(outcome.status, "succeeded");
     assert.equal(f.calls(), 1);
+  }, false));
+
+test("advisory discovery reports OPEN and HALF_OPEN and fences stale generation/version", { skip: !dbEnabled }, () =>
+  withFixture(async (f) => {
+    for (const minutes of [60, 55, 50]) {
+      const at = new Date(Date.now() - minutes * 60_000);
+      await prisma.deploymentRecoveryAttempt.create({ data: {
+        ...f.scope, runtimeInstanceId: f.runtimeId, generation: 0, trigger: "AUTOMATIC", action: "RESTART",
+        idempotencyKey: randomUUID(), status: "FAILED", attemptCount: 1, createdAt: at, startedAt: at, finishedAt: at, failureReason: "HTTP_STATUS",
+      } });
+    }
+    const rows = await discoverAutoRecoveryCandidates(4, f.scope.deploymentId);
+    assert.equal(rows.length, 1, "generation zero is valid for runtime attempt one");
+    const eligible = evaluateCandidateRows(rows, { autoRecoveryEnabled: true, persistenceEnabled: true }).results[0];
+    assert.equal(eligible?.circuit?.state, "HALF_OPEN");
+    assert.equal(eligible?.decision.eligible, true);
+    assert.equal(eligible?.circuit?.consecutiveFailures, 3);
+    assert.ok(eligible);
+    assert.equal((await reserveAutomaticRecovery(prisma, f.scope, f.runtimeId, {
+      generation: eligible.generation + 1, version: eligible.version,
+    })).kind, "ineligible");
+    await prisma.deploymentHealthState.updateMany({ where: f.scope, data: { version: { increment: 1 } } });
+    assert.equal((await reserveAutomaticRecovery(prisma, f.scope, f.runtimeId, {
+      generation: eligible.generation, version: eligible.version,
+    })).kind, "ineligible");
+    const last = await prisma.deploymentRecoveryAttempt.findFirstOrThrow({ where: f.scope, orderBy: { createdAt: "desc" } });
+    await prisma.deploymentRecoveryAttempt.update({ where: { id: last.id }, data: { failureReason: "RECOVERY_RESTART_UNCERTAIN" } });
+    const blocked = evaluateCandidateRows(await discoverAutoRecoveryCandidates(4, f.scope.deploymentId),
+      { autoRecoveryEnabled: true, persistenceEnabled: true }).results[0];
+    assert.equal(blocked?.circuit?.state, "OPEN");
+    assert.deepEqual(blocked?.decision, { eligible: false, reason: "RESTART_UNCERTAIN" });
+    assert.equal(blocked?.circuit?.manualInterventionRequired, true);
+  }, false));
+
+test("terminal queue jobs for expired durable intent are retried while disabled", { skip: !redisEnabled || !autoDisabled }, () =>
+  withFixture(async (f) => {
+    const reserve = await reserveAutomaticRecovery(prisma, f.scope, f.runtimeId);
+    if (reserve.kind !== "reserved") return assert.fail(reserve.kind);
+    const id = reserve.attempt.id;
+    const startedAt = new Date(Date.now() - 10_000);
+    await prisma.deploymentRecoveryAttempt.update({ where: { id }, data: {
+      status: "RUNNING", attemptCount: 1, startedAt, leaseOwnerId: randomUUID(), leaseToken: randomUUID(),
+      leaseExpiresAt: startedAt, restartIssuedAt: startedAt, restartSourceStartedAt: sourceEpoch,
+    } });
+    assert.equal(await publishRecoveryJob(f.recoveryQueue, { ...f.scope, buildId: f.buildId, runtimeInstanceId: f.runtimeId }, id, "AUTOMATIC"), true);
+    const worker = new Worker(f.queue.name, async () => null, { connection: redisConnection(), prefix: `cp583:${f.suffix}` });
+    const jobId = `recovery-${id}`;
+    try {
+      const expires = Date.now() + 5_000;
+      while (Date.now() < expires && await (await f.queue.getJob(jobId))?.getState() !== "completed") await delay(25);
+      assert.equal(await (await f.queue.getJob(jobId))?.getState(), "completed");
+    } finally { await worker.close(); }
+    const result = await reconcileUnpublishedAutoRecoveries(f.recoveryQueue, 4, { deploymentId: f.scope.deploymentId });
+    assert.equal(result.published, 1);
+    assert.equal(await (await f.queue.getJob(jobId))?.getState(), "waiting");
+    const persisted = await prisma.deploymentRecoveryAttempt.findUniqueOrThrow({ where: { id } });
+    assert.equal(persisted.restartSourceStartedAt, sourceEpoch);
+    assert.equal((await runJob(autoJob(f, id, "AUTOMATIC"), f.executor)).status, "failed");
+    assert.equal(f.calls(), 0);
+    assert.equal((await prisma.deploymentRecoveryAttempt.findUniqueOrThrow({ where: { id } })).failureReason, "RECOVERY_RESTART_UNCERTAIN");
+  }, true));
+
+test("disabled reconciliation cancels claimed work, releases its lease and fences duplicate delivery", { skip: !dbEnabled || !autoDisabled }, () =>
+  withFixture(async (f) => {
+    const reserve = await reserveAutomaticRecovery(prisma, f.scope, f.runtimeId);
+    if (reserve.kind !== "reserved") return assert.fail(reserve.kind);
+    const id = reserve.attempt.id;
+    const now = new Date();
+    const token = randomUUID();
+    const leaseExpiresAt = new Date(now.getTime() + 90_000);
+    await prisma.deploymentRecoveryAttempt.update({ where: { id }, data: {
+      status: "RUNNING", attemptCount: 1, startedAt: now, leaseOwnerId: randomUUID(), leaseToken: token, leaseExpiresAt,
+    } });
+    await prisma.deploymentRuntimeInstance.update({ where: { id: f.runtimeId }, data: {
+      executionLeaseToken: token, executionLeaseExpiresAt: leaseExpiresAt,
+    } });
+    const payload = autoJob(f, id, "AUTOMATIC");
+    await Promise.all([
+      reconcileUnpublishedAutoRecoveries(null, 4, { deploymentId: f.scope.deploymentId }),
+      cancelUnstartedAutomatic(payload),
+      runJob(payload, f.executor),
+    ]);
+    assert.equal((await prisma.deploymentRecoveryAttempt.findUniqueOrThrow({ where: { id } })).status, "CANCELLED");
+    assert.equal((await prisma.deploymentRuntimeInstance.findUniqueOrThrow({ where: { id: f.runtimeId } })).executionLeaseToken, null);
+    assert.equal(f.calls(), 0);
+    await prisma.deploymentHealthState.updateMany({ where: f.scope, data: { status: "RECOVERING", nextCheckAt: null } });
+    assert.equal((await reconcileUnpublishedAutoRecoveries(null, 4, { deploymentId: f.scope.deploymentId })).repaired, 1);
+    assert.equal((await prisma.deploymentHealthState.findFirstOrThrow({ where: f.scope })).status, "FAILED");
+  }, false));
+
+test("cancellation racing with an already-authorizing transaction preserves its durable intent", { skip: !dbEnabled || !autoDisabled }, () =>
+  withFixture(async (f) => {
+    const reserve = await reserveAutomaticRecovery(prisma, f.scope, f.runtimeId);
+    if (reserve.kind !== "reserved") return assert.fail(reserve.kind);
+    const id = reserve.attempt.id;
+    const scope = { ...f.scope, runtimeInstanceId: f.runtimeId };
+    const now = new Date();
+    const token = randomUUID();
+    await prisma.deploymentRecoveryAttempt.update({ where: { id }, data: {
+      status: "RUNNING", attemptCount: 1, startedAt: now, leaseExpiresAt: now, leaseOwnerId: randomUUID(), leaseToken: token,
+    } });
+    let competingCancellation: Promise<boolean> | undefined;
+    // Model a worker that was already authorized before disablement, holding the
+    // same lock as markRestart while the disabled worker attempts cancellation.
+    await prisma.$transaction(async (tx) => {
+      assert.equal(await lockRecoveryRuntime(tx, scope), true);
+      competingCancellation = cancelUnstartedAutomatic(autoJob(f, id, "AUTOMATIC"));
+      const changed = await tx.deploymentRecoveryAttempt.updateMany({
+        where: { id, status: "RUNNING", leaseToken: token, restartIssuedAt: null },
+        data: { restartIssuedAt: now, restartSourceStartedAt: sourceEpoch },
+      });
+      assert.equal(changed.count, 1);
+    });
+    assert.equal(await competingCancellation, false);
+    assert.equal((await prisma.deploymentRecoveryAttempt.findUniqueOrThrow({ where: { id } })).restartSourceStartedAt, sourceEpoch);
+    assert.equal(f.calls(), 0);
   }, false));
 
 after(async () => { await disconnectDatabase(); });

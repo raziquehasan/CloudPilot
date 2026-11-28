@@ -25,6 +25,7 @@ function row(overrides: Partial<AutoRecoveryCandidateRow> = {}): AutoRecoveryCan
     deploymentId: "dp",
     runtimeInstanceId: "rt",
     generation: 1,
+    version: 0,
     deploymentStatus: "RUNNING",
     runtimeStatus: "RUNNING",
     runtimeEligible: true,

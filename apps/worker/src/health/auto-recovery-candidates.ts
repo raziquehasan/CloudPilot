@@ -10,11 +10,12 @@
 // safety conditions atomically.
 // ==================================================
 
-import { Prisma, prisma } from "@cloudpilot/database";
-import { recoveryPolicy } from "@cloudpilot/database";
+import { inspectAutomaticRecoveryCircuit, Prisma, prisma, recoveryPolicy } from "@cloudpilot/database";
 import { workerEnv } from "../config/env.js";
 import { healthDefaults } from "./health-state.js";
 import { evaluateAutoRecovery, type AutoRecoveryDecision } from "./auto-recovery-policy.js";
+
+type CircuitSnapshot = Awaited<ReturnType<typeof inspectAutomaticRecoveryCircuit>>;
 
 export interface AutoRecoveryCandidateRow {
   workspaceId: string;
@@ -22,6 +23,7 @@ export interface AutoRecoveryCandidateRow {
   deploymentId: string;
   runtimeInstanceId: string;
   generation: number;
+  version: number;
   deploymentStatus: string;
   runtimeStatus: string;
   runtimeEligible: boolean;
@@ -36,6 +38,7 @@ export interface AutoRecoveryCandidateRow {
   lastFailedFinishedAt: Date | null;
   recentFailureCount: number;
   now: Date;
+  circuit?: CircuitSnapshot;
 }
 
 export interface CandidateEvaluation {
@@ -44,7 +47,10 @@ export interface CandidateEvaluation {
   deploymentId: string;
   runtimeInstanceId: string;
   generation: number;
-  decision: AutoRecoveryDecision;
+  version: number;
+  decision: AutoRecoveryDecision | { eligible: false; reason: NonNullable<CircuitSnapshot["reason"]> };
+  circuit: CircuitSnapshot | null;
+  automaticRecoveryAvailable: boolean;
 }
 
 export interface EvaluationBatch {
@@ -84,11 +90,11 @@ export function evaluateCandidateRows(
 
   for (const row of rows) {
     const nowMs = row.now.getTime();
-    const cooldownRemainingMs = row.lastFailedFinishedAt
+    const cooldownRemainingMs = row.circuit?.cooldownRemainingMs ?? (row.lastFailedFinishedAt
       ? Math.max(0, row.lastFailedFinishedAt.getTime() + recoveryPolicy.cooldownMs * 2 ** Math.max(0, row.recentFailureCount - 1) - nowMs)
-      : 0;
+      : 0);
 
-    const decision = evaluateAutoRecovery({
+    const baseDecision = evaluateAutoRecovery({
       autoRecoveryEnabled,
       persistenceEnabled,
       monitoringAvailable,
@@ -110,6 +116,10 @@ export function evaluateCandidateRows(
       cooldownRemainingMs,
     });
 
+    const circuit = row.circuit ?? null;
+    const decision = baseDecision.eligible && circuit?.reason
+      ? { eligible: false as const, reason: circuit.reason }
+      : baseDecision;
     if (decision.eligible) eligible += 1;
     else reasons[decision.reason] = (reasons[decision.reason] ?? 0) + 1;
 
@@ -119,7 +129,10 @@ export function evaluateCandidateRows(
       deploymentId: row.deploymentId,
       runtimeInstanceId: row.runtimeInstanceId,
       generation: row.generation,
+      version: row.version,
       decision,
+      circuit,
+      automaticRecoveryAvailable: decision.eligible,
     });
   }
 
@@ -128,47 +141,25 @@ export function evaluateCandidateRows(
 
 /**
  * Bounded, read-only discovery of candidate runtimes using a
- * single query (no N+1). Pre-filters to current, trusted,
+ * bounded query plus shared circuit snapshots. Pre-filters to current, trusted,
  * eligible, unhealthy runtimes with sufficient, fresh failures
  * and no active/conflicting operation; the evaluator makes the
  * final advisory decision (budget, cooldown, uncertainty).
  */
-export async function discoverAutoRecoveryCandidates(limit: number): Promise<AutoRecoveryCandidateRow[]> {
+export async function discoverAutoRecoveryCandidates(limit: number, deploymentId?: string): Promise<AutoRecoveryCandidateRow[]> {
   if (!Number.isInteger(limit) || limit < 1 || limit > 128) {
     throw new RangeError("Invalid candidate batch size");
   }
   const repositories = workerEnv.BUILD_TRUSTED_REPOSITORIES.map((name) => name.trim().toLowerCase());
   if (!workerEnv.RUNTIME_TRUSTED_LOCAL_ONLY || repositories.length === 0) return [];
 
+  const deploymentFilter = deploymentId ? Prisma.sql`AND h."deploymentId" = ${deploymentId}::uuid` : Prisma.empty;
   const rows = await prisma.$queryRaw<Array<Record<string, unknown>>>(Prisma.sql`
     WITH db_clock AS MATERIALIZED (SELECT clock_timestamp() AT TIME ZONE 'UTC' AS now)
     SELECT
-      h."workspaceId", h."projectId", h."deploymentId", h."runtimeInstanceId", h."generation",
+      h."workspaceId", h."projectId", h."deploymentId", h."runtimeInstanceId", h."generation", h."version",
       d."status" AS "deploymentStatus", r."status" AS "runtimeStatus",
       h."status" AS "healthStatus", h."consecutiveFailures", h."lastCheckedAt",
-      (h."generation" = r."runtimeAttempt") AS "generationMatches",
-      (h."status" = 'FAILED' AND h."lastFailureReason" = 'RECOVERY_RESTART_UNCERTAIN') AS "restartUncertain",
-      EXISTS (
-        SELECT 1 FROM "deployment_recovery_attempts" a
-        WHERE (a."workspaceId", a."projectId", a."deploymentId") = (h."workspaceId", h."projectId", h."deploymentId")
-          AND a."status" IN ('REQUESTED','RUNNING')
-      ) AS "activeRecovery",
-      (r."executionLeaseExpiresAt" IS NOT NULL AND r."executionLeaseExpiresAt" > db_clock.now) AS "conflictingOperation",
-      (
-        SELECT count(*) FROM "deployment_recovery_attempts" a
-        WHERE (a."workspaceId", a."projectId", a."deploymentId") = (h."workspaceId", h."projectId", h."deploymentId")
-          AND a."createdAt" > db_clock.now - (${recoveryPolicy.windowMs}::bigint * interval '1 millisecond')
-      ) AS "attemptsInWindow",
-      (
-        SELECT max(a."finishedAt") FROM "deployment_recovery_attempts" a
-        WHERE (a."workspaceId", a."projectId", a."deploymentId") = (h."workspaceId", h."projectId", h."deploymentId")
-          AND a."status" = 'FAILED'
-      ) AS "lastFailedFinishedAt",
-      (
-        SELECT count(*) FROM "deployment_recovery_attempts" a
-        WHERE (a."workspaceId", a."projectId", a."deploymentId") = (h."workspaceId", h."projectId", h."deploymentId")
-          AND a."createdAt" > db_clock.now - (${recoveryPolicy.windowMs}::bigint * interval '1 millisecond')
-      ) AS "recentFailureCount",
       db_clock.now AS "now"
     FROM "deployment_health_states" h
     JOIN "deployment_runtime_instances" r ON (r."workspaceId", r."projectId", r."deploymentId", r.id) =
@@ -176,7 +167,18 @@ export async function discoverAutoRecoveryCandidates(limit: number): Promise<Aut
     JOIN "deployments" d ON (d."workspaceId", d."projectId", d.id) = (h."workspaceId", h."projectId", h."deploymentId")
     JOIN "repositories" repo ON (repo."workspaceId", repo."projectId") = (h."workspaceId", h."projectId")
     CROSS JOIN db_clock
-    WHERE h."status" = 'UNHEALTHY'
+    WHERE h."status" = 'UNHEALTHY' AND h."nextCheckAt" IS NOT NULL
+      ${deploymentFilter}
+      AND NOT EXISTS (
+        SELECT 1 FROM "deployment_health_states" newer
+        WHERE (newer."workspaceId", newer."projectId", newer."deploymentId", newer."runtimeInstanceId") =
+          (h."workspaceId", h."projectId", h."deploymentId", h."runtimeInstanceId") AND newer."generation" > h."generation"
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM "deployment_runtime_instances" newer
+        WHERE (newer."workspaceId", newer."projectId", newer."deploymentId") =
+          (h."workspaceId", h."projectId", h."deploymentId") AND newer."runtimeAttempt" > r."runtimeAttempt"
+      )
       AND h."consecutiveFailures" >= ${healthDefaults.consecutiveFailureLimit}
       AND h."lastCheckedAt" IS NOT NULL
       AND h."lastCheckedAt" > db_clock.now - (${healthDefaults.checkIntervalMs * 2}::bigint * interval '1 millisecond')
@@ -194,25 +196,25 @@ export async function discoverAutoRecoveryCandidates(limit: number): Promise<Aut
     LIMIT ${limit}::integer
   `);
 
-  return rows.map((row) => ({
-    workspaceId: String(row.workspaceId),
-    projectId: String(row.projectId),
-    deploymentId: String(row.deploymentId),
-    runtimeInstanceId: String(row.runtimeInstanceId),
-    generation: Number(row.generation),
-    deploymentStatus: String(row.deploymentStatus),
-    runtimeStatus: String(row.runtimeStatus),
-    runtimeEligible: true,
-    healthStatus: String(row.healthStatus),
-    consecutiveFailures: Number(row.consecutiveFailures),
-    lastCheckedAt: row.lastCheckedAt ? new Date(row.lastCheckedAt as string) : null,
-    generationMatches: row.generationMatches === true,
-    restartUncertain: row.restartUncertain === true,
-    activeRecovery: row.activeRecovery === true,
-    conflictingOperation: row.conflictingOperation === true,
-    attemptsInWindow: Number(row.attemptsInWindow),
-    lastFailedFinishedAt: row.lastFailedFinishedAt ? new Date(row.lastFailedFinishedAt as string) : null,
-    recentFailureCount: Number(row.recentFailureCount),
-    now: new Date(row.now as string),
-  }));
+  const candidates: AutoRecoveryCandidateRow[] = [];
+  for (const row of rows) {
+    const scope = {
+      workspaceId: String(row.workspaceId), projectId: String(row.projectId), deploymentId: String(row.deploymentId),
+    };
+    const now = new Date(row.now as string);
+    const circuit = await inspectAutomaticRecoveryCircuit(prisma, scope, now);
+    candidates.push({
+      ...scope, runtimeInstanceId: String(row.runtimeInstanceId),
+      generation: Number(row.generation), version: Number(row.version),
+      deploymentStatus: String(row.deploymentStatus), runtimeStatus: String(row.runtimeStatus),
+      runtimeEligible: true, healthStatus: String(row.healthStatus),
+      consecutiveFailures: Number(row.consecutiveFailures),
+      lastCheckedAt: row.lastCheckedAt ? new Date(row.lastCheckedAt as string) : null,
+      generationMatches: true, restartUncertain: false, activeRecovery: false, conflictingOperation: false,
+      attemptsInWindow: recoveryPolicy.limit - circuit.remainingBudget,
+      lastFailedFinishedAt: null, recentFailureCount: 0,
+      now, circuit,
+    });
+  }
+  return candidates;
 }

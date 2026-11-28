@@ -29,3 +29,11 @@ Live Redis/PostgreSQL interruption, worker termination during Docker ops, and re
 - auto-recovery-reservation.test.ts: 3 pass, 0 fail
 - API tsc: pass
 - worker tsc: pass
+
+## Phase 5.8.4.C worker integration
+
+The worker uses the database circuit evaluator during candidate discovery, locked reservation and immediately before recording restart intent. Discovery includes the circuit state, rejection reason, remaining budget, consecutive failures, cooldown, next eligible time, manual-intervention requirement and latest outcome. Reservation fences the observed health generation and version. Restart authorization shares a runtime lock with cancellation. If cancellation wins, the worker cannot persist restart intent. If authorization wins, reconciliation preserves that intent and verifies the outcome without issuing another restart.
+
+The health monitor runs reconciliation separately from candidate evaluation, including while automatic recovery is disabled. Reconciliation cancels expired or ineligible reservations without restart intent, retires orphaned RECOVERING states under the runtime lock and uses deterministic BullMQ IDs to republish missing jobs or retry terminal jobs for recoveries that remain active. Manual recovery continues to share budget and cooldown.
+
+The focused suite ran against disposable PostgreSQL and Redis with automatic execution disabled. It passed 50 tests, with zero failures and three automatic-execution tests skipped. It exercised OPEN and HALF_OPEN discovery, stale snapshot rejection, cancellation and authorization ordering, persisted intent, queue reconciliation and manual recovery. Live infrastructure interruption, real worker termination during Docker execution and end-to-end automatic Docker recovery remain Phase 5.8.6 activation gates.

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   prisma, currentRecoveryRuntime, isRecoveryRuntimeEligible, lockRecoveryRuntime,
+  inspectAutomaticRecoveryCircuit,
   recoveryNow, recoveryPolicy, recoveryRuntimeWhere, recoverySchemaReady,
   type HealthFailureReason, type HealthScope, type Prisma,
 } from "@cloudpilot/database";
@@ -17,6 +18,7 @@ type Transaction = Prisma.TransactionClient;
 type Claim = {
   scope: HealthScope; attemptId: string; token: string; ownerId: string; version: number;
   runtime: HealthRuntime; readyAt: Date; sourceEpoch: string | null;
+  trigger: RuntimeJob["recoveryTrigger"];
 };
 type ClaimResult = { kind: "claimed"; claim: Claim } | { kind: "busy" | "done" };
 const cleared = { leaseOwnerId: null, leaseToken: null, leaseExpiresAt: null };
@@ -62,7 +64,7 @@ async function latestHealth(tx: Transaction, scope: Omit<HealthScope, "generatio
   });
 }
 
-async function audit(tx: Transaction, scope: Omit<HealthScope, "generation">, id: string, status: "FAILED" | "SUCCEEDED",
+async function audit(tx: Transaction, scope: Omit<HealthScope, "generation">, id: string, status: "FAILED" | "SUCCEEDED" | "CANCELLED",
   reason: HealthFailureReason | null) {
   await tx.auditLog.create({ data: {
     workspaceId: scope.workspaceId, entityType: "Deployment", entityId: scope.deploymentId,
@@ -110,7 +112,7 @@ async function claimRecovery(job: RuntimeJob, ownerId: string): Promise<ClaimRes
     } });
     return { kind: "claimed", claim: {
       scope: generation, attemptId: attempt.id, version: health.version, token, ownerId, runtime: target,
-      readyAt: runtime.readyAt, sourceEpoch: attempt.restartSourceStartedAt,
+      readyAt: runtime.readyAt, sourceEpoch: attempt.restartSourceStartedAt, trigger: attempt.trigger,
     } };
   });
 }
@@ -141,9 +143,23 @@ async function markRestart(claim: Claim, epoch: string, signal: AbortSignal): Pr
     if (!await lockRecoveryRuntime(tx, claim.scope) || signal.aborted) return false;
     const now = await recoveryNow(tx);
     if (!await revalidate(tx, claim, now) || signal.aborted) return false;
+    if (claim.trigger === "AUTOMATIC") {
+      if (!workerEnv.AUTO_RECOVERY_ENABLED) return false;
+      const authorization = await tx.auditLog.findFirst({
+        where: { workspaceId: claim.scope.workspaceId, entityId: claim.scope.deploymentId, entityType: "Deployment",
+          action: "DEPLOYMENT_RECOVERY_REQUESTED", metadata: { path: ["recoveryId"], equals: claim.attemptId } },
+        select: { metadata: true },
+      });
+      const circuit = await inspectAutomaticRecoveryCircuit(tx, claim.scope, now, { excludeAttemptId: claim.attemptId });
+      const marker = authorization?.metadata;
+      if (circuit.reason !== null || !marker || typeof marker !== "object" || Array.isArray(marker) ||
+        marker.automaticCircuitState !== circuit.state || signal.aborted) return false;
+    }
+    const authorizedAt = await recoveryNow(tx);
+    if (signal.aborted) return false;
     const updated = await tx.deploymentRecoveryAttempt.updateMany({
-      where: { ...ownedAttempt(claim, now), restartIssuedAt: null },
-      data: { restartIssuedAt: now, restartSourceStartedAt: epoch },
+      where: { ...ownedAttempt(claim, authorizedAt), restartIssuedAt: null },
+      data: { restartIssuedAt: authorizedAt, restartSourceStartedAt: epoch },
     });
     return updated.count === 1;
   });
@@ -155,6 +171,10 @@ async function finishRecovery(claim: Claim, observed: RecoveryOperationResult) {
     const now = await recoveryNow(tx);
     const owned = ownedAttempt(claim, now);
     if (!await tx.deploymentRecoveryAttempt.findFirst({ where: owned, select: { id: true } })) {
+      const terminal = await tx.deploymentRecoveryAttempt.findFirst({
+        where: { ...claim.scope, id: claim.attemptId, status: { in: ["CANCELLED", "FAILED", "SUCCEEDED"] } }, select: { id: true },
+      });
+      if (terminal) return null;
       throw new Error("Recovery lease expired");
     }
     const health = await revalidate(tx, claim, now);
@@ -234,7 +254,7 @@ async function releaseRecoveryForRetry(claim: Claim) {
  * cancelled here; the caller reconciles its outcome instead.
  * Returns true when the attempt was cancelled (caller skips).
  */
-async function cancelUnstartedAutomatic(job: RuntimeJob): Promise<boolean> {
+export async function cancelUnstartedAutomatic(job: RuntimeJob, mode: "disabled" | "stale" = "disabled"): Promise<boolean> {
   const scope = scopeOf(job);
   return prisma.$transaction(async (tx) => {
     if (!await lockRecoveryRuntime(tx, scope)) return false;
@@ -245,9 +265,22 @@ async function cancelUnstartedAutomatic(job: RuntimeJob): Promise<boolean> {
     if (attempt.restartIssuedAt) return false;
     if (attempt.status !== "REQUESTED" && attempt.status !== "RUNNING") return true;
     const now = await recoveryNow(tx);
-    await tx.deploymentRecoveryAttempt.updateMany({
-      where: { id: attempt.id, ...scope, status: attempt.status === "RUNNING" ? "RUNNING" : "REQUESTED" },
+    if (mode === "stale") {
+      const runtime = await currentRecoveryRuntime(tx, scope);
+      const health = await latestHealth(tx, scope);
+      const compatible = runtime?.id === scope.runtimeInstanceId && runtimeTarget(runtime, job.buildId) &&
+        health?.generation === attempt.generation && health.version === attempt.healthVersion && health.status === "RECOVERING";
+      const expired = (!attempt.leaseExpiresAt || attempt.leaseExpiresAt <= now) &&
+        attempt.createdAt.getTime() + recoveryPolicy.windowMs <= now.getTime();
+      if (compatible && !expired) return false;
+    }
+    const changed = await tx.deploymentRecoveryAttempt.updateMany({
+      where: { id: attempt.id, ...scope, status: attempt.status, restartIssuedAt: null },
       data: { ...cleared, status: "CANCELLED", failureReason: "RECOVERY_STALE", finishedAt: now },
+    });
+    if (changed.count !== 1) return false;
+    if (attempt.leaseToken) await tx.deploymentRuntimeInstance.updateMany({
+      where: { ...recoveryRuntimeWhere(scope), executionLeaseToken: attempt.leaseToken }, data: runtimeCleared,
     });
     if (attempt.healthVersion !== null) {
       await tx.deploymentHealthState.updateMany({
@@ -255,7 +288,7 @@ async function cancelUnstartedAutomatic(job: RuntimeJob): Promise<boolean> {
         data: { ...cleared, version: { increment: 1 }, status: "UNHEALTHY", lastFailureReason: "RECOVERY_STALE", nextCheckAt: new Date(now.getTime() + healthDefaults.checkIntervalMs) },
       });
     }
-    await audit(tx, scope, attempt.id, "FAILED", "RECOVERY_STALE");
+    await audit(tx, scope, attempt.id, "CANCELLED", "RECOVERY_STALE");
     return true;
   });
 }

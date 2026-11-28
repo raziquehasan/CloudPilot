@@ -133,6 +133,50 @@ async function readCircuitHistory(tx: Transaction, scope: RecoveryScope) {
   return history;
 }
 
+type RecentAttempt = { finishedAt: Date | null; status: string };
+
+function recentRecoveryAttempts(tx: Transaction, scope: RecoveryScope, now: Date, excludeAttemptId?: string) {
+  return tx.deploymentRecoveryAttempt.findMany({
+    where: { ...scope, createdAt: { gt: new Date(now.getTime() - recoveryPolicy.windowMs) },
+      ...(excludeAttemptId ? { id: { not: excludeAttemptId } } : {}) },
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: recoveryPolicy.limit,
+    select: { status: true, finishedAt: true },
+  });
+}
+
+function remainingCooldown(recent: RecentAttempt[], now: Date) {
+  const last = recent[0];
+  return last?.status === "FAILED" && last.finishedAt
+    ? Math.max(0, last.finishedAt.getTime() + recoveryPolicy.cooldownMs * 2 ** (recent.length - 1) - now.getTime())
+    : 0;
+}
+
+export async function inspectAutomaticRecoveryCircuit(
+  tx: Transaction, scope: RecoveryScope, now: Date, options: { excludeAttemptId?: string; recent?: RecentAttempt[]; halfOpenInProgress?: boolean } = {},
+) {
+  const recent = options.recent ?? await recentRecoveryAttempts(tx, scope, now, options.excludeAttemptId);
+  const history = await readCircuitHistory(tx, scope);
+  const cooldownRemainingMs = remainingCooldown(recent, now);
+  const circuit = evaluateCircuit({
+    ...history, failureThreshold: circuitFailureThreshold, failedAttemptsInWindow: recent.filter((a) => a.status === "FAILED").length,
+    attemptsInWindow: recent.length, recoveryLimit: recoveryPolicy.limit, cooldownRemainingMs, now: now.getTime(),
+    verifiedRecoverySinceOpen: false, halfOpenInProgress: options.halfOpenInProgress ?? false,
+  });
+  return {
+    ...circuit,
+    ...(history.legacyTrialUnclassified ? {
+      state: "OPEN" as const, reason: "LEGACY_TRIAL_UNCLASSIFIED" as const, nextEligibleAt: null, manualInterventionRequired: true,
+    } : {}),
+    remainingBudget: Math.max(0, recoveryPolicy.limit - recent.length),
+    consecutiveFailures: history.consecutiveFailures,
+    cooldownRemainingMs,
+    latestOutcome: await tx.deploymentRecoveryAttempt.findFirst({
+      where: { ...scope, finishedAt: { not: null } }, orderBy: [{ finishedAt: "desc" }, { id: "desc" }],
+      select: { status: true, failureReason: true, finishedAt: true, trigger: true },
+    }),
+  };
+}
+
 export async function recoverySchemaReady(db: Pick<PrismaClient, "$queryRaw">): Promise<boolean> {
   const [table] = await db.$queryRaw<Array<{ ready: boolean }>>`
     SELECT to_regclass('public._prisma_migrations') IS NOT NULL
@@ -169,8 +213,12 @@ export async function reserveManualRecovery(
  */
 export async function reserveAutomaticRecovery(
   db: PrismaClient, scope: RecoveryScope, runtimeInstanceId: string,
+  expectedHealth?: { generation: number; version: number },
 ): Promise<ReserveResult> {
-  return reserveRecovery(db, scope, { trigger: "AUTOMATIC", actorId: null, idempotencyKey: "", expectedRuntimeId: runtimeInstanceId });
+  return reserveRecovery(db, scope, {
+    trigger: "AUTOMATIC", actorId: null, idempotencyKey: "", expectedRuntimeId: runtimeInstanceId,
+    ...(expectedHealth ? { expectedHealth } : {}),
+  });
 }
 
 type ReserveOptions = {
@@ -178,6 +226,7 @@ type ReserveOptions = {
   actorId: string | null;
   idempotencyKey: string;
   expectedRuntimeId?: string;
+  expectedHealth?: { generation: number; version: number };
 };
 
 async function reserveRecovery(
@@ -222,10 +271,13 @@ async function reserveRecovery(
         where: runtimeScope, orderBy: { generation: "desc" },
       });
       if (!health || health.status !== "UNHEALTHY" || !health.nextCheckAt) return { kind: "ineligible" };
+      if (options.expectedHealth && (health.generation !== options.expectedHealth.generation ||
+        health.version !== options.expectedHealth.version)) return { kind: "ineligible" };
       // Automatic recovery requires a fresh unhealthy observation so a
       // stale, lagging health state can never authorize a restart.
       if (trigger === "AUTOMATIC" &&
-        (!health.lastCheckedAt || now.getTime() - health.lastCheckedAt.getTime() > 30_000)) {
+        (!health.lastCheckedAt || health.lastCheckedAt > now || now.getTime() - health.lastCheckedAt.getTime() > 30_000 ||
+          health.consecutiveFailures < 3)) {
         return { kind: "ineligible" };
       }
       const idempotencyKey = trigger === "AUTOMATIC"
@@ -237,11 +289,7 @@ async function reserveRecovery(
         if (derived) return { kind: "replay", attempt: derived };
       }
       const healthKey = { ...runtimeScope, generation: health.generation, version: health.version };
-      const recent = await tx.deploymentRecoveryAttempt.findMany({
-        where: { ...scope, createdAt: { gt: new Date(now.getTime() - recoveryPolicy.windowMs) } },
-        orderBy: { createdAt: "desc" }, take: recoveryPolicy.limit,
-        select: { finishedAt: true, status: true },
-      });
+      const recent = await recentRecoveryAttempts(tx, scope, now);
       const unleased = { nextCheckAt: null, leaseOwnerId: null, leaseToken: null, leaseExpiresAt: null, version: { increment: 1 } };
       if (recent.length >= recoveryPolicy.limit) {
         await tx.deploymentHealthState.updateMany({
@@ -249,30 +297,11 @@ async function reserveRecovery(
         });
         return { kind: "exhausted" };
       }
-      const last = recent[0];
-      if (last?.status === "FAILED" && last.finishedAt &&
-        now.getTime() < last.finishedAt.getTime() + recoveryPolicy.cooldownMs * 2 ** (recent.length - 1)) {
-        return { kind: "cooldown" };
-      }
+      if (remainingCooldown(recent, now)) return { kind: "cooldown" };
       let automaticCircuitState: CircuitState | undefined;
       if (trigger === "AUTOMATIC") {
-        const history = await readCircuitHistory(tx, scope);
-        const circuit = evaluateCircuit({
-          ...history,
-          failureThreshold: circuitFailureThreshold,
-          failedAttemptsInWindow: recent.filter((attempt) => attempt.status === "FAILED").length,
-          attemptsInWindow: recent.length,
-          recoveryLimit: recoveryPolicy.limit,
-          cooldownRemainingMs: 0,
-          now: now.getTime(),
-          // The history starts at the last verified success. The deployment-wide
-          // active-attempt guard above already excludes an in-progress trial.
-          verifiedRecoverySinceOpen: false,
-          halfOpenInProgress: false,
-        });
-        // Older attempts have no admission marker. When they could have
-        // consumed a trial, require a verified recovery instead of guessing.
-        if (history.legacyTrialUnclassified || circuit.reason !== null || circuit.state === "OPEN") {
+        const circuit = await inspectAutomaticRecoveryCircuit(tx, scope, now, { recent });
+        if (circuit.reason !== null || circuit.state === "OPEN") {
           return { kind: "ineligible" };
         }
         automaticCircuitState = circuit.state;

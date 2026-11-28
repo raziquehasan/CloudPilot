@@ -11,6 +11,7 @@ export interface HealthMonitorOptions {
   discover: (limit: number) => Promise<HealthScope[]>;
   check: (scope: HealthScope, signal: AbortSignal) => Promise<void>;
   retain?: () => Promise<number>;
+  maintenance?: () => Promise<void>;
   // Optional read-only hook run after a successful batch (Phase 5.8.2).
   afterBatch?: () => Promise<void>;
   emit: (event: "started" | "stopped" | "infrastructure_error" | "retained" | "batch" | "auto_recovery", details?: Record<string, number | string>) => void;
@@ -39,6 +40,11 @@ export function startHealthMonitor(options: HealthMonitorOptions) {
         const batchStart = performance.now();
         try {
           if (!await options.ready()) throw new Error("Health persistence is unavailable");
+          if (signal.aborted) break;
+          if (options.maintenance) {
+            try { await options.maintenance(); }
+            catch { options.emit("auto_recovery", { reconciliationError: 1 }); }
+          }
           if (signal.aborted) break;
           operation = "due-check discovery";
           const scopes = (await options.discover(batchSize)).slice(0, batchSize);
