@@ -105,7 +105,7 @@ Phase 5.9.3 requires verified private scrape connectivity, a least-privilege exp
 | Base and overlay Compose config plus pinned promtool check config | Both configurations valid | Valid, with absent application targets under base and authenticated app targets under overlay | 0 / PASS |
 | Disposable Compose, actual API and worker entry points, HTTP and PromQL probes | Both authorized scrapes plus self-scrape UP with genuine samples | All three UP. Both missing and invalid credentials returned 401 on both listeners. Authorized responses were 200 in Prometheus text format. | 0 / PASS |
 | node --import tsx --test --test-concurrency=1 apps/api/test/deployment-api.test.ts using disposable API fixture | Authorization, CSRF, scope, deployment and manual recovery API regression | Both tests passed with the isolated branch enabled | 0 / PASS |
-| Live primary activation and scrape history | Approval and authenticated primary app targets, then live samples | Primary Prometheus still has self-scrape only. Primary activation awaits approval. | Not run / NOT VERIFIED |
+| Live primary activation and scrape history | Approval and authenticated primary app targets, then live samples | Primary activated under explicit approval (Phase 5.9.2.B): all three targets UP, genuine samples and preserved self-history | 0 / PASS |
 
 The initial combined regression command used a random database name outside the existing API test's guarded fixture branch and hit its DISABLED assertion. The API guard now permits a unique suffix in its dedicated disposable name. The recovery integration files have their own naming guard, so they run separately against a different disposable database. This changes only the test gate.
 
@@ -122,3 +122,40 @@ The isolated stack ran PostgreSQL 16 and Redis 7 with dynamically published loop
 | Samples over the last minute | 3 UP samples for each application target |
 
 At the isolated listener pre-workload snapshot the API response was 12,960 bytes, about 11.1 ms and 136 exposed samples. The worker response was 11,876 bytes, about 4.9 ms and 109 exposed samples. Later Node RSS was 170,684,416 bytes for the API and 179,302,400 bytes for the worker. Disposable Prometheus reported 1,051 head series, 0.43% CPU and 31 MiB of its 512 MiB limit. Phase 5.9.1 self-scrape-only measurements were 795 head series and 29.1 MiB. These are local process snapshots, and the workloads and process ages differ.
+
+## Phase 5.9.2.B — Controlled primary activation
+
+Baseline commit `9b72894`. Activation was performed only after explicit user approval. No source, schema, migration, root `.env` or recovery flag was changed; no primary data was modified; no protected deployment container, PostgreSQL, Redis or frontend was restarted.
+
+### Original discrepancy investigation
+The pre-activation report's "protected-infrastructure comparison detected a difference" could not be reconstructed. The committed record stated primary activation was "Not run / NOT VERIFIED"; no before/after snapshots existed in the repository, the local temporary artifacts, or any recalled session (15 sessions / 1035 candidates searched). Historical parity is therefore unrecoverable and was not fabricated. A fresh read-only baseline was captured instead and used for the after-comparison below.
+
+### Fresh pre-activation baseline (read-only)
+Demo `f9144585eb87` / `sha256:15b896427fd3` / StartedAt `2026-11-27T16:36:43.784631096Z` / `127.0.0.1:53143`; validation `64376e6449f1` / `sha256:ec6f7b2f9d1a` / StartedAt `2026-11-28T08:30:23.100977192Z` / `127.0.0.1:63299`; PostgreSQL `f887ca72cb1b` healthy; Redis `3e42c98d87c9` healthy; API PID 13780; frontend PID 8460; worker PID 46964; ports 9464/9465 free; recovery flags persistence/monitoring/manual true and automatic false. No active builds or recovery; one stale `DEPLOYING` deployment and `QUEUED` runtime (created 2026-11-27 16:04, no lease, untouched ~26 h) were left unmodified.
+
+### Approval scope
+Explicit approval to restart only the API and worker with process-local `METRICS_*` environment, create a private token file, and apply the `cloudpilot-monitoring` Prometheus overlay, accepting the documented risks and the unrecoverable historical discrepancy.
+
+### Activation commands (actual)
+Token created once at `%LOCALAPPDATA%\CloudPilot\metrics.token` (32-byte CSPRNG, base64url, ACL restricted to the current user; never printed or committed). `npm run metrics:build` succeeded. The API tree (npm PID 32440) and worker tree (npm PID 43760) were stopped with scoped `taskkill /T` (the user's terminals and the frontend npm tree PID 35148 were untouched); port 8000 was freed and the frontend stayed up. API and worker were restarted via `npm run dev -w @cloudpilot/api` and `npm run worker:dev` with `METRICS_ENABLED=true`, `METRICS_HOST=127.0.0.1`, `API_METRICS_PORT=9464`, `WORKER_METRICS_PORT=9465`, `METRICS_TOKEN_FILE=<private file>`. The overlay was applied with `docker compose -f infrastructure/monitoring/docker-compose.yml -f infrastructure/monitoring/docker-compose.metrics.yml up -d --wait prometheus` after `config --quiet` and a pinned `promtool check config` both succeeded. `CLOUDPILOT_METRICS_TOKEN_FILE` pointed at the same private file; the token is mounted read-only as a Compose secret. Activation is process-local and does not survive future API/worker restarts unless the variables are added to the ignored root `.env` (a separate approved change).
+
+### Authentication and endpoints
+Both listeners bound to IPv4 loopback only (9464 API, 9465 worker). Authorized `GET /metrics` returned 200 (API 11,668 bytes, worker 13,643 bytes); missing and invalid bearer credentials returned 401 on both. Exposition was valid Prometheus text; no credentials, tokens, raw URLs or business-route labels were present.
+
+### Live scrape targets and real observations
+All three targets became UP with no scrape errors: `prometheus` (`127.0.0.1:9090`), `cloudpilot-api` (`host.docker.internal:9464`), `cloudpilot-worker` (`host.docker.internal:9465`); `up` = 1 for each. Genuine metrics observed: API HTTP request counters and duration histograms, Node/process metrics, and queue gauges (`cloudpilot_queue_jobs{queue="deployment"/"build",...}`, `collection_success`, `last_success_timestamp_seconds`); worker `cloudpilot_worker_available 1`, `cloudpilot_worker_automatic_recovery_enabled 0`, `cloudpilot_health_checks_total`, `cloudpilot_recovery_attempts_total`. The deployment `completed` queue gauge read 7 consistently, matching authoritative BullMQ. No fake jobs were enqueued and no recovery was triggered; recovery counters may remain absent, which is not a zero value.
+
+### Historical samples and preserved self-history
+Over 120 s both application targets produced 5 UP samples each (all 1). A 600 s range query of `up{job="prometheus"}` returned 11 distinct samples spanning before and after the overlay, confirming the persistent TSDB volume retained pre-existing self-metric history across the container recreate.
+
+### Resource and cardinality
+Prometheus 1,373 head series, CPU 0.59%, 31.09 MiB of 512 MiB. API metrics 11,668 bytes / ~216 ms (cold first request), worker 13,643 bytes / ~26 ms. Process RSS: API 96,604,160 bytes, worker 95,698,944 bytes. No high-cardinality labels (no workspace/user/job/recovery/deployment IDs, URLs or paths). These are local snapshots, not production benchmarks.
+
+### After-comparison (explained differences)
+Protected demo and validation containers retained identical IDs, images, StartedAt and ports; PostgreSQL and Redis unchanged and healthy; frontend PID 8460 unchanged; Prometheus volume unchanged. Expected, approved differences: API PID changed (13780 → 26756) and worker PID changed (46964 → new) due to the authorized restart; Prometheus container ID changed (`92890d52f328` → `978cc183fe6d`) due to the authorized overlay recreate. All HTTP health checks returned 200 and `AUTO_RECOVERY_ENABLED` remained false. No unexplained difference remains.
+
+### Rollback
+`docker compose -f infrastructure/monitoring/docker-compose.yml up -d --force-recreate --wait prometheus` removes the overlay while retaining the TSDB volume; set `METRICS_ENABLED=false` in the application launch environments and (with approval) gracefully restart only the API and worker; remove token-file settings only where added; re-verify service identities, HTTP health, the Prometheus self-target and recovery flags. Do not run `compose down --volumes`.
+
+### Final acceptance
+PHASE 5.9.2 PASSED — primary metrics activation is live and validated; all three scrape targets UP with genuine samples and preserved history; authentication enforced; protected infrastructure preserved; primary automatic recovery remains disabled.
