@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { randomBytes, randomUUID } from "node:crypto";
 import test from "node:test";
-import { prisma } from "@cloudpilot/database";
+import { prisma, recoveryPolicy } from "@cloudpilot/database";
 import { createApp } from "../src/app.ts";
 import { hashSecret } from "../src/services/session.service.ts";
 import { disconnectQueueProducer, queueManager } from "../src/services/queue-producer.ts";
@@ -254,6 +254,220 @@ test("deployment API enforces workspace, role, CSRF, worker readiness, and atomi
       assert.equal(status.status, 200);
       assert.equal(payload.data.status, "REQUESTED");
       assert.equal(payload.data.leaseToken, undefined);
+    }
+  } finally {
+    if (server.listening) {
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => error ? reject(error) : resolve());
+      });
+    }
+    if (createdWorkspaces.length) {
+      await prisma.auditLog.deleteMany({ where: { workspaceId: { in: createdWorkspaces } } });
+      await prisma.workspace.deleteMany({ where: { id: { in: createdWorkspaces } } });
+    }
+    if (createdUsers.length) {
+      await prisma.user.deleteMany({ where: { id: { in: createdUsers } } });
+    }
+    if (recoveryIntegration) await disconnectQueueProducer();
+  }
+});
+
+test("deployment health endpoint enforces access, scope, read-only behavior, and recovery availability", async () => {
+  const suffix = randomUUID();
+  const createdUsers: string[] = [];
+  const createdWorkspaces: string[] = [];
+  const server = createServer(createApp());
+
+  try {
+    const owner = await prisma.user.create({
+      data: { email: `health-owner-${suffix}@example.invalid`, name: "Health test owner" },
+    });
+    createdUsers.push(owner.id);
+    const member = await prisma.user.create({
+      data: { email: `health-member-${suffix}@example.invalid`, name: "Health test member" },
+    });
+    createdUsers.push(member.id);
+
+    const workspace = await prisma.workspace.create({
+      data: { name: "Health test workspace", slug: `health-${suffix}` },
+    });
+    createdWorkspaces.push(workspace.id);
+    await prisma.workspaceMember.createMany({
+      data: [
+        { workspaceId: workspace.id, userId: owner.id, role: "OWNER" },
+        { workspaceId: workspace.id, userId: member.id, role: "MEMBER" },
+      ],
+    });
+    const project = await prisma.project.create({
+      data: { workspaceId: workspace.id, name: "Health project", slug: `health-proj-${suffix}` },
+    });
+    const deployment = await prisma.deployment.create({
+      data: { workspaceId: workspace.id, projectId: project.id, environment: "DEVELOPMENT", triggerSource: "MANUAL" },
+    });
+    const ownerSession = await createTestSession(owner.id, workspace.id);
+    const memberSession = await createTestSession(member.id, workspace.id);
+
+    const otherWorkspace = await prisma.workspace.create({
+      data: { name: "Health other workspace", slug: `health-other-${suffix}` },
+    });
+    createdWorkspaces.push(otherWorkspace.id);
+    const otherProject = await prisma.project.create({
+      data: { workspaceId: otherWorkspace.id, name: "Health other project", slug: `health-other-proj-${suffix}` },
+    });
+
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const healthUrl = (projectId: string, deploymentId: string) =>
+      `http://127.0.0.1:${address.port}/api/v1/projects/${projectId}/deployments/${deploymentId}/health`;
+    const ownHealth = healthUrl(project.id, deployment.id);
+
+    // Unauthenticated access is rejected.
+    assert.equal((await fetch(ownHealth)).status, 401);
+
+    // Cross-workspace access is rejected as not found.
+    assert.equal((await fetch(healthUrl(otherProject.id, randomUUID()), { headers: { Cookie: ownerSession.cookie } })).status, 404);
+
+    // Invalid deployment/project combinations return 404.
+    assert.equal((await fetch(healthUrl(project.id, randomUUID()), { headers: { Cookie: ownerSession.cookie } })).status, 404);
+    assert.equal((await fetch(healthUrl(randomUUID(), deployment.id), { headers: { Cookie: ownerSession.cookie } })).status, 404);
+
+    // Authorized workspace members can read health information.
+    const memberRead = await fetch(ownHealth, { headers: { Cookie: memberSession.cookie } });
+    assert.equal(memberRead.status, 200);
+    const memberBody = await memberRead.json() as { data: { schemaAvailable: boolean; checks: unknown[]; recovery: { allowed: boolean; reason: string | null } } };
+    assert.equal(typeof memberBody.data.schemaAvailable, "boolean");
+    assert.ok(Array.isArray(memberBody.data.checks));
+    assert.equal(typeof memberBody.data.recovery.allowed, "boolean");
+
+    // GET requests do not mutate database state.
+    const before = {
+      states: await prisma.deploymentHealthState.count({ where: { deploymentId: deployment.id } }),
+      checks: await prisma.deploymentHealthCheck.count({ where: { deploymentId: deployment.id } }),
+      recoveries: await prisma.deploymentRecoveryAttempt.count({ where: { deploymentId: deployment.id } }),
+    };
+    const ownerRead = await fetch(ownHealth, { headers: { Cookie: ownerSession.cookie } });
+    assert.equal(ownerRead.status, 200);
+    const after = {
+      states: await prisma.deploymentHealthState.count({ where: { deploymentId: deployment.id } }),
+      checks: await prisma.deploymentHealthCheck.count({ where: { deploymentId: deployment.id } }),
+      recoveries: await prisma.deploymentRecoveryAttempt.count({ where: { deploymentId: deployment.id } }),
+    };
+    assert.deepEqual(after, before);
+
+    // Non-owner/admin users cannot initiate recovery.
+    const memberRecover = await fetch(`${ownHealth.replace(/\/health$/, "")}/recoveries`, {
+      method: "POST",
+      headers: { Cookie: memberSession.cookie, "Content-Type": "application/json", "X-CSRF-Token": memberSession.csrf, "Idempotency-Key": randomUUID() },
+    });
+    assert.equal(memberRecover.status, 403);
+
+    // Manual recovery disabled state is respected (only observable when the
+    // isolated recovery integration is not enabled).
+    if (!recoveryIntegration) {
+      const ownerBody = await ownerRead.json() as { data: { recovery: { reason: string | null } } };
+      assert.equal(ownerBody.data.recovery.reason, "DISABLED");
+      assert.equal(ownerBody.data.recovery.allowed, false);
+    }
+
+    if (recoveryIntegration) {
+      // Build an eligible, running runtime with a repository so recovery
+      // availability can be exercised against real fixtures.
+      await prisma.repository.create({ data: {
+        workspaceId: workspace.id, projectId: project.id, provider: "github", externalId: randomUUID(),
+        name: "fixture", fullName: "example/health-endpoint-test",
+      } });
+      const build = await prisma.deploymentBuild.create({ data: {
+        workspaceId: workspace.id, projectId: project.id, deploymentId: deployment.id,
+        sourcePreparationId: randomUUID(), resolvedCommitSha: "a".repeat(40), status: "SUCCEEDED",
+      } });
+      // Two runtime attempts: only the current (highest attempt) runtime's
+      // checks must be returned.
+      const previousRuntime = await prisma.deploymentRuntimeInstance.create({ data: {
+        workspaceId: workspace.id, projectId: project.id, deploymentId: deployment.id, buildId: build.id,
+        runtimeAttempt: 1, status: "STOPPED",
+      } });
+      const currentRuntime = await prisma.deploymentRuntimeInstance.create({ data: {
+        workspaceId: workspace.id, projectId: project.id, deploymentId: deployment.id, buildId: build.id,
+        runtimeAttempt: 2, status: "RUNNING", readyAt: new Date(),
+        containerId: "a".repeat(64), imageId: `sha256:${"b".repeat(64)}`, hostPort: 3001, hostBindingAddress: "127.0.0.1",
+      } });
+      await prisma.deployment.update({ where: { id: deployment.id }, data: { status: "RUNNING" } });
+      const healthScope = { workspaceId: workspace.id, projectId: project.id, deploymentId: deployment.id, runtimeInstanceId: currentRuntime.id, generation: 0 };
+      await prisma.deploymentHealthState.create({ data: {
+        ...healthScope, status: "UNHEALTHY", consecutiveFailures: 3, nextCheckAt: new Date(),
+      } });
+      // 60 checks on the current runtime; history must be capped at 50.
+      await prisma.deploymentHealthCheck.createMany({ data: Array.from({ length: 60 }, (_, index) => ({
+        workspaceId: workspace.id, projectId: project.id, deploymentId: deployment.id,
+        runtimeInstanceId: currentRuntime.id, generation: 0,
+        dockerResult: "PASSED" as const, httpResult: "PASSED" as const, httpStatus: 200,
+        responseLatencyMs: index, checkedAt: new Date(Date.now() - index * 1000),
+      })) });
+      // Create the required health state for the previous runtime.
+      await prisma.deploymentHealthState.create({ data: {
+        ...healthScope,
+        runtimeInstanceId: previousRuntime.id,
+        status: "HEALTHY",
+        nextCheckAt: null,
+      } });
+
+      // A check on the previous runtime must never surface.
+      const previousCheck = await prisma.deploymentHealthCheck.create({ data: {
+        workspaceId: workspace.id, projectId: project.id, deploymentId: deployment.id,
+        runtimeInstanceId: previousRuntime.id, generation: 0,
+        dockerResult: "PASSED" as const, httpResult: "PASSED" as const, httpStatus: 200, checkedAt: new Date(),
+      } });
+
+      const currentRead = await fetch(ownHealth, { headers: { Cookie: ownerSession.cookie } });
+      assert.equal(currentRead.status, 200);
+      const currentBody = await currentRead.json() as {
+        data: { runtimeStatus: string | null; checks: Array<{ id: string; generation: number }> };
+      };
+      assert.equal(currentBody.data.runtimeStatus, "RUNNING");
+      assert.equal(currentBody.data.checks.length, 50);
+      assert.ok(currentBody.data.checks.every((check) => check.id !== previousCheck.id));
+      assert.ok(currentBody.data.checks.every((check) => check.generation === 0));
+
+      // Active recovery is reflected in availability.
+      await prisma.deploymentRecoveryAttempt.create({ data: {
+        ...healthScope, action: "RESTART", trigger: "MANUAL", idempotencyKey: randomUUID(), status: "REQUESTED",
+      } });
+      const activeBody = await (await fetch(ownHealth, { headers: { Cookie: ownerSession.cookie } })).json() as { data: { recovery: { allowed: boolean; reason: string | null } } };
+      assert.equal(activeBody.data.recovery.reason, "ACTIVE");
+      assert.equal(activeBody.data.recovery.allowed, false);
+
+      // Cooldown is reflected after a recent failed attempt.
+      await prisma.deploymentRecoveryAttempt.deleteMany({ where: { deploymentId: deployment.id } });
+      await prisma.deploymentRecoveryAttempt.create({ data: {
+        ...healthScope, action: "RESTART", trigger: "MANUAL", idempotencyKey: randomUUID(), status: "FAILED",
+        attemptCount: 1, startedAt: new Date(Date.now() - 1000), finishedAt: new Date(), failureReason: "RECOVERY_EXECUTION_FAILED",
+      } });
+      const cooldownBody = await (await fetch(ownHealth, { headers: { Cookie: ownerSession.cookie } })).json() as { data: { recovery: { reason: string | null } } };
+      assert.equal(cooldownBody.data.recovery.reason, "COOLDOWN");
+
+      // Exhausted budget is reflected once the window is full.
+      await prisma.deploymentRecoveryAttempt.deleteMany({ where: { deploymentId: deployment.id } });
+      await prisma.deploymentRecoveryAttempt.createMany({ data: Array.from({ length: recoveryPolicy.limit }, () => ({
+        workspaceId: workspace.id, projectId: project.id, deploymentId: deployment.id, runtimeInstanceId: currentRuntime.id,
+        generation: 0, action: "RESTART" as const, trigger: "MANUAL" as const, idempotencyKey: randomUUID(),
+        status: "FAILED" as const, attemptCount: 1, startedAt: new Date(Date.now() - 61_000), finishedAt: new Date(Date.now() - 60_000), failureReason: "RECOVERY_EXECUTION_FAILED" as const,
+      })) });
+      const exhaustedBody = await (await fetch(ownHealth, { headers: { Cookie: ownerSession.cookie } })).json() as { data: { recovery: { reason: string | null } } };
+      assert.equal(exhaustedBody.data.recovery.reason, "EXHAUSTED");
+
+      // A healthy runtime is not eligible for recovery.
+      await prisma.deploymentRecoveryAttempt.deleteMany({ where: { deploymentId: deployment.id } });
+      await prisma.deploymentHealthState.update({ where: {
+        workspaceId_projectId_deploymentId_runtimeInstanceId_generation: {
+          workspaceId: workspace.id, projectId: project.id, deploymentId: deployment.id, runtimeInstanceId: currentRuntime.id, generation: 0,
+        },
+      }, data: { status: "HEALTHY", nextCheckAt: new Date() } });
+      const healthyBody = await (await fetch(ownHealth, { headers: { Cookie: ownerSession.cookie } })).json() as { data: { recovery: { reason: string | null } } };
+      assert.equal(healthyBody.data.recovery.reason, "NOT_UNHEALTHY");
     }
   } finally {
     if (server.listening) {

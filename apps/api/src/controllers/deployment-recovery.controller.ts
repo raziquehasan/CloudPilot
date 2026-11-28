@@ -1,6 +1,9 @@
 import { Router } from "express";
 import type { Request, Response } from "express";
-import { prisma, publicRecoverySelect, recoverySchemaReady, reserveManualRecovery } from "@cloudpilot/database";
+import {
+  currentRecoveryRuntime, isRecoveryRuntimeEligible, prisma, publicRecoverySelect,
+  recoveryNow, recoveryPolicy, recoverySchemaReady, reserveManualRecovery,
+} from "@cloudpilot/database";
 import { env } from "../config/env.js";
 import { requireAuth, requireCsrf } from "../middlewares/auth.middleware.js";
 import { enqueueRecoveryJob } from "../services/queue-producer.js";
@@ -104,3 +107,84 @@ const path = "/:projectId/deployments/:deploymentId/recoveries";
 deploymentRecoveryRouter.post(path, requireAuth, requireCsrf, requestRecovery);
 deploymentRecoveryRouter.get(path, requireAuth, readRecovery);
 deploymentRecoveryRouter.get(`${path}/:recoveryId`, requireAuth, readRecovery);
+
+async function readDeploymentHealth(req: Request, res: Response) {
+  const target = await getScope(req, res);
+  if (!target) return;
+  const { scope, project } = target;
+  try {
+    const deployment = await prisma.deployment.findFirst({
+      where: { id: scope.deploymentId, workspaceId: scope.workspaceId, projectId: scope.projectId },
+      select: { id: true },
+    });
+    if (!deployment) {
+      sendError(res, 404, "DEPLOYMENT_NOT_FOUND", "Deployment not found in this project.");
+      return;
+    }
+    const [runtime, [schema]] = await Promise.all([
+      currentRecoveryRuntime(prisma, scope),
+      prisma.$queryRaw<Array<{ available: boolean }>>`
+        SELECT to_regclass('public.deployment_health_states') IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM pg_attribute
+            WHERE attrelid = to_regclass('public.deployment_health_checks')
+              AND attname = 'dockerState' AND NOT attisdropped
+          ) AS available
+      `,
+    ]);
+    const schemaAvailable = schema?.available === true;
+    const runtimeStatus = runtime?.status ?? null;
+    const [state, checks] = schemaAvailable && runtime ? await Promise.all([
+      prisma.deploymentHealthState.findFirst({
+        where: { ...scope, runtimeInstanceId: runtime.id }, orderBy: { generation: "desc" },
+        select: {
+          status: true, generation: true, consecutiveFailures: true, lastCheckedAt: true,
+          lastHealthyAt: true, nextCheckAt: true, lastFailureReason: true,
+        },
+      }),
+      prisma.deploymentHealthCheck.findMany({
+        where: { ...scope, runtimeInstanceId: runtime.id }, orderBy: [{ checkedAt: "desc" }, { id: "desc" }], take: 50,
+        select: {
+          id: true, generation: true, dockerResult: true, dockerState: true, httpResult: true,
+          httpStatus: true, responseLatencyMs: true, failureReason: true, checkedAt: true,
+        },
+      }),
+    ]) : [null, []];
+
+    const reason = await recoveryAvailability();
+    res.json({
+      success: true,
+      data: { schemaAvailable, runtimeStatus, state, checks, recovery: { allowed: reason === null, reason } },
+    });
+
+    async function recoveryAvailability() {
+      if (!canManage(project.role)) return "FORBIDDEN";
+      if (!env.MANUAL_RECOVERY_ENABLED) return "DISABLED";
+      if (!schemaAvailable || !await recoverySchemaReady(prisma)) return "SCHEMA_UNAVAILABLE";
+      if (!isRecoveryRuntimeEligible(runtime)) return "RUNTIME_NOT_RUNNING";
+
+      const now = await recoveryNow(prisma);
+      if (runtime.executionLeaseExpiresAt && runtime.executionLeaseExpiresAt > now) return "ACTIVE";
+      const active = await prisma.deploymentRecoveryAttempt.findFirst({
+        where: { ...scope, status: { in: ["REQUESTED", "RUNNING"] } }, select: { id: true },
+      });
+      if (active) return "ACTIVE";
+      if (state?.status === "FAILED" && state.lastFailureReason === "RECOVERY_EXHAUSTED") return "EXHAUSTED";
+      if (state?.status !== "UNHEALTHY" || !state.nextCheckAt) return "NOT_UNHEALTHY";
+      const recent = await prisma.deploymentRecoveryAttempt.findMany({
+        where: { ...scope, createdAt: { gt: new Date(now.getTime() - recoveryPolicy.windowMs) } },
+        orderBy: { createdAt: "desc" }, take: recoveryPolicy.limit,
+        select: { status: true, finishedAt: true },
+      });
+      if (recent.length >= recoveryPolicy.limit) return "EXHAUSTED";
+      const last = recent[0];
+      if (last?.status === "FAILED" && last.finishedAt &&
+        now.getTime() < last.finishedAt.getTime() + recoveryPolicy.cooldownMs * 2 ** (recent.length - 1)) return "COOLDOWN";
+      return null;
+    }
+  } catch {
+    sendError(res, 503, "DEPLOYMENT_HEALTH_UNAVAILABLE", "Deployment health is temporarily unavailable.");
+  }
+}
+
+deploymentRecoveryRouter.get("/:projectId/deployments/:deploymentId/health", requireAuth, readDeploymentHealth);

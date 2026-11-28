@@ -6,12 +6,14 @@
 // ==================================================
 
 import { Suspense } from "react";
+import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { Loader2 } from "lucide-react";
+import { Activity, Loader2, Terminal } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 
 import { useDashboard } from "@/components/dashboard/dashboard-provider";
 import { DashboardPageShell } from "@/components/dashboard/page-shell";
+import DeploymentHealthPanel from "@/components/dashboard/deployment-health";
 import { ApiError, apiFetch } from "@/lib/api";
 
 import LogTerminal from "./log-terminal";
@@ -126,6 +128,7 @@ function DeploymentStatus({ projectId, deploymentId }: { projectId: string; depl
 
 function LogsPageContent() {
   const searchParams = useSearchParams();
+  const { activeWorkspace } = useDashboard();
 
   const deploymentId = readUniqueUuid(
     searchParams?.getAll("deployment") ?? [],
@@ -152,6 +155,35 @@ function LogsPageContent() {
     );
   }
 
+  const healthSelected = searchParams?.get("tab") === "health";
+  const base = new URLSearchParams({ project: projectId, deployment: deploymentId });
+  const health = new URLSearchParams(base);
+  health.set("tab", "health");
+  const detailsNavigation = <nav aria-label="Deployment details" className="mb-4 flex w-fit max-w-full items-center gap-1 rounded-lg border bg-muted/30 p-1">
+    <Link prefetch={false} href={`/dashboard/logs?${base.toString()}`} aria-current={!healthSelected ? "page" : undefined}
+      className="inline-flex items-center gap-2 rounded-md px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground aria-[current=page]:bg-background aria-[current=page]:font-medium aria-[current=page]:text-foreground aria-[current=page]:shadow-xs">
+      <Terminal className="size-4" aria-hidden="true" /> Logs
+    </Link>
+    <Link prefetch={false} href={`/dashboard/logs?${health.toString()}`} aria-current={healthSelected ? "page" : undefined}
+      className="inline-flex items-center gap-2 rounded-md px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground aria-[current=page]:bg-background aria-[current=page]:font-medium aria-[current=page]:text-foreground aria-[current=page]:shadow-xs">
+      <Activity className="size-4" aria-hidden="true" /> Health
+    </Link>
+  </nav>;
+
+  if (healthSelected) {
+    return <DashboardPageShell breadcrumb="Deployment Health">
+      {detailsNavigation}
+      <h1 className="mb-4 text-xl font-semibold tracking-tight">Deployment health</h1>
+      {activeWorkspace ? <DeploymentHealthPanel
+        key={`${activeWorkspace.id}:${projectId}:${deploymentId}`}
+        workspaceId={activeWorkspace.id}
+        projectId={projectId}
+        deploymentId={deploymentId}
+        canManage={activeWorkspace.role === "OWNER" || activeWorkspace.role === "ADMIN"}
+      /> : <p className="text-sm text-muted-foreground">Select a workspace to view deployment health.</p>}
+    </DashboardPageShell>;
+  }
+
   // Remount the terminal when the selected
   // deployment or project changes.
   //
@@ -165,6 +197,7 @@ function LogsPageContent() {
 
   return (
     <>
+      <div className="mx-4 mt-4 sm:mx-6 lg:mx-8">{detailsNavigation}</div>
       <DeploymentStatus projectId={projectId} deploymentId={deploymentId} />
       <LogTerminal
         key={`${projectId}:${deploymentId}`}
