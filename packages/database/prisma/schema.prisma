@@ -649,6 +649,7 @@ model DeploymentRuntimeInstance {
   updatedAt            DateTime                @updatedAt
   deployment Deployment @relation(fields: [workspaceId, projectId, deploymentId], references: [workspaceId, projectId, id], onDelete: Cascade, onUpdate: Cascade, map: "dri_deployment_fkey")
   build DeploymentBuild @relation(fields: [workspaceId, projectId, deploymentId, buildId], references: [workspaceId, projectId, deploymentId, id], onDelete: NoAction, onUpdate: Cascade, map: "dri_build_fkey")
+  healthStates DeploymentHealthState[]
   logEntries DeploymentLogEntry[] @relation("DeploymentLogRuntime")
 
   @@unique([workspaceId, projectId, deploymentId, runtimeAttempt], map: "dri_ws_proj_dep_attempt_key")
@@ -737,4 +738,146 @@ model DeploymentLogNotificationOutbox {
   @@unique([workspaceId, deploymentId, fromSequence, toSequence], map: "dlno_ws_dep_range_key")
   @@index([status, createdAt], map: "dlno_status_created_idx")
   @@map("deployment_log_notification_outbox")
+}
+
+enum DeploymentHealthStatus {
+  UNKNOWN
+  STARTING
+  HEALTHY
+  DEGRADED
+  UNHEALTHY
+  RECOVERING
+  FAILED
+}
+
+enum HealthProbeStatus {
+  PASSED
+  FAILED
+  SKIPPED
+}
+
+enum HealthDockerState {
+  created
+  running
+  exited
+  restarting
+  paused
+  dead
+  unknown
+}
+
+enum HealthFailureReason {
+  CONTAINER_UNAVAILABLE
+  CONTAINER_NOT_RUNNING
+  HTTP_TIMEOUT
+  HTTP_UNREACHABLE
+  HTTP_STATUS
+  RECOVERY_EXECUTION_FAILED
+  RECOVERY_EXHAUSTED
+  CONTAINER_IDENTITY_MISMATCH
+  HTTP_CONNECTION_REFUSED
+  HTTP_INVALID_RESPONSE
+  HTTP_REDIRECT
+  RECOVERY_STALE
+  RECOVERY_IDENTITY_MISMATCH
+  RECOVERY_PORT_CHANGED
+  RECOVERY_DOCKER_UNAVAILABLE
+  RECOVERY_TIMEOUT
+  RECOVERY_RESTART_UNCERTAIN
+}
+
+enum RecoveryAction {
+  RESTART
+}
+
+enum RecoveryTrigger {
+  MANUAL
+  AUTOMATIC
+}
+
+enum RecoveryStatus {
+  REQUESTED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+model DeploymentHealthState {
+  workspaceId          String                      @db.Uuid
+  projectId            String                      @db.Uuid
+  deploymentId         String                      @db.Uuid
+  runtimeInstanceId    String                      @db.Uuid
+  generation           Int
+  status               DeploymentHealthStatus      @default(UNKNOWN)
+  consecutiveSuccesses Int                         @default(0)
+  consecutiveFailures  Int                         @default(0)
+  lastCheckedAt        DateTime?
+  lastHealthyAt        DateTime?
+  nextCheckAt          DateTime?
+  lastFailureReason    HealthFailureReason?
+  leaseOwnerId         String?                     @db.Uuid
+  leaseToken           String?                     @unique(map: "dhs_lease_token_key") @db.Uuid
+  leaseExpiresAt       DateTime?
+  version              Int                         @default(0)
+  createdAt            DateTime                    @default(now())
+  updatedAt            DateTime                    @default(now()) @updatedAt
+  runtime              DeploymentRuntimeInstance   @relation(fields: [workspaceId, projectId, deploymentId, runtimeInstanceId], references: [workspaceId, projectId, deploymentId, id], onDelete: Cascade, onUpdate: Cascade, map: "dhs_runtime_fkey")
+  checks               DeploymentHealthCheck[]
+  recoveryAttempts     DeploymentRecoveryAttempt[]
+
+  @@id([workspaceId, projectId, deploymentId, runtimeInstanceId, generation], map: "dhs_pkey")
+  @@index([nextCheckAt], map: "dhs_due_idx")
+  @@map("deployment_health_states")
+}
+
+model DeploymentHealthCheck {
+  id                String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId       String                @db.Uuid
+  projectId         String                @db.Uuid
+  deploymentId      String                @db.Uuid
+  runtimeInstanceId String                @db.Uuid
+  generation        Int
+  dockerResult      HealthProbeStatus
+  dockerState       HealthDockerState?
+  httpResult        HealthProbeStatus
+  responseLatencyMs Int?
+  httpStatus        Int?
+  failureReason     HealthFailureReason?
+  checkedAt         DateTime              @default(now())
+  healthState       DeploymentHealthState @relation(fields: [workspaceId, projectId, deploymentId, runtimeInstanceId, generation], references: [workspaceId, projectId, deploymentId, runtimeInstanceId, generation], onDelete: Cascade, onUpdate: Cascade, map: "dhc_state_fkey")
+
+  @@index([workspaceId, projectId, deploymentId, runtimeInstanceId, generation, checkedAt], map: "dhc_state_time_idx")
+  @@index([checkedAt], map: "dhc_retention_idx")
+  @@map("deployment_health_checks")
+}
+
+model DeploymentRecoveryAttempt {
+  id                String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  workspaceId       String                @db.Uuid
+  projectId         String                @db.Uuid
+  deploymentId      String                @db.Uuid
+  runtimeInstanceId String                @db.Uuid
+  generation        Int
+  action            RecoveryAction
+  trigger           RecoveryTrigger
+  idempotencyKey    String                @db.Uuid
+  status            RecoveryStatus        @default(REQUESTED)
+  attemptCount      Int                   @default(0)
+  healthVersion     Int?
+  restartIssuedAt   DateTime?
+  restartSourceStartedAt String?          @db.VarChar(40)
+  leaseOwnerId      String?               @db.Uuid
+  leaseToken        String?               @unique(map: "dra_lease_token_key") @db.Uuid
+  leaseExpiresAt    DateTime?
+  startedAt         DateTime?
+  finishedAt        DateTime?
+  failureReason     HealthFailureReason?
+  createdAt         DateTime              @default(now())
+  updatedAt         DateTime              @default(now()) @updatedAt
+  healthState       DeploymentHealthState @relation(fields: [workspaceId, projectId, deploymentId, runtimeInstanceId, generation], references: [workspaceId, projectId, deploymentId, runtimeInstanceId, generation], onDelete: Cascade, onUpdate: Cascade, map: "dra_state_fkey")
+
+  @@unique([workspaceId, projectId, deploymentId, idempotencyKey], map: "dra_deployment_idempotency_key")
+  @@index([workspaceId, projectId, deploymentId, runtimeInstanceId, generation, createdAt], map: "dra_state_time_idx")
+  @@map("deployment_recovery_attempts")
 }

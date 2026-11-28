@@ -5,6 +5,12 @@ import test from "node:test";
 import { prisma } from "@cloudpilot/database";
 import { createApp } from "../src/app.ts";
 import { hashSecret } from "../src/services/session.service.ts";
+import { disconnectQueueProducer, queueManager } from "../src/services/queue-producer.ts";
+
+const recoveryIntegration = process.env.MANUAL_RECOVERY_ENABLED === "true" &&
+  /^\/cloudpilot_health_test_574$/.test(new URL(process.env.DATABASE_URL ?? "http://localhost").pathname) &&
+  process.env.CLOUDPILOT_RECOVERY_TEST_REDIS === process.env.REDIS_URL &&
+  !!process.env.CLOUDPILOT_RECOVERY_TEST_REDIS;
 
 type TestSession = {
   cookie: string;
@@ -85,6 +91,15 @@ test("deployment API enforces workspace, role, CSRF, worker readiness, and atomi
 
     const unauthenticated = await fetch(baseUrl);
     assert.equal(unauthenticated.status, 401);
+    const recoveryPath = `${baseUrl}/${randomUUID()}/recoveries`;
+    assert.equal((await fetch(recoveryPath)).status, 401);
+    assert.equal((await fetch(recoveryPath, { method: "POST", headers: { Cookie: ownerSession.cookie } })).status, 403);
+    assert.equal((await fetch(recoveryPath, { method: "POST", headers: {
+      ...csrfHeaders(memberSession), "Idempotency-Key": randomUUID(),
+    } })).status, 403);
+    assert.equal((await fetch(`${apiUrl}/projects/${otherProject.id}/deployments/${randomUUID()}/recoveries`, {
+      headers: { Cookie: ownerSession.cookie },
+    })).status, 404);
 
     const listResponse = await fetch(`${baseUrl}?page=1&perPage=10`, {
       headers: { Cookie: ownerSession.cookie },
@@ -199,6 +214,47 @@ test("deployment API enforces workspace, role, CSRF, worker readiness, and atomi
       }),
       1,
     );
+    if (recoveryIntegration) {
+      const deployment = await prisma.deployment.create({
+        data: { workspaceId: workspace.id, projectId: project.id, environment: "DEVELOPMENT", triggerSource: "MANUAL", status: "RUNNING" },
+      });
+      const recoveryScope = { workspaceId: workspace.id, projectId: project.id, deploymentId: deployment.id };
+      await prisma.repository.create({ data: {
+        workspaceId: workspace.id, projectId: project.id, provider: "github", externalId: randomUUID(),
+        name: "fixture", fullName: "example/health-probe-test",
+      } });
+      const build = await prisma.deploymentBuild.create({ data: {
+        ...recoveryScope, sourcePreparationId: randomUUID(), resolvedCommitSha: "a".repeat(40), status: "SUCCEEDED",
+      } });
+      const runtime = await prisma.deploymentRuntimeInstance.create({ data: {
+        ...recoveryScope, buildId: build.id, status: "RUNNING", readyAt: new Date(),
+        containerId: "a".repeat(64), imageId: `sha256:${"b".repeat(64)}`, hostPort: 3001, hostBindingAddress: "127.0.0.1",
+      } });
+      await prisma.deploymentHealthState.create({ data: {
+        ...recoveryScope, runtimeInstanceId: runtime.id, generation: 0, status: "UNHEALTHY",
+        consecutiveFailures: 3, nextCheckAt: new Date(),
+      } });
+      const path = `${baseUrl}/${deployment.id}/recoveries`;
+      const headers = { ...csrfHeaders(ownerSession), "Idempotency-Key": randomUUID() };
+      const results = await Promise.all([fetch(path, { method: "POST", headers }), fetch(path, { method: "POST", headers })]);
+      assert.deepEqual(results.map((result) => result.status), [202, 202]);
+      const accepted = await Promise.all(results.map(async (result) => (await result.json() as { data: { id: string } }).data.id));
+      const [id] = accepted;
+      assert.ok(id);
+      assert.equal(accepted[1], id);
+      const job = await queueManager.getQueue("runtime").getJob(`recovery-${id}`);
+      assert.ok(job && job.data.kind === "runtime");
+      assert.equal(job.data.action, "recover");
+      assert.equal(job.data.runtimeInstanceId, runtime.id);
+      const history = await fetch(path, { headers: { Cookie: memberSession.cookie } });
+      assert.equal(history.status, 200);
+      assert.equal((await history.json() as { data: unknown[] }).data.length, 1);
+      const status = await fetch(`${path}/${id}`, { headers: { Cookie: memberSession.cookie } });
+      const payload = await status.json() as { data: { status: string; leaseToken?: string } };
+      assert.equal(status.status, 200);
+      assert.equal(payload.data.status, "REQUESTED");
+      assert.equal(payload.data.leaseToken, undefined);
+    }
   } finally {
     if (server.listening) {
       await new Promise<void>((resolve, reject) => {
@@ -212,5 +268,6 @@ test("deployment API enforces workspace, role, CSRF, worker readiness, and atomi
     if (createdUsers.length) {
       await prisma.user.deleteMany({ where: { id: { in: createdUsers } } });
     }
+    if (recoveryIntegration) await disconnectQueueProducer();
   }
 });

@@ -191,6 +191,7 @@ export type ContainerState =
 
 export interface ContainerInspection {
   exists: boolean;
+  restartCount?: number | null;
 
   /**
    * Immutable identifier of the inspected container.
@@ -383,6 +384,14 @@ export interface RuntimeExecutor {
     name: string,
   ): Promise<ContainerInspection>;
 
+  inspectOwnedContainer?(
+    id: string,
+    ownershipLabels: Record<string, string>,
+    containerPort: number,
+    bindHost: string,
+    signal?: AbortSignal,
+  ): Promise<{ inspection: ContainerInspection; ownershipVerified: boolean }>;
+
   /**
    * Stop a running container within a bounded time.
    *
@@ -407,6 +416,12 @@ export interface RuntimeExecutor {
     name: string,
     timeoutMs: number,
     signal: AbortSignal,
+  ): Promise<void>;
+
+  restartOwnedContainer?(
+    id: string, ownershipLabels: Record<string, string>,
+    target: { imageId: string; host: string; hostPort: number; containerPort: number; startedAt: string },
+    timeoutMs: number, signal: AbortSignal,
   ): Promise<void>;
 
   /**

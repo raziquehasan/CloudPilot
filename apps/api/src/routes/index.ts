@@ -10,6 +10,7 @@ import { projectRepositoryRouter } from "../controllers/project-repository.contr
 import { projectBuildConfigurationRouter } from "../controllers/project-build-configuration.controller.js";
 import { projectEnvironmentVariableRouter } from "../controllers/project-environment-variable.controller.js";
 import { projectDeploymentRouter } from "../controllers/project-deployment.controller.js";
+import { deploymentRecoveryRouter } from "../controllers/deployment-recovery.controller.js";
 import { projectDeploymentLogsRouter } from "../controllers/deployment-logs.controller.js";
 
 export const routes = Router();
@@ -23,5 +24,6 @@ routes.use(`/api/${env.API_VERSION}/projects`, projectEnvironmentVariableRouter)
 routes.use(`/api/${env.API_VERSION}/projects`, projectRepositoryRouter);
 routes.use(`/api/${env.API_VERSION}/projects`, projectBuildConfigurationRouter);
 routes.use(`/api/${env.API_VERSION}/projects`, projectDeploymentRouter);
+routes.use(`/api/${env.API_VERSION}/projects`, deploymentRecoveryRouter);
 routes.use(`/api/${env.API_VERSION}/projects`, projectDeploymentLogsRouter);
 routes.use(`/api/${env.API_VERSION}`, workspaceRouter);

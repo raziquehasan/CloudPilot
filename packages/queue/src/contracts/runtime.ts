@@ -337,6 +337,7 @@ export const runtimeJobActions = Object.freeze([
   "start",
   "stop",
   "restart",
+  "recover",
 ] as const);
 
 export type RuntimeJobAction =

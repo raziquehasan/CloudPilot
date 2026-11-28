@@ -36,6 +36,8 @@ import {
 
 import { workerEnv } from "../config/env.js";
 import { workerLogger } from "../config/logger.js";
+import { retireRuntimeHealth, syncRuntimeHealthAfterStart } from "../health/runtime-health.js";
+import { processRecoveryJob, withRuntimeLifecycleLease } from "../health/recovery-processor.js";
 import { DeploymentLogWriter } from "../logging/log-writer.js";
 import { emitSystemLog } from "../logging/system-logs.js";
 
@@ -79,6 +81,18 @@ export interface RuntimeProcessorContext {
 
 export interface ProcessRuntimeOptions {
   executor: RuntimeExecutor;
+}
+
+async function initializeHealthAfterStart(payload: RuntimeJob, readyAt: Date, executor: RuntimeExecutor, signal: AbortSignal) {
+  if (!executor.inspectOwnedContainer) return;
+  try {
+    await syncRuntimeHealthAfterStart({
+      ...runtimeScope(payload), runtimeInstanceId: payload.runtimeInstanceId,
+    }, readyAt, executor.inspectOwnedContainer.bind(executor), signal);
+  } catch {
+    workerLogger.warn({ deploymentId: payload.deploymentId, runtimeInstanceId: payload.runtimeInstanceId },
+      "Runtime health generation could not be initialized");
+  }
 }
 
 export type ProcessRuntimeResultStatus =
@@ -496,6 +510,7 @@ async function settleSuccess(
     networkName: string;
     imageId: string;
     imageTag: string | null;
+    readyAt: Date;
   },
 ): Promise<SettlementResult> {
   return prisma.$transaction(async (tx) => {
@@ -547,7 +562,8 @@ async function settleSuccess(
           cpuLimit: workerEnv.RUNTIME_CPU_LIMIT,
           memoryLimitMb: workerEnv.RUNTIME_MEMORY_LIMIT_MB,
           pidsLimit: workerEnv.RUNTIME_PIDS_LIMIT,
-          readyAt: now,
+          readyAt: metadata.readyAt,
+          containerPort: workerEnv.RUNTIME_CONTAINER_PORT,
           executionLeaseToken: null,
           executionLeaseExpiresAt: null,
           failureCode: null,
@@ -774,12 +790,10 @@ export async function processRuntimeJob(
   // Lifecycle actions operate on an existing instance
   // ================================================
 
+  if (payload.action === "recover") return processRecoveryJob(job.id, payload, options.executor, signal);
   if (payload.action !== "deploy") {
-    return processRuntimeLifecycle(
-      payload,
-      signal,
-      options,
-    );
+    return withRuntimeLifecycleLease(payload, signal, (operationSignal) =>
+      processRuntimeLifecycle(payload, operationSignal, options));
   }
 
   // ================================================
@@ -1104,6 +1118,7 @@ export async function processRuntimeJob(
     // ==============================================
 
     stage = "runtime settlement";
+    const readyAt = new Date();
     const settled = await settleSuccess(claim, {
       containerId: createdContainer.containerId,
       containerName: createdContainer.containerName,
@@ -1111,9 +1126,11 @@ export async function processRuntimeJob(
       networkName: createdContainer.networkName,
       imageId: artifact.imageId,
       imageTag: artifact.imageTag,
+      readyAt,
     });
 
     if (settled === "succeeded") {
+      await initializeHealthAfterStart(payload, readyAt, options.executor, signal);
       workerLogger.info(
         {
           deploymentId: payload.deploymentId,
@@ -1266,6 +1283,7 @@ async function processRuntimeLifecycle(
   const now = new Date();
 
   try {
+    await retireRuntimeHealth({ ...scope, runtimeInstanceId: instance.id });
     if (payload.action === "stop") {
       await options.executor.stopContainer(
         containerName,
@@ -1337,6 +1355,7 @@ async function processRuntimeLifecycle(
         });
       });
 
+      await initializeHealthAfterStart(payload, now, options.executor, signal);
       return { status: "succeeded" };
     }
 
@@ -1375,6 +1394,7 @@ async function processRuntimeLifecycle(
       });
     });
 
+    await initializeHealthAfterStart(payload, now, options.executor, signal);
     return { status: "succeeded" };
   } catch (error) {
     const code = getRuntimeFailureCode(error);

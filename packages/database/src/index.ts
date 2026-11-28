@@ -5,6 +5,16 @@ import { fileURLToPath } from "node:url";
 import { PrismaClient } from "./generated/prisma/client.js";
 
 export { Prisma } from "./generated/prisma/client.js";
+export type {
+  DeploymentHealthStatus,
+  HealthFailureReason,
+  HealthProbeStatus,
+  RecoveryAction,
+  RecoveryStatus,
+  RecoveryTrigger,
+} from "./generated/prisma/enums.js";
+export * from "./health-ownership.js";
+export * from "./recovery-store.js";
 
 config({ path: fileURLToPath(new URL("../../../.env", import.meta.url)) });
 

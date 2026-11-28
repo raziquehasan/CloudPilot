@@ -578,6 +578,7 @@ const envSchema = z.object({
   // Deployment logging feature flag
   // ------------------------------------------------
 
+  MANUAL_RECOVERY_ENABLED: booleanEnv(false),
   DEPLOYMENT_LOGS_ENABLED:
     booleanEnv(false),
 

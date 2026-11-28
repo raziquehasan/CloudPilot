@@ -868,7 +868,8 @@ export class QueueManager {
         return policy.attempts;
 
       case "runtime":
-        return payload.action === "deploy"
+        // Recovery replays reconcile a durable intent and cannot dispatch it twice.
+        return payload.action === "deploy" || payload.action === "recover"
           ? policy.attempts
           : 1;
 

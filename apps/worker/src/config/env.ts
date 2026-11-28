@@ -607,6 +607,12 @@ const envSchema = z
     // ==============================================
 
     RUNTIME_ENABLED: booleanEnv(false),
+    HEALTH_PERSISTENCE_ENABLED: booleanEnv(false),
+    HEALTH_MONITORING_ENABLED: booleanEnv(false),
+    MANUAL_RECOVERY_ENABLED: booleanEnv(false),
+    AUTO_RECOVERY_ENABLED: booleanEnv(false),
+    HEALTH_MONITORING_CONCURRENCY: integerEnv(1, 16, 4),
+    HEALTH_MONITORING_BATCH_SIZE: integerEnv(1, 128, 16),
 
     RUNTIME_TRUSTED_LOCAL_ONLY: booleanEnv(true),
 

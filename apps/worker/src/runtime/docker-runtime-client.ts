@@ -1122,6 +1122,7 @@ function parseState(
 function extractHostPort(
   ports: unknown,
   containerPort: number,
+  expectedBindHost?: string,
 ): number | null {
   if (!isRecord(ports)) {
     return null;
@@ -1163,8 +1164,8 @@ function extractHostPort(
       const hostPort = mapping.HostPort;
 
       if (
-        hostIp !== "127.0.0.1" &&
-        hostIp !== "::1"
+        (hostIp !== "127.0.0.1" && hostIp !== "::1") ||
+        (expectedBindHost !== undefined && hostIp !== expectedBindHost)
       ) {
         return null;
       }
@@ -1254,6 +1255,7 @@ const CONTAINER_INSPECT_FORMAT =
   '{"Id":{{json .Id}},' +
   '"Name":{{json .Name}},' +
   '"Image":{{json .Image}},' +
+  '"RestartCount":{{json .RestartCount}},' +
   '"State":{{json .State}},' +
   '"Ports":{{json .NetworkSettings.Ports}},' +
   '"Labels":{{json .Config.Labels}}}';
@@ -1262,6 +1264,7 @@ function parseInspection(
   stdout: string,
   target: string,
   containerPort: number,
+  expectedBindHost?: string,
 ): ManagedContainerSnapshot {
   let parsed: unknown;
 
@@ -1357,12 +1360,15 @@ function parseInspection(
       running: state.Running === true,
 
       exitCode,
+      restartCount: typeof parsed.RestartCount === "number" && Number.isSafeInteger(parsed.RestartCount) &&
+        parsed.RestartCount >= 0 ? parsed.RestartCount : null,
 
       startedAt,
 
       hostPort: extractHostPort(
         parsed.Ports,
         containerPort,
+        expectedBindHost,
       ),
 
       imageId,
@@ -1818,6 +1824,7 @@ export class DockerRuntimeExecutor
     target: string,
     containerPort = 0,
     signal?: AbortSignal,
+    expectedBindHost?: string,
   ): Promise<ManagedContainerSnapshot | null> {
     if (!isValidContainerId(target)) {
       assertManagedContainerName(target);
@@ -1860,7 +1867,23 @@ export class DockerRuntimeExecutor
       result.stdout,
       target,
       containerPort,
+      expectedBindHost,
     );
+  }
+
+  async inspectOwnedContainer(
+    id: string,
+    ownershipLabels: Record<string, string>,
+    containerPort: number,
+    bindHost: string,
+    signal?: AbortSignal,
+  ): Promise<{ inspection: ContainerInspection; ownershipVerified: boolean }> {
+    assertContainerId(id);
+    const snapshot = await this.inspectManagedContainer(id, containerPort, signal, bindHost);
+    return {
+      inspection: snapshot?.inspection ?? missingContainer(),
+      ownershipVerified: snapshot !== null && labelsMatch(snapshot.labels, ownershipLabels),
+    };
   }
 
   /**
@@ -2288,6 +2311,27 @@ export class DockerRuntimeExecutor
       );
     }
 
+    await this.restartContainerById(containerId, timeoutMs, signal);
+  }
+
+  async restartOwnedContainer(
+    id: string, ownershipLabels: Record<string, string>,
+    target: { imageId: string; host: string; hostPort: number; containerPort: number; startedAt: string },
+    timeoutMs: number, signal: AbortSignal,
+  ): Promise<void> {
+    assertContainerId(id);
+    assertLifecycleTimeout(timeoutMs);
+    const snapshot = await this.inspectManagedContainer(id, target.containerPort, signal, target.host);
+    if (!snapshot || !snapshot.inspection.running || !labelsMatch(snapshot.labels, ownershipLabels) ||
+      snapshot.inspection.imageId !== target.imageId || snapshot.inspection.startedAt !== target.startedAt ||
+      snapshot.inspection.hostPort !== target.hostPort) {
+      throw executionFailed("Recovery container ownership could not be verified.");
+    }
+    await this.restartContainerById(id, timeoutMs, signal);
+  }
+
+  private async restartContainerById(containerId: string, timeoutMs: number, signal: AbortSignal): Promise<void> {
+    assertNotCancelled(signal);
     const graceSeconds = Math.max(
       1,
       Math.ceil(timeoutMs / 1_000),

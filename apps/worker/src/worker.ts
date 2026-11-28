@@ -50,6 +50,7 @@ import {
 } from "./logging/runtime-log-manager.js";
 
 import { runLogRetention } from "./logging/retention.js";
+import { startDeploymentHealthMonitor } from "./health/health-monitor-runtime.js";
 
 // ==================================================
 // Constants
@@ -297,6 +298,7 @@ const runtimeQueueManager = workerEnv.RUNTIME_ENABLED
 const runtimeExecutor = workerEnv.RUNTIME_ENABLED
   ? new DockerRuntimeExecutor()
   : null;
+let healthMonitor: ReturnType<typeof startDeploymentHealthMonitor> = null;
 
 // ==================================================
 // Runtime log collector manager (Phase 5.6)
@@ -1764,6 +1766,12 @@ async function start(): Promise<void> {
     });
   }
 
+  if (runtimeExecutor && workerEnv.HEALTH_MONITORING_ENABLED) {
+    healthMonitor = startDeploymentHealthMonitor(
+      runtimeExecutor.inspectOwnedContainer.bind(runtimeExecutor), shutdownController.signal,
+    );
+  }
+
   if (shuttingDown) {
     return;
   }
@@ -2084,6 +2092,8 @@ function shutdown(
           const pendingTasks: Promise<unknown>[] = [
             collectorShutdownTask,
           ];
+
+          if (healthMonitor) pendingTasks.push(healthMonitor.stop());
 
           if (maintenanceTask) {
             pendingTasks.push(maintenanceTask);
