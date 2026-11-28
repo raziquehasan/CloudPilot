@@ -172,6 +172,30 @@ function booleanEnv(
 // Optional configuration helpers
 // ==================================================
 
+/**
+ * Comma-separated string to trimmed string array.
+ */
+function csvEnv(
+  defaultValue: readonly string[],
+) {
+  return z.preprocess(
+    (value) => {
+      if (typeof value !== "string") {
+        return value;
+      }
+
+      return value
+        .split(",")
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0);
+    },
+
+    z
+      .array(z.string().trim().min(1))
+      .default([...defaultValue]),
+  );
+}
+
 function optionalString(
   maximumLength = 4_096,
 ) {
@@ -381,6 +405,20 @@ const envSchema = z.object({
     .trim()
     .regex(/^v[1-9][0-9]{0,3}$/)
     .default("v1"),
+
+  // ------------------------------------------------
+  // Runtime trust (fixed host port authorization)
+  // ------------------------------------------------
+  //
+  // Mirrors the worker's trusted local runtime
+  // configuration so the API can authorize a fixed
+  // host port before the deployment is persisted.
+  // Absence preserves dynamic allocation.
+  // ------------------------------------------------
+
+  RUNTIME_TRUSTED_LOCAL_ONLY: booleanEnv(true),
+
+  BUILD_TRUSTED_REPOSITORIES: csvEnv([]),
 
   // ------------------------------------------------
   // CORS

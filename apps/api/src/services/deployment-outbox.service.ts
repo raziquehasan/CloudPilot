@@ -7,6 +7,8 @@ import {
   type RuntimeJob,
 } from "@cloudpilot/queue";
 
+import { normalizeRequestedHostPort } from "./deployment-host-port.js";
+
 export interface DeploymentOutboxPolicy {
   maxAttempts: number;
   baseBackoffMs: number;
@@ -295,7 +297,10 @@ export class DeploymentOutboxPublisher {
     // An explicit host port may be recorded on the deployment's
     // build configuration snapshot for authorized trusted local
     // deployments. It is optional; absence preserves dynamic
-    // allocation. The worker re-validates and enforces trust.
+    // allocation. The value is forwarded unchanged so an
+    // occupied fixed port fails authoritatively in the worker
+    // instead of silently falling back to dynamic allocation.
+    // The worker re-validates and enforces trust.
     const deployment = await this.database.deployment.findFirst({
       where: {
         workspaceId: event.workspaceId,
@@ -304,18 +309,10 @@ export class DeploymentOutboxPublisher {
       },
       select: { buildConfigurationSnapshot: true },
     });
-    const snapshot = deployment?.buildConfigurationSnapshot as
-      | { requestedHostPort?: unknown }
-      | null
-      | undefined;
-    const rawPort = snapshot?.requestedHostPort;
     const requestedHostPort =
-      typeof rawPort === "number" &&
-      Number.isInteger(rawPort) &&
-      rawPort >= 0 &&
-      rawPort <= 65_535
-        ? rawPort
-        : 0;
+      normalizeRequestedHostPort(
+        deployment?.buildConfigurationSnapshot,
+      );
 
     const payload: RuntimeJob = {
       kind: "runtime",

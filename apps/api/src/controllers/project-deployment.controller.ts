@@ -33,6 +33,16 @@ import {
 } from "../services/deployment-outbox.service.js";
 
 import {
+  isFixedPortAuthorized,
+} from "../services/deployment-host-port.js";
+
+import {
+  matchesDeploymentRequest,
+} from "../services/deployment-identity.js";
+
+import { env } from "../config/env.js";
+
+import {
   resolveImmutableCommit,
 } from "../services/commit-resolution.service.js";
 
@@ -248,16 +258,6 @@ interface RepositoryIdentity {
   repo: string;
 }
 
-interface DeploymentRequestIdentity {
-  branch?: string | null | undefined;
-  commit?: string | null | undefined;
-}
-
-interface ExistingDeploymentIdentity {
-  requestedBranch: string | null;
-  commitSha: string | null;
-}
-
 // ==================================================
 // Sanitized error utilities
 // ==================================================
@@ -341,45 +341,6 @@ function parseRepositoryFullName(
 // ==================================================
 // Idempotency validation
 // ==================================================
-
-function matchesDeploymentRequest(
-  existing: ExistingDeploymentIdentity,
-  request: DeploymentRequestIdentity,
-): boolean {
-  if (
-    request.branch &&
-    existing.requestedBranch !== request.branch
-  ) {
-    return false;
-  }
-
-  if (request.commit) {
-    const requestedCommit =
-      request.commit.toLowerCase();
-
-    const existingCommit =
-      existing.commitSha?.toLowerCase();
-
-    if (
-      !existingCommit ||
-      requestedCommit !== existingCommit
-    ) {
-      return false;
-    }
-
-    // A commit-only request must not silently
-    // reuse a branch-based deployment.
-
-    if (
-      !request.branch &&
-      existing.requestedBranch !== null
-    ) {
-      return false;
-    }
-  }
-
-  return true;
-}
 
 function sendIdempotencyConflict(
   res: Response,
@@ -664,6 +625,43 @@ async function createDeployment(
     repository.installation.installationId;
 
   // ================================================
+  // Authorize a fixed host port (if requested)
+  // ================================================
+  //
+  // A non-zero fixed host port is only honored for
+  // an OWNER/ADMIN actor when trusted local runtime
+  // mode is enabled and the repository is explicitly
+  // trusted. Dynamic allocation (0 / omitted) is
+  // always permitted under the existing authorization.
+  // ================================================
+
+  const requestedHostPort =
+    requestData.requestedHostPort ?? 0;
+
+  if (requestedHostPort !== 0) {
+    const authorized = isFixedPortAuthorized({
+      requestedHostPort,
+      role: scope.role,
+      trustedLocalMode:
+        env.RUNTIME_TRUSTED_LOCAL_ONLY === true,
+      trustedRepositories:
+        env.BUILD_TRUSTED_REPOSITORIES,
+      repositoryFullName: repository.fullName,
+    });
+
+    if (!authorized) {
+      sendError(
+        res,
+        403,
+        "FIXED_PORT_NOT_AUTHORIZED",
+        "A fixed host port requires workspace administrator access, trusted local runtime mode, and a trusted repository.",
+      );
+
+      return;
+    }
+  }
+
+  // ================================================
   // Resolve requested branch or commit
   // ================================================
   //
@@ -933,6 +931,15 @@ async function createDeployment(
                 resolved.commitMessage,
 
               triggeredByUserId: actorId,
+
+              ...(requestData.requestedHostPort !== undefined
+                ? {
+                    buildConfigurationSnapshot: {
+                      requestedHostPort:
+                        requestData.requestedHostPort,
+                    },
+                  }
+                : {}),
             },
           );
 

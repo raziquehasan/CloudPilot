@@ -431,6 +431,62 @@ Not yet done (awaiting operator): create/push the GitHub repo
 services, then create the validation deployment with a fixed `requestedHostPort` in its build
 configuration snapshot.
 
+### 5.9 Authorized deployment-level fixed host port (implemented, not deployed)
+
+The deployment API now accepts an optional fixed host port so the disposable validation deployment
+can be created through the normal authorized workflow. No DB migration and no frontend change.
+
+Schema (`apps/api/src/validators/deployment.validator.ts`):
+
+- `createDeploymentSchema` gains optional `requestedHostPort` validated by `requestedHostPortSchema`
+  (`0` = dynamic, or an integer in `1024–65535`; `1–1023`, fractional, negative, non-number and
+  out-of-range values are rejected; `.strict()` still rejects unknown keys).
+- `buildConfigurationSchema` is intentionally **not** extended: it maps to persisted
+  `ProjectBuildConfiguration` columns, so a new field would require a migration (forbidden). The
+  fixed port is a per-deployment property carried in the deployment's `buildConfigurationSnapshot`
+  JSON, set only by the authorized deployment API.
+
+Authorization (`apps/api/src/services/deployment-host-port.ts`, `isFixedPortAuthorized`):
+
+- A non-zero fixed port is honored only when the actor is `OWNER`/`ADMIN`, trusted local runtime
+  mode is enabled (`RUNTIME_TRUSTED_LOCAL_ONLY`, default `true`), and the resolved repository
+  `fullName` is in `BUILD_TRUSTED_REPOSITORIES`. Otherwise the API returns
+  `403 FIXED_PORT_NOT_AUTHORIZED`.
+- Dynamic allocation (`0`/omitted) is always permitted under the existing `canManage` gate.
+- Existing authentication (`requireAuth`), CSRF (`requireCsrf`), workspace isolation
+  (`resolveProject`) and repository authorization (installation `ACTIVE`, immutable commit
+  resolution) are unchanged and still enforced before any port handling.
+
+API env (`apps/api/src/config/env.ts`): added `RUNTIME_TRUSTED_LOCAL_ONLY` (boolean, default
+`true`) and `BUILD_TRUSTED_REPOSITORIES` (CSV, default empty) mirroring the worker so the API can
+authorize before persisting. The worker independently re-validates and enforces trust.
+
+Persistence + propagation:
+
+- `createDeployment` passes `buildConfigurationSnapshot: { requestedHostPort }` to
+  `createDeploymentWithOutbox` only when the field is provided; existing/omitted deployments keep a
+  `null` snapshot (dynamic).
+- `deployment-outbox.service.ts` forwards the persisted value via the shared
+  `normalizeRequestedHostPort` (unchanged fixed port, `0` for absent/invalid) into the runtime job
+  payload — no silent dynamic fallback; an occupied fixed port fails authoritatively in the worker.
+
+Idempotency (`apps/api/src/services/deployment-identity.ts`, `matchesDeploymentRequest`):
+
+- The requested port is part of the request identity. Reusing an `Idempotency-Key` with a different
+  `requestedHostPort` returns `409 IDEMPOTENCY_KEY_REUSED` (checked on the initial lookup, inside the
+  transaction, and on `P2002` recovery).
+
+Retry/redeploy safety: the outbox retry re-reads the persisted snapshot each attempt, so the fixed
+port is never lost; there is no separate redeploy endpoint that creates deployments, so the single
+authorized `createDeployment` path cannot be bypassed.
+
+Tests (`apps/api/test/deployment-host-port.test.ts`): **18 passed, 0 failed** — omitted/`0`, valid
+`63299`, bounds `1024`/`65535`, invalid/fractional/out-of-range/non-number rejection, strict unknown
+key, MEMBER/untrusted-repo/disabled-local rejection, dynamic always allowed, snapshot→queue
+propagation with no silent fallback, idempotency conflict for different ports, and existing-deployment
+compatibility. Typecheck: API **pass**, worker **pass**. Not committed or pushed; validation project
+not created or deployed.
+
 ## 6. Recovery identifiers and state transitions (planned; actuals recorded post-approval)
 
 Target: a disposable deployment (not the demo). Expected transition:
@@ -462,3 +518,67 @@ complete and verified; manual recovery is enabled and the healthy demo is correc
 After approval of the §5.7 changes (trusted repo + validation app, and optionally fixed-port support)
 and a real recovery reaching `SUCCEEDED` with a new HEALTHY generation, Phase 5.7.7 is complete and
 Phase 5.8 may begin.
+## Final end-to-end manual recovery validation
+
+Date: 2026-11-28
+Result: PASSED
+
+### Validation deployment
+
+- Repository: raziquehasan/cloudpilot-recovery-validation
+- Branch: main
+- Commit: 34d9c8e
+- Project ID: 92965047-d6d9-4512-81f6-3c8286240fa5
+- Deployment ID: 31198994-8d7d-4c70-81d5-af2a0c5c2839
+- Runtime ID: 8a842ccb-ffd3-4a6b-95ff-e625c9eee724
+- Container ID: 64376e6449f1
+- Fixed host port: 63299
+- Container port: 3000
+
+### Recovery audit
+
+- Recovery ID: 5edf953f-31ec-4e61-ac20-a35eb6eba1d6
+- Action: RESTART
+- Trigger: MANUAL
+- Status: SUCCEEDED
+- Attempt count: 1
+- Recovery duration: 13.186 seconds
+- Health generation: 0 -> 1
+- Health version at reservation: 23
+- HTTP status: 503 -> 200
+- Durable restart intent: 2026-11-28 08:30:11.748 UTC
+- Previous StartedAt: 2026-11-28T08:24:28.723658833Z
+- Recovered StartedAt: 2026-11-28T08:30:23.100977192Z
+- Recovery lease released successfully.
+- No recovery failure reason recorded.
+
+### Verified safety guarantees
+
+- Container identity preserved.
+- Docker image identity preserved.
+- Fixed loopback host port preserved.
+- Existing demo container was not restarted or replaced.
+- Existing demo continued returning HTTP 200.
+- PostgreSQL and Redis remained healthy.
+- Scheduled monitoring continued after recovery.
+- Recovery was initiated through the authenticated dashboard.
+- No direct Docker restart was used.
+
+### Active local feature configuration
+
+- HEALTH_PERSISTENCE_ENABLED=true
+- HEALTH_MONITORING_ENABLED=true
+- MANUAL_RECOVERY_ENABLED=true
+- AUTO_RECOVERY_ENABLED=false
+
+Feature defaults remain disabled in source configuration.
+
+### Known limitations
+
+- Backend does not report effective worker monitoring-enabled status.
+- Some dashboard chart tooltip metadata remains unavailable.
+- Automatic recovery remains disabled.
+- Backup restore procedure has not been exercised.
+- Validation covers the controlled local Docker environment.
+
+The controlled end-to-end manual recovery validation passed.
