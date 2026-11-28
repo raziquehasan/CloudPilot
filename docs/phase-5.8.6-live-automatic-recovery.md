@@ -131,3 +131,95 @@ Before/after snapshots of `cloudpilot-postgres` (127.0.0.1:5433) and `cloudpilot
 
 ### Remaining limitations
 Exactly-once Docker execution is not claimed. BullMQ redelivery was not exercised because bounded interruptions restored the service before the stalled-job threshold; reconciliation of a truly stalled/terminal job remains covered by the 5.8.4 integration tests, not by a live stall in this phase. Real worker termination during an in-flight Docker operation (5.8.6.C) and final activation readiness (5.8.6.D) remain open.
+
+## Phase 5.8.6.C.1 — BullMQ stalled redelivery diagnosis
+
+Baseline HEAD was 554f710. The existing uncommitted C1/C2/C3 harness work was preserved. The diagnostic and acceptance code is test-only. No runtime code, package policy, schema, or migration changed.
+
+### Minimal reproduction
+
+BullMQ 6.7.9 ran against a disposable Redis 7 instance on a unique loopback port and prefix. Worker A started the only job, held a 1,600 ms lock, and was hard-killed. The initial probe incorrectly used the unavailable queue.client handle for raw Redis reads. The dedicated read-only ioredis observer corrected that harness error. With a 700 ms stalled interval and one permitted stall, TTL declined from 1,560 ms to 9 ms, then Redis returned -2. The job stayed active briefly until BullMQ emitted waiting and stalled, then Worker B activated and completed the original job. The final attempt counters were 2 started and 1 made, and the Redis stall counter was 1. No observer manipulated any queue key.
+
+### Effective options and root cause
+
+A live diagnostic explicitly recorded runtime consumer readiness from both actual workers on the same runtime queue, disposable prefix, 127.0.0.1:63095, Redis database 0. Both had autorun enabled, concurrency 1, no pause, lock renewal and stalled detection enabled, a 30 s stalled interval, and maxStalledCount 1. Both reported a 600 s lock and 300 s renewal period. Immediately after Worker A exited, the original job was still in the active list with a 597.934 s lock TTL and attemptsStarted=1. Subsequent TTLs included 593.458 s, 588.416 s, and 497.521 s. This is a positive, decreasing lock TTL that outlasted the 540 s observation deadline. It was never eligible to be moved under those deadlines.
+
+The worker computes its runtime policy from the larger of the shared queue timeout and the runtime startup timeout plus 120 s. QueueManager also applies the 180 s runtime execution floor and then doubles the effective timeout to obtain the lock. The shared queue timeout defaults to 300 s. The old startup-only override left that default in control. The corrected harness sets both inputs for disposable crash children, asserts the actual 360 s lock and 180 s renewal period, and gives the original lock plus two stall-check intervals room in the 540 s bound. An earlier corrected preflight expected 250 s and exited before injection when it measured the 360 s runtime floor. The acceptance harness explicitly accounts for that floor.
+
+PostgreSQL uses separate recovery and runtime execution leases, both expiring 120 s after the original claim. The recovery processor waits on a busy lease and retries its claim while its queue execution remains valid. Reconciliation can also look up an expired durable reservation and its current queue job. A reconciliation publication count by itself does not establish redelivery, since publication treats an existing active job as already present.
+
+### Commands and fresh regressions
+
+```powershell
+$env:CLOUDPILOT_RUN_LIVE_RECOVERY='1'
+node --import tsx apps/worker/test/bullmq-stalled.live.ts
+node --import tsx apps/worker/test/automatic-recovery-fault.live.ts c1
+npm run worker:typecheck
+node node_modules/typescript/bin/tsc --noEmit --module NodeNext --target ES2023 --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --esModuleInterop --skipLibCheck apps/worker/test/automatic-recovery-fault.live.ts apps/worker/test/bullmq-stalled.live.ts
+node --import tsx --test --test-reporter=spec apps/worker/test/recovery-fault-gate.test.ts apps/worker/test/auto-recovery-circuit.test.ts apps/worker/test/auto-recovery-candidates.test.ts
+```
+
+The minimal reproduction, worker TypeScript and harness TypeScript checks exited 0. The focused unit suite exited 0 with 33 passes. On a separate disposable PostgreSQL/Redis pair, the scheduling integration file ran sequentially under both flag settings and exited 0 each time. Enabled yielded 12 passes and 4 skips, disabled yielded 13 passes and 3 skips. Together they exercised all 16 cases. The four enabled-mode skips were disabled-before-execution cancellation, disabled terminal-job reconciliation, disabled claimed-work reconciliation, and the disablement-versus-authorization race. The disposable circuit integration file exited 0 with 4 passes. The commands for those runs were node --import tsx --test --test-reporter=spec apps/worker/test/auto-recovery-scheduling.integration.test.ts and node --import tsx --test --test-reporter=spec apps/worker/test/auto-recovery-circuit.integration.test.ts.
+
+### Single C1 acceptance result
+
+The corrected scenario exited 0. The disposable run was cp586-c1-8fd79b43-d075-4c38-9e13-4e2faf6690f0 with PostgreSQL, Redis, and application loopback ports 54060, 53726, and 51974. Both actual runtime consumers reported the same prefix, Redis database 0, a 360,000 ms lock, 180,000 ms renewal, 30,000 ms stall interval, maxStalledCount 1, concurrency 1, autorun enabled, and no pause or disabled checks. Worker A PID 25084 and Worker B PID 35944 proved their identities through the parent-child IPC channel before the crash and replacement observation.
+
+Recovery d0d24569-537c-4a6a-97a6-6a6fdba4c211 used job recovery-d0d24569-537c-4a6a-97a6-6a6fdba4c211. All following times are UTC on 2026-11-28.
+
+| Event | Time or value |
+| --- | --- |
+| Original Docker StartedAt | 16:41:32.833449506 |
+| PostgreSQL restart intent persisted | 16:42:29.275 |
+| Docker daemon sent signal 15 to the fixture and the app logged the signal | 16:42:29.813753351 |
+| Hard termination requested and child exit confirmed | 16:42:31.215 / 16:42:31.253 |
+| Final Docker StartedAt and daemon restart event | 16:42:38.374514603 / 16:42:38.988490449 |
+| Original recovery and runtime leases expired | 16:44:28.933 |
+| Redis lock TTL progression | 357628, 10440, 5439, 427, then -2 ms |
+| BullMQ stalled stream ID | 1795884515481-1 |
+| Replacement PostgreSQL claim | 16:48:35.578 |
+| Reconciled settlement | 16:48:36.489 |
+
+The Redis stalled-check key had a positive TTL and the job was in the stalled candidate set while the original lock remained positive. At 16:48:33 Redis returned -2 for the job lock while the job was still active. The next stalled check moved the same job through waiting and active before it completed with attemptsStarted=2, attemptsMade=1. Worker B replaced the expired database lease and verified the original restart intent against Docker and HTTP. The recovery settled SUCCEEDED with one Docker restart event, an unchanged container ID/image/port, generation 0 to 1, a CLOSED circuit, two attempts remaining, and cleared leases. The app returned HTTP 200. Redelivery followed lease expiry in this run, so the early-redelivery busy path was not exercised by this C1 scenario.
+
+The earlier instrumented diagnostic exited 1 at its deadline while the original job was still active and its latest sampled TTL was 53.959 s. It shut down its replacement worker and removed its containers. The accepted run also shut down Worker B gracefully and removed the uniquely tagged containers, anonymous volumes, Redis queue data, and temporary workspace. The separate minimal Redis and regression fixtures were removed. Protected container IDs, image IDs, StartedAt and port bindings matched before and after. Both protected apps returned HTTP 200, the API and frontend retained their listeners, and primary worker PID 46964 retained its start time. The root environment hash matched and AUTO_RECOVERY_ENABLED remained false.
+
+## Phase 5.8.6.C — Live worker-termination acceptance (C1/C2/C3)
+
+Baseline HEAD was `554f710`. This section closes the third activation gate (real worker termination during an in-flight Docker operation) with two independent C1 repetitions plus one C2 and one C3 run, all on real Docker, PostgreSQL, Redis, BullMQ and isolated worker processes. The C1/C2/C3 harness and the `bullmq-stalled.live.ts` diagnostic are test-only; no runtime, package-policy, schema or migration code changed in this phase. Automatic recovery stayed disabled in the caller shell and primary worker; it was enabled only inside each disposable child.
+
+### Crash and replacement mechanics
+Each run starts Worker A on the normal worker entry point, drives one automatic recovery to the durable-intent boundary, verifies container labels/ownership and identity (child PID ≠ self, parent = harness PID, run match), then hard-kills Worker A with `SIGKILL` and confirms the persisted attempt stays `RUNNING` with `finishedAt:null` and the original lease unchanged. Worker B (`startWorker(false)`) then waits for BullMQ stalled redelivery plus recovery-attempt lease expiry, claims the expired lease, and settles the original job. The replacement claim is asserted to land at or after the original `leaseExpiresAt`, with `attemptsStarted≥2`, a captured `stalled` stream event, reused `restartSourceStartedAt`, cleared leases and a single settled attempt. The 360 s runtime lock (180 s renewal) and the 120 s recovery/runtime leases come from the corrected effective-timeout configuration; the original lock plus two stall-check intervals fit inside the 540 s bound.
+
+Mode semantics follow `verifyRecoveryRestart` (`recovery-operations.ts:50`): when a durable `sourceEpoch` exists it never re-issues Docker, an unchanged epoch yields `RECOVERY_RESTART_UNCERTAIN`, and a fixed non-zero host port is required (`RECOVERY_PORT_CHANGED`).
+- C1 (`armed=false`): the Docker restart runs to completion; expect 1 restart, SUCCEEDED, generation 1, circuit CLOSED. Timing fence `issuedAt < crashRequestedAt < crashObservedAt < completedAt`.
+- C2 (`armed=true`, boundary `after-intent`): no Docker restart is issued; expect 0 restarts, FAILED / `RECOVERY_RESTART_UNCERTAIN`, generation 0, circuit OPEN, manual intervention required, `originalStartedAt == finalStartedAt`.
+- C3 (`armed=true`, boundary `after-restart`): the restart completed before the crash; expect 1 restart, SUCCEEDED, generation 1, circuit CLOSED. Timing fence `issuedAt < completedAt < crashRequestedAt`.
+
+### Results (all pass, exit 0)
+All four runs captured a BullMQ `stalled` stream event, settled with `attemptsStarted=2`/`attemptsMade=1`, replaced the lease only after `leaseExpiresAt`, preserved container ID/image/fixed host port, and cleaned up (child exit 0, no leftover containers). All times UTC on 2026-11-28.
+
+| Mode | Run | Recovery ID | Host port | Worker A / B PID | issuedAt | completedAt | crashRequestedAt | Original StartedAt | Final StartedAt | Restarts | Status | Gen | Circuit |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| C1 | cp586-c1-e589caa7-baa8-4b7f-a8f5-ddfe89b09453 | f2030fc6-0179-4fce-a9c5-3b1b4e1d1c6a | 57930 | 10316 / 9984 | 16:52:56.178 | 16:53:06.050 | 16:52:57.632 | 16:51:58.358355434 | 16:53:05.203468829 | 1 | SUCCEEDED | 1 | CLOSED |
+| C1 | cp586-c1-ac677de7-31cf-427c-bee2-2db6272fde62 | 4629c11a-adbf-4f9d-a920-773ce478b90d | 63439 | 25112 / 26176 | 17:01:30.775 | 17:01:41.032 | 17:01:32.339 | 17:00:33.460233640 | 17:01:40.232408696 | 1 | SUCCEEDED | 1 | CLOSED |
+| C2 | cp586-c2-772e8424-dce2-4d2e-a0d8-461f4b9df9ba | f0b449b6-e19c-4bf1-9455-ca38f83b3c1a | 55483 | 35324 / 16796 | null | null | 17:10:01.626 | 17:09:03.346212630 | 17:09:03.346212630 | 0 | FAILED / RECOVERY_RESTART_UNCERTAIN | 0 | OPEN |
+| C3 | cp586-c3-ebaf4353-32a5-4ebb-a29b-393473c629cd | 04ebb26a-7998-4f47-8e57-59b8b009316e | 55708 | 9608 / 44916 | 17:17:42.723 | 17:17:53.812 | 17:17:57.998 | 17:16:48.099730426 | 17:17:53.301627438 | 1 | SUCCEEDED | 1 | CLOSED |
+
+Replacement claims landed after lease expiry in every run: C1 #2 at 16:59:01.799 (lease 16:54:55.309), C1 #3 at 17:07:38.099 (lease 17:03:29.732), C2 at 17:16:06.337 (lease 17:11:59.722), C3 at 17:23:59.761 (lease 17:19:42.002). C2 left the attempt FAILED with manual intervention required and the circuit OPEN; C1/C3 each produced exactly one generation advance and a CLOSED circuit. The C1 runs confirm reproducibility of the crash/restart path; C2 confirms the epoch fence suppresses any second Docker issuance and surfaces `RECOVERY_RESTART_UNCERTAIN`; C3 confirms an already-completed restart is verified and finalized despite the worker crash.
+
+### Commands and exit codes
+```powershell
+$env:CLOUDPILOT_RUN_LIVE_RECOVERY='1'
+node --import tsx apps/worker/test/automatic-recovery-fault.live.ts c1   # x2, exit 0
+node --import tsx apps/worker/test/automatic-recovery-fault.live.ts c2   # exit 0
+node --import tsx apps/worker/test/automatic-recovery-fault.live.ts c3   # exit 0
+npm run worker:typecheck                                                 # exit 0
+node node_modules/typescript/bin/tsc --noEmit --module NodeNext --target ES2023 --strict --noUncheckedIndexedAccess --exactOptionalPropertyTypes --esModuleInterop --skipLibCheck apps/worker/test/automatic-recovery-fault.live.ts  # exit 0
+```
+
+### Protected infrastructure and cleanup
+Each run's `finally` shut down Worker B (exit 0), closed the queue, disconnected Prisma, removed all `cloudpilot.validation=cp586-*` containers/volumes (label-asserted) and the temp workspace; post-run disposable-container inventory was empty. The demo (53143), validation (63299), API (8000) and frontend (3000) stayed reachable; root `.env` was unchanged with `AUTO_RECOVERY_ENABLED=false`; the primary worker was untouched.
+
+### Remaining limitations
+Exactly-once Docker execution is not claimed; redelivery followed lease expiry in these runs, so the early-redelivery busy path remains covered by the 5.8.4 integration tests rather than a live stall. Final activation readiness (5.8.6.D) remains a separate decision. No commit or push was performed; the harness and this report are left uncommitted pending explicit approval.
