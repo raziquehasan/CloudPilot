@@ -1,0 +1,12 @@
+scrape_configs:
+  - job_name: cloudpilot-api
+    authorization:
+      credentials_file: /run/secrets/cloudpilot_metrics_token
+    static_configs:
+      - targets: ["host.docker.internal:9464"]
+
+  - job_name: cloudpilot-worker
+    authorization:
+      credentials_file: /run/secrets/cloudpilot_metrics_token
+    static_configs:
+      - targets: ["host.docker.internal:9465"]

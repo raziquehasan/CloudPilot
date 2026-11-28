@@ -11,6 +11,7 @@ import {
 import { type RuntimeJob } from "@cloudpilot/queue";
 import { cancelUnstartedAutomatic, processRecoveryJob } from "../src/health/recovery-processor.js";
 import { discoverAutoRecoveryCandidates, evaluateCandidateRows } from "../src/health/auto-recovery-candidates.js";
+import { workerMetrics } from "../src/metrics.js";
 import { DockerRuntimeExecutor } from "../src/runtime/docker-runtime-client.js";
 import {
   publishRecoveryJob, reconcileUnpublishedAutoRecoveries, type RecoveryJobQueue,
@@ -243,6 +244,15 @@ test("automatic recovery is cancelled without a restart when disabled before exe
     assert.ok(health.nextCheckAt);
   }, false));
 
+async function recoveryObservation(trigger: "MANUAL" | "AUTOMATIC", outcome: "SUCCEEDED" | "FAILED", reason: string) {
+  if (process.env.CLOUDPILOT_ASSERT_RECOVERY_METRICS !== "1") return;
+  assert.ok(workerMetrics, "Metrics must be configured for recovery observations");
+  const metric = await workerMetrics.registry.getSingleMetric("cloudpilot_recovery_attempts_total")?.get();
+  const row = metric?.values.find((sample) =>
+    sample.labels.trigger === trigger && sample.labels.outcome === outcome && sample.labels.reason === reason);
+  assert.equal(row?.value, 1);
+}
+
 test("successful automatic recovery uses the existing processor and advances generation", { skip: !autoExecEnabled }, () =>
   withFixture(async (f) => {
     const reserve = await reserveAutomaticRecovery(prisma, f.scope, f.runtimeId);
@@ -254,6 +264,7 @@ test("successful automatic recovery uses the existing processor and advances gen
     const settled = await prisma.deploymentRecoveryAttempt.findUniqueOrThrow({ where: { id: reserve.attempt.id } });
     assert.equal(settled.status, "SUCCEEDED");
     assert.equal(settled.trigger, "AUTOMATIC");
+    await recoveryObservation("AUTOMATIC", "SUCCEEDED", "none");
     const latest = await prisma.deploymentHealthState.findFirstOrThrow({ where: f.scope, orderBy: { generation: "desc" } });
     assert.equal(latest.generation, 1);
     assert.equal(latest.status, "HEALTHY");
@@ -271,6 +282,7 @@ test("failed automatic recovery is not reported as success", { skip: !autoExecEn
     const settled = await prisma.deploymentRecoveryAttempt.findUniqueOrThrow({ where: { id: reserve.attempt.id } });
     assert.equal(settled.status, "FAILED");
     assert.equal(settled.failureReason, "HTTP_STATUS");
+    await recoveryObservation("AUTOMATIC", "FAILED", "HTTP_STATUS");
   }, false));
 
 test("ambiguous automatic restart is never repeated and never reported as success", { skip: !autoExecEnabled }, () =>
@@ -283,6 +295,7 @@ test("ambiguous automatic restart is never repeated and never reported as succes
     assert.equal(outcome.status, "failed");
     const settled = await prisma.deploymentRecoveryAttempt.findUniqueOrThrow({ where: { id: reserve.attempt.id } });
     assert.equal(settled.failureReason, "RECOVERY_RESTART_UNCERTAIN");
+    await recoveryObservation("AUTOMATIC", "FAILED", "RECOVERY_RESTART_UNCERTAIN");
     const latest = await prisma.deploymentHealthState.findFirstOrThrow({ where: f.scope, orderBy: { generation: "desc" } });
     assert.equal(latest.generation, 0);
   }, false));
@@ -304,6 +317,7 @@ test("existing manual recovery remains compatible", { skip: !manualEnabled }, ()
     const outcome = await runJob(autoJob(f, reserve.attempt.id, "MANUAL"), f.executor);
     assert.equal(outcome.status, "succeeded");
     assert.equal(f.calls(), 1);
+    await recoveryObservation("MANUAL", "SUCCEEDED", "none");
   }, false));
 
 test("advisory discovery reports OPEN and HALF_OPEN and fences stale generation/version", { skip: !dbEnabled }, () =>

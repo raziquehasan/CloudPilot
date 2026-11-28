@@ -1,0 +1,10 @@
+services:
+  prometheus:
+    volumes:
+      - ./prometheus/application-targets.yml:/etc/prometheus/optional/application-targets.yml:ro
+    secrets:
+      - cloudpilot_metrics_token
+
+secrets:
+  cloudpilot_metrics_token:
+    file: ${CLOUDPILOT_METRICS_TOKEN_FILE:?Set CLOUDPILOT_METRICS_TOKEN_FILE to the private metrics credentials file}

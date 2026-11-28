@@ -1,3 +1,4 @@
+import { workerMetrics } from "../metrics.js";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import {
@@ -349,6 +350,7 @@ export async function processRecoveryJob(jobId: string | undefined, job: Runtime
     }
     if (claimed.kind !== "claimed") break;
     const { claim } = claimed;
+    const claimedAt = performance.now();
     maybeCrash("after-claim");
     try {
       const result = await verifyRecoveryRestart({
@@ -362,9 +364,11 @@ export async function processRecoveryJob(jobId: string | undefined, job: Runtime
       const settled = await finishRecovery(claim, result);
       maybeCrash("after-finish");
       if (!settled) return { status: "skipped" as const };
+      const status = settled.status === "SUCCEEDED" ? "SUCCEEDED" : "FAILED";
+      workerMetrics?.recovery(trigger, status, settled.failureReason, (performance.now() - claimedAt) / 1000);
       workerLogger.info({ recoveryId: claim.attemptId, deploymentId: job.deploymentId, trigger, failureReason: settled.failureReason },
         `${trigger === "AUTOMATIC" ? "Automatic" : "Manual"} recovery settled`);
-      return { status: settled.status === "SUCCEEDED" ? "succeeded" as const : "failed" as const };
+      return { status: status === "SUCCEEDED" ? "succeeded" as const : "failed" as const };
     } catch {
       await releaseRecoveryForRetry(claim).catch(() => {});
       throw new TransientJobError("Recovery interrupted or settlement unavailable");

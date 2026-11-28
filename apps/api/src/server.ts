@@ -16,6 +16,7 @@ import { LogDistributionRuntime } from "./services/log-distribution.service.js";
 import { LogGateway } from "./realtime/log-gateway.js";
 import { createApp } from "./app.js";
 import { env } from "./config/env.js";
+import { apiMetrics } from "./metrics/index.js";
 import { logger } from "./config/logger.js";
 
 // --------------------------------------------------
@@ -24,6 +25,7 @@ import { logger } from "./config/logger.js";
 
 const app = createApp();
 const httpServer: Server = createServer(app);
+let closeMetrics: (() => Promise<void>) | undefined;
 
 // --------------------------------------------------
 // Real-time log distribution (Phase 5.6)
@@ -123,6 +125,7 @@ async function shutdown(
   }
 
   try {
+    await cleanup("Metrics listener", async () => { await closeMetrics?.(); });
     // 1. Stop accepting new HTTP requests.
     await cleanup("HTTP server", async () => {
       if (!httpServer.listening) {
@@ -264,6 +267,8 @@ process.on("uncaughtException", (error) => {
 // --------------------------------------------------
 
 httpServer.listen(env.PORT, env.HOST, () => {
+  try { closeMetrics = apiMetrics?.start(); }
+  catch { logger.error("API metrics startup failed"); }
   if (isShuttingDown) {
     return;
   }

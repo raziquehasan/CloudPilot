@@ -1,3 +1,4 @@
+import { workerMetrics } from "../metrics.js";
 import { randomUUID } from "node:crypto";
 import { Prisma, prisma, reserveAutomaticRecovery, type HealthScope } from "@cloudpilot/database";
 import { workerEnv } from "../config/env.js";
@@ -147,6 +148,7 @@ export function startDeploymentHealthMonitor(inspect: HealthInspector, signal: A
       }
     },
     async check(scope, checkSignal) {
+      const started = performance.now();
       let dockerError = false;
       await runRuntimeHealthCheck(scope, ownerId, inspect, {
         signal: checkSignal,
@@ -161,6 +163,7 @@ export function startDeploymentHealthMonitor(inspect: HealthInspector, signal: A
             workerLogger.debug(detail, "Health check skipped");
             return;
           }
+          workerMetrics?.healthCheck(event.failureReason, (performance.now() - started) / 1000);
           if (event.previousStatus !== event.status) workerLogger.info(detail, "Deployment health state changed");
           workerLogger.debug(detail, event.failureReason ? "Deployment health check failed" : "Deployment health check passed");
         },
@@ -169,6 +172,9 @@ export function startDeploymentHealthMonitor(inspect: HealthInspector, signal: A
     },
     emit(event, detail) {
       const data = { ownerId, deploymentId, event, ...detail };
+      if (event === "batch" && typeof detail?.batchDurationMs === "number") {
+        workerMetrics?.healthBatch(detail.consecutiveFailures ? "infrastructure_error" : "completed", detail.batchDurationMs / 1000);
+      }
       if (event === "infrastructure_error") workerLogger.warn(data, "Deployment health monitor infrastructure error");
       else if (event === "batch") workerLogger.debug(data, "Deployment health monitor batch");
       else workerLogger.info(data, "Deployment health monitor");

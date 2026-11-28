@@ -16,6 +16,7 @@ import {
 } from "bullmq";
 
 import { workerEnv } from "./config/env.js";
+import { workerMetrics } from "./metrics.js";
 import { workerLogger } from "./config/logger.js";
 
 import {
@@ -109,6 +110,7 @@ let startupCompleted = false;
 
 let shutdownExitCode = 0;
 
+let closeMetrics: (() => Promise<void>) | undefined;
 let shutdownPromise: Promise<void> | null = null;
 
 let heartbeatTimer: Timer | undefined;
@@ -505,7 +507,14 @@ workerConnection.on("end", () => {
 // Diagnostic queue worker
 // ==================================================
 
-const worker = queueManager.createWorker(
+function createObservedWorker(manager: QueueManager, ...args: Parameters<QueueManager["createWorker"]>) {
+  const [queue, processor, concurrency] = args;
+  const consumer = manager.createWorker(queue, workerMetrics?.wrap(queue, processor) ?? processor, concurrency);
+  if (workerMetrics) consumer.on("stalled", () => workerMetrics?.stalled(queue));
+  return consumer;
+}
+
+const worker = createObservedWorker(queueManager,
   QUEUE_NAMES.diagnostic,
 
   async (
@@ -577,7 +586,7 @@ const worker = queueManager.createWorker(
 // ==================================================
 
 const deploymentWorker =
-  queueManager.createWorker(
+  createObservedWorker(queueManager,
     QUEUE_NAMES.deployment,
 
     async (
@@ -651,7 +660,7 @@ const deploymentWorker =
 
 const buildWorker =
   buildQueueManager && buildExecutor
-    ? buildQueueManager.createWorker(
+    ? createObservedWorker(buildQueueManager,
         QUEUE_NAMES.build,
 
         async (
@@ -726,7 +735,7 @@ const buildWorker =
 
 const runtimeWorker =
   runtimeQueueManager && runtimeExecutor
-    ? runtimeQueueManager.createWorker(
+    ? createObservedWorker(runtimeQueueManager,
         QUEUE_NAMES.runtime,
 
         async (
@@ -1810,6 +1819,21 @@ async function start(): Promise<void> {
     return;
   }
 
+  if (workerMetrics) {
+    try {
+      workerMetrics.readiness(() => {
+        const available = isWorkerAvailable("deployment");
+        const monitoring = healthMonitor !== null && !shutdownController.signal.aborted;
+        const automatic = available && monitoring && workerEnv.AUTO_RECOVERY_ENABLED &&
+          isRuntimeAvailable() && runtimeQueueManager !== null && workerEnv.BUILD_TRUSTED_REPOSITORIES.length > 0;
+        return { available, monitoring, automatic };
+      });
+      closeMetrics = workerMetrics.start();
+    } catch {
+      workerLogger.error("Worker metrics startup failed");
+    }
+  }
+
   workerLogger.info(
     {
       workerId,
@@ -2016,6 +2040,7 @@ function shutdown(
       // downloads and extraction cooperatively.
 
       shutdownController.abort();
+      await shutdownStep("close-metrics-listener", async () => { await closeMetrics?.(); });
 
       /**
        * Start collector shutdown immediately.

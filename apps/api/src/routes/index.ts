@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { metricsRoutePrefix } from "../metrics/http.js";
 import { env } from "../config/env.js";
 import { getHealth } from "../controllers/health.controller.js";
 import { healthRouter } from "./health.routes.js";
@@ -15,15 +16,19 @@ import { projectDeploymentLogsRouter } from "../controllers/deployment-logs.cont
 
 export const routes = Router();
 
+function mount(prefix: string, router: Router) {
+  routes.use(prefix, metricsRoutePrefix(prefix), router);
+}
+
 routes.get("/health", getHealth);
-routes.use(`/api/${env.API_VERSION}/health`, healthRouter);
-routes.use(`/api/${env.API_VERSION}/auth/github`, githubAuthRouter);
-routes.use(`/api/${env.API_VERSION}/auth`, authRouter);
-routes.use(`/api/${env.API_VERSION}/github`, githubAppRouter);
-routes.use(`/api/${env.API_VERSION}/projects`, projectEnvironmentVariableRouter);
-routes.use(`/api/${env.API_VERSION}/projects`, projectRepositoryRouter);
-routes.use(`/api/${env.API_VERSION}/projects`, projectBuildConfigurationRouter);
-routes.use(`/api/${env.API_VERSION}/projects`, projectDeploymentRouter);
-routes.use(`/api/${env.API_VERSION}/projects`, deploymentRecoveryRouter);
-routes.use(`/api/${env.API_VERSION}/projects`, projectDeploymentLogsRouter);
-routes.use(`/api/${env.API_VERSION}`, workspaceRouter);
+mount(`/api/${env.API_VERSION}/health`, healthRouter);
+mount(`/api/${env.API_VERSION}/auth/github`, githubAuthRouter);
+mount(`/api/${env.API_VERSION}/auth`, authRouter);
+mount(`/api/${env.API_VERSION}/github`, githubAppRouter);
+mount(`/api/${env.API_VERSION}/projects`, projectEnvironmentVariableRouter);
+mount(`/api/${env.API_VERSION}/projects`, projectRepositoryRouter);
+mount(`/api/${env.API_VERSION}/projects`, projectBuildConfigurationRouter);
+mount(`/api/${env.API_VERSION}/projects`, projectDeploymentRouter);
+mount(`/api/${env.API_VERSION}/projects`, deploymentRecoveryRouter);
+mount(`/api/${env.API_VERSION}/projects`, projectDeploymentLogsRouter);
+mount(`/api/${env.API_VERSION}`, workspaceRouter);

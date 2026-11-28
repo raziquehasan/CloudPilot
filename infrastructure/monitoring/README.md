@@ -44,3 +44,9 @@ For throwaway testing, choose an unused host port and a distinct project, such a
 Development defaults are a 15-second scrape and evaluation interval, a 5-second timeout, and retention up to 7 days or approximately 1 GiB of retained storage. The size setting governs TSDB retention and is not a hard volume quota. The operator endpoint has no application-level authentication. Keep it on loopback and do not proxy it to the public internet.
 
 See the [Phase 5.9.1 validation report](../../docs/phase-5.9.1-prometheus-setup.md) for measured results and future integration boundaries.
+
+## Application and worker metrics
+
+Phase 5.9.2 adds an optional Compose overlay. Leave the base stack on self-scrape until both dedicated metrics listeners are enabled and verified. The overlay adds authenticated targets for host.docker.internal:9464 and :9465 without changing the monitoring project or data volume.
+
+Both application processes default to metrics disabled. When approval is granted, use one randomly generated bearer token stored outside the repository. Start the API and worker with METRICS_ENABLED=true and METRICS_TOKEN_FILE pointing to the private file. Pass the same path as CLOUDPILOT_METRICS_TOKEN_FILE in the Compose shell. See the [Phase 5.9.2 activation and rollback runbook](../../docs/phase-5.9.2-application-queue-metrics.md).

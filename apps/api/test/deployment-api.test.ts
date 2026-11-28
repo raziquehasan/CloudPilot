@@ -9,7 +9,7 @@ import { hashSecret } from "../src/services/session.service.ts";
 import { disconnectQueueProducer, queueEnv, queueManager, redisProducerConnection } from "../src/services/queue-producer.ts";
 
 const recoveryIntegration = process.env.MANUAL_RECOVERY_ENABLED === "true" &&
-  /^\/cloudpilot_health_test_574$/.test(new URL(process.env.DATABASE_URL ?? "http://localhost").pathname) &&
+  /^\/cloudpilot_health_test_574(?:_[a-z0-9]+)?$/.test(new URL(process.env.DATABASE_URL ?? "http://localhost").pathname) &&
   process.env.CLOUDPILOT_RECOVERY_TEST_REDIS === process.env.REDIS_URL &&
   !!process.env.CLOUDPILOT_RECOVERY_TEST_REDIS;
 

@@ -11,12 +11,14 @@ import { errorMiddleware } from "./middlewares/error.middleware.js";
 import { notFoundMiddleware } from "./middlewares/not-found.middleware.js";
 import { apiRateLimiter } from "./middlewares/rate-limit.middleware.js";
 import { requestIdMiddleware } from "./middlewares/request-id.middleware.js";
+import { apiMetrics } from "./metrics/index.js";
 import { routes } from "./routes/index.js";
 import { ApiError } from "./utils/api-error.js";
 
 export function createApp(): express.Express {
   const app = express();
   app.disable("x-powered-by");
+  if (apiMetrics) app.use(apiMetrics.requests);
 
   app.use(requestIdMiddleware);
   app.use(

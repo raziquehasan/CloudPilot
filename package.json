@@ -8,7 +8,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run db:build && npm run queue:build && npm run worker:build && npm run build -w @cloudpilot/api && npm run build -w web",
+    "build": "npm run db:build && npm run queue:build && npm run metrics:build && npm run worker:build && npm run build -w @cloudpilot/api && npm run build -w web",
     "infra:up": "docker compose up -d",
     "infra:down": "docker compose down",
     "infra:logs": "docker compose logs -f",
@@ -29,7 +29,8 @@
     "worker:dev": "npm run dev -w @cloudpilot/worker",
     "worker:build": "npm run build -w @cloudpilot/worker",
     "worker:start": "npm run start -w @cloudpilot/worker",
-    "worker:typecheck": "npm run typecheck -w @cloudpilot/worker"
+    "worker:typecheck": "npm run typecheck -w @cloudpilot/worker",
+    "metrics:build": "npm run build -w @cloudpilot/metrics"
   },
   "repository": {
     "type": "git",
