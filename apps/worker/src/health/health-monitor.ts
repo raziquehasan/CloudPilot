@@ -1,5 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 import type { HealthScope } from "@cloudpilot/database";
+import { computeBackoffMs, schedulingLagMs } from "./scheduler-diagnostics.js";
 
 export interface HealthMonitorOptions {
   enabled: boolean;
@@ -10,7 +11,7 @@ export interface HealthMonitorOptions {
   discover: (limit: number) => Promise<HealthScope[]>;
   check: (scope: HealthScope, signal: AbortSignal) => Promise<void>;
   retain?: () => Promise<number>;
-  emit: (event: "started" | "stopped" | "infrastructure_error" | "retained", details?: Record<string, number | string>) => void;
+  emit: (event: "started" | "stopped" | "infrastructure_error" | "retained" | "batch", details?: Record<string, number | string>) => void;
   pollMs?: number;
 }
 
@@ -33,6 +34,7 @@ export function startHealthMonitor(options: HealthMonitorOptions) {
     try {
       while (!signal.aborted) {
         let operation = "schema readiness";
+        const batchStart = performance.now();
         try {
           if (!await options.ready()) throw new Error("Health persistence is unavailable");
           if (signal.aborted) break;
@@ -52,13 +54,32 @@ export function startHealthMonitor(options: HealthMonitorOptions) {
             if (deleted > 0) options.emit("retained", { deleted });
           }
           failures = 0;
+          if (!signal.aborted) options.emit("batch", {
+            dueCount: scopes.length,
+            batchDurationMs: Math.round(performance.now() - batchStart),
+          });
         } catch {
           if (signal.aborted) break;
           failures = Math.min(failures + 1, 10);
-          options.emit("infrastructure_error", { operation, consecutiveFailures: failures });
+          const backoffMs = computeBackoffMs(pollMs, failures);
+          options.emit("infrastructure_error", { operation, consecutiveFailures: failures, backoffMs });
+          if (!signal.aborted) {
+            const waitStart = performance.now();
+            await delay(backoffMs, undefined, { signal }).catch((error: unknown) => {
+              if (!signal.aborted) throw error;
+            });
+            if (!signal.aborted) options.emit("batch", {
+              dueCount: 0,
+              batchDurationMs: Math.round(performance.now() - batchStart),
+              consecutiveFailures: failures,
+              backoffMs,
+              schedulingLagMs: Math.round(schedulingLagMs(performance.now() - waitStart, backoffMs)),
+            });
+            continue;
+          }
         }
         if (!signal.aborted) {
-          await delay(Math.min(30_000, pollMs * 2 ** failures), undefined, { signal }).catch((error: unknown) => {
+          await delay(pollMs, undefined, { signal }).catch((error: unknown) => {
             if (!signal.aborted) throw error;
           });
         }

@@ -93,6 +93,7 @@ export function startDeploymentHealthMonitor(inspect: HealthInspector, signal: A
     emit(event, detail) {
       const data = { ownerId, deploymentId, event, ...detail };
       if (event === "infrastructure_error") workerLogger.warn(data, "Deployment health monitor infrastructure error");
+      else if (event === "batch") workerLogger.debug(data, "Deployment health monitor batch");
       else workerLogger.info(data, "Deployment health monitor");
     },
   });

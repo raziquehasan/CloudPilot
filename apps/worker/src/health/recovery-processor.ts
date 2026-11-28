@@ -29,6 +29,20 @@ function scopeOf(job: RuntimeJob) {
   };
 }
 
+// Test-only crash hook (Phase 5.7.9). Strictly triple-gated so it can
+// never fire outside an explicit test run: NODE_ENV must be "test",
+// the test flag must be set, and the stage must match a known boundary.
+// It terminates the process abruptly (no finally) to emulate a worker
+// crash at a specific recovery boundary.
+function maybeCrash(stage: "after-claim" | "after-intent" | "after-restart" | "after-finish") {
+  if (process.env.NODE_ENV !== "test") return;
+  if (process.env.CLOUDPILOT_RECOVERY_CRASH_TEST !== "1") return;
+  if (process.env.CLOUDPILOT_RECOVERY_CRASH_AFTER === stage) {
+    workerLogger.warn({ stage }, "Simulated worker crash (test only)");
+    process.exit(1);
+  }
+}
+
 function runtimeTarget(runtime: Awaited<ReturnType<typeof currentRecoveryRuntime>>, buildId?: string): HealthRuntime | null {
   if (!workerEnv.RUNTIME_TRUSTED_LOCAL_ONLY || !isRecoveryRuntimeEligible(runtime) ||
       (buildId && runtime.buildId !== buildId)) return null;
@@ -231,14 +245,17 @@ export async function processRecoveryJob(jobId: string | undefined, job: Runtime
     }
     if (claimed.kind !== "claimed") break;
     const { claim } = claimed;
+    maybeCrash("after-claim");
     try {
       const result = await verifyRecoveryRestart({
         scope: claim.scope, runtime: claim.runtime, executor, signal, sourceEpoch: claim.sourceEpoch,
         timeoutMs: Math.min(15_000, workerEnv.RUNTIME_STOP_TIMEOUT_MS),
-        markIntent: (epoch) => markRestart(claim, epoch, signal),
+        markIntent: async (epoch) => { const ok = await markRestart(claim, epoch, signal); if (ok) maybeCrash("after-intent"); return ok; },
       });
+      maybeCrash("after-restart");
       if (workerSignal.aborted) throw new Error("Recovery interrupted");
       const settled = await finishRecovery(claim, result);
+      maybeCrash("after-finish");
       if (!settled) return { status: "skipped" as const };
       workerLogger.info({ recoveryId: claim.attemptId, deploymentId: job.deploymentId, failureReason: settled.failureReason },
         "Manual recovery settled");
