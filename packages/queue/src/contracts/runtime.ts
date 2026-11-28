@@ -343,6 +343,22 @@ export const runtimeJobActions = Object.freeze([
 export type RuntimeJobAction =
   (typeof runtimeJobActions)[number];
 
+/**
+ * Recovery trigger recorded on a `recover` job.
+ *
+ * `MANUAL` is the default and preserves the existing operator-driven
+ * recovery behavior. `AUTOMATIC` marks a recovery reserved by the
+ * automatic-recovery scheduler (Phase 5.8.3); the processor enforces
+ * the corresponding feature flag independently at execution time.
+ */
+export const recoveryJobTriggers = Object.freeze([
+  "MANUAL",
+  "AUTOMATIC",
+] as const);
+
+export type RecoveryJobTrigger =
+  (typeof recoveryJobTriggers)[number];
+
 export const runtimeJobSchema = z
   .object({
     kind: z.literal("runtime"),
@@ -365,6 +381,16 @@ export const runtimeJobSchema = z
     action: z
       .enum(runtimeJobActions)
       .default("deploy"),
+
+    /**
+     * Recovery trigger for `recover` jobs. Defaults to `MANUAL` so
+     * existing payloads remain valid and behavior is unchanged.
+     * `AUTOMATIC` is set only by the automatic-recovery scheduler and
+     * is independently gated by AUTO_RECOVERY_ENABLED at execution.
+     */
+    recoveryTrigger: z
+      .enum(recoveryJobTriggers)
+      .default("MANUAL"),
 
     /**
      * Optional explicit host port for trusted local deployments.

@@ -64,7 +64,7 @@ async function withFixture(run: (f: { scope: RecoveryScope; actorId: string; run
 }
 
 function jobFor(f: { scope: RecoveryScope; buildId: string; runtimeId: string }, id: string): RuntimeJob {
-  return { ...f.scope, kind: "runtime", action: "recover", correlationId: id, buildId: f.buildId, runtimeInstanceId: f.runtimeId };
+  return { ...f.scope, kind: "runtime", action: "recover", recoveryTrigger: "MANUAL", correlationId: id, buildId: f.buildId, runtimeInstanceId: f.runtimeId };
 }
 
 function parentExecutor(port: number) {

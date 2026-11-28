@@ -89,7 +89,7 @@ async function fixture(run: (f: {
 }
 
 function jobFor(f: { scope: RecoveryScope; runtimeId: string; buildId: string }, id: string): RuntimeJob {
-  return { ...f.scope, kind: "runtime", action: "recover", correlationId: id, buildId: f.buildId, runtimeInstanceId: f.runtimeId };
+  return { ...f.scope, kind: "runtime", action: "recover", recoveryTrigger: "MANUAL", correlationId: id, buildId: f.buildId, runtimeInstanceId: f.runtimeId };
 }
 
 const runJob = (job: RuntimeJob, executor: DockerRuntimeExecutor, signal = new AbortController().signal) =>

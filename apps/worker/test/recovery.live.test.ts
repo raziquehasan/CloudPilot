@@ -199,7 +199,8 @@ test("real Docker manual recovery", { timeout: 240000 }, async () => {
     const job = {
       ...scope,
       kind: "runtime" as const,
-      action: "recover" as const,
+action: "recover" as const,
+      recoveryTrigger: "MANUAL" as const,
       correlationId: recoveryId,
       buildId: build.id,
       runtimeInstanceId: runtimeId

@@ -322,6 +322,7 @@ export class DeploymentOutboxPublisher {
       runtimeInstanceId: event.id,
       buildId: build.id,
       action: "deploy",
+      recoveryTrigger: "MANUAL",
       requestedHostPort,
       correlationId: event.id,
     };

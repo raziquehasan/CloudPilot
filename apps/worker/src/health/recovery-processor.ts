@@ -76,7 +76,7 @@ async function claimRecovery(job: RuntimeJob, ownerId: string): Promise<ClaimRes
   return prisma.$transaction(async (tx): Promise<ClaimResult> => {
     if (!await lockRecoveryRuntime(tx, scope)) return { kind: "done" };
     const attempt = await tx.deploymentRecoveryAttempt.findFirst({
-      where: { ...scope, id: job.correlationId, trigger: "MANUAL", action: "RESTART" },
+      where: { ...scope, id: job.correlationId, trigger: job.recoveryTrigger, action: "RESTART" },
     });
     if (!attempt || (attempt.status !== "REQUESTED" && attempt.status !== "RUNNING")) return { kind: "done" };
     const now = await recoveryNow(tx);
@@ -227,10 +227,52 @@ async function releaseRecoveryForRetry(claim: Claim) {
   });
 }
 
+/**
+ * Conservatively close a not-yet-started AUTOMATIC reservation when
+ * automatic recovery has been disabled before execution. A restart
+ * that was already issued (RUNNING or intent persisted) is never
+ * cancelled here; the caller reconciles its outcome instead.
+ * Returns true when the attempt was cancelled (caller skips).
+ */
+async function cancelUnstartedAutomatic(job: RuntimeJob): Promise<boolean> {
+  const scope = scopeOf(job);
+  return prisma.$transaction(async (tx) => {
+    if (!await lockRecoveryRuntime(tx, scope)) return false;
+    const attempt = await tx.deploymentRecoveryAttempt.findFirst({
+      where: { ...scope, id: job.correlationId, trigger: "AUTOMATIC", action: "RESTART" },
+    });
+    if (!attempt) return true;
+    if (attempt.status === "RUNNING" || attempt.restartIssuedAt) return false;
+    if (attempt.status !== "REQUESTED") return true;
+    const now = await recoveryNow(tx);
+    await tx.deploymentRecoveryAttempt.updateMany({
+      where: { id: attempt.id, ...scope, status: "REQUESTED" },
+      data: { ...cleared, status: "CANCELLED", failureReason: "RECOVERY_STALE", finishedAt: now },
+    });
+    if (attempt.healthVersion !== null) {
+      await tx.deploymentHealthState.updateMany({
+        where: { ...scope, runtimeInstanceId: attempt.runtimeInstanceId, generation: attempt.generation, version: attempt.healthVersion, status: "RECOVERING" },
+        data: { ...cleared, version: { increment: 1 }, status: "UNHEALTHY", lastFailureReason: "RECOVERY_STALE", nextCheckAt: new Date(now.getTime() + healthDefaults.checkIntervalMs) },
+      });
+    }
+    await audit(tx, scope, attempt.id, "FAILED", "RECOVERY_STALE");
+    return true;
+  });
+}
+
 export async function processRecoveryJob(jobId: string | undefined, job: RuntimeJob, executor: RuntimeExecutor, workerSignal: AbortSignal) {
   if (jobId !== `recovery-${job.correlationId}` ||
     !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(job.correlationId)) return { status: "skipped" as const };
-  if (!workerEnv.MANUAL_RECOVERY_ENABLED || !workerEnv.RUNTIME_ENABLED || !await recoverySchemaReady(prisma)) {
+  const trigger = job.recoveryTrigger;
+  const schemaReady = await recoverySchemaReady(prisma);
+  if (trigger === "AUTOMATIC") {
+    if (!workerEnv.RUNTIME_ENABLED || !schemaReady) throw new TransientJobError("Automatic recovery is unavailable");
+    if (!workerEnv.AUTO_RECOVERY_ENABLED) {
+      // Disabled before execution: cancel unstarted reservations, but
+      // still reconcile a restart that was already issued.
+      if (await cancelUnstartedAutomatic(job)) return { status: "skipped" as const };
+    }
+  } else if (!workerEnv.MANUAL_RECOVERY_ENABLED || !workerEnv.RUNTIME_ENABLED || !schemaReady) {
     throw new TransientJobError("Manual recovery is unavailable");
   }
   const ownerId = randomUUID();
@@ -257,8 +299,8 @@ export async function processRecoveryJob(jobId: string | undefined, job: Runtime
       const settled = await finishRecovery(claim, result);
       maybeCrash("after-finish");
       if (!settled) return { status: "skipped" as const };
-      workerLogger.info({ recoveryId: claim.attemptId, deploymentId: job.deploymentId, failureReason: settled.failureReason },
-        "Manual recovery settled");
+      workerLogger.info({ recoveryId: claim.attemptId, deploymentId: job.deploymentId, trigger, failureReason: settled.failureReason },
+        `${trigger === "AUTOMATIC" ? "Automatic" : "Manual"} recovery settled`);
       return { status: settled.status === "SUCCEEDED" ? "succeeded" as const : "failed" as const };
     } catch {
       await releaseRecoveryForRetry(claim).catch(() => {});

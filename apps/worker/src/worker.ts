@@ -51,6 +51,7 @@ import {
 
 import { runLogRetention } from "./logging/retention.js";
 import { startDeploymentHealthMonitor } from "./health/health-monitor-runtime.js";
+import type { RecoveryJobQueue } from "./health/auto-recovery-publisher.js";
 
 // ==================================================
 // Constants
@@ -1785,8 +1786,14 @@ async function start(): Promise<void> {
   }
 
   if (runtimeExecutor && workerEnv.HEALTH_MONITORING_ENABLED) {
+    const recoveryQueue: RecoveryJobQueue | null = runtimeQueueManager
+      ? {
+          getJob: (id) => runtimeQueueManager.getQueue("runtime").getJob(id).then((job) => job ?? null),
+          add: (name, payload, opts) => runtimeQueueManager.getQueue("runtime").add(name, payload, opts),
+        }
+      : null;
     healthMonitor = startDeploymentHealthMonitor(
-      runtimeExecutor.inspectOwnedContainer.bind(runtimeExecutor), shutdownController.signal,
+      runtimeExecutor.inspectOwnedContainer.bind(runtimeExecutor), shutdownController.signal, undefined, recoveryQueue,
     );
   }
 

@@ -88,7 +88,7 @@ async function withFixture(run: (f: Fixture) => Promise<void>) {
 }
 
 function jobFor(f: Fixture, id: string): RuntimeJob {
-  return { ...f.scope, kind: "runtime", action: "recover", correlationId: id, buildId: f.buildId, runtimeInstanceId: f.runtimeId };
+  return { ...f.scope, kind: "runtime", action: "recover", recoveryTrigger: "MANUAL", correlationId: id, buildId: f.buildId, runtimeInstanceId: f.runtimeId };
 }
 
 // Postgres interruption runs first, while the pool is fresh.

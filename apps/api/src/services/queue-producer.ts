@@ -58,6 +58,7 @@ export async function enqueueRuntimeLifecycleJob(input: {
     runtimeInstanceId: input.runtimeInstanceId,
     buildId: input.buildId,
     action: input.action,
+    recoveryTrigger: "MANUAL",
     correlationId: input.jobId,
   };
   await queueManager.addJob("runtime", payload, QueueManager.validateJobId(input.jobId));
@@ -67,12 +68,12 @@ export async function disconnectQueueProducer(): Promise<void> {
   await queueManager.close();
 }
 
-export async function enqueueRecoveryJob(input: Omit<RuntimeJob, "kind" | "action" | "correlationId">, recoveryId: string) {
+export async function enqueueRecoveryJob(input: Omit<RuntimeJob, "kind" | "action" | "correlationId" | "recoveryTrigger">, recoveryId: string, trigger: "MANUAL" | "AUTOMATIC" = "MANUAL") {
   const jobId = QueueManager.validateJobId(`recovery-${recoveryId}`);
   const queue = queueManager.getQueue("runtime");
   const existing = await queue.getJob(jobId);
   if (!existing) {
-    await queueManager.addJob("runtime", { ...input, kind: "runtime", action: "recover", correlationId: recoveryId }, jobId);
+    await queueManager.addJob("runtime", { ...input, kind: "runtime", action: "recover", recoveryTrigger: trigger, correlationId: recoveryId }, jobId);
   } else if (await existing.getState() === "failed") {
     try {
       await existing.retry("failed", { resetAttemptsMade: true, resetAttemptsStarted: true });

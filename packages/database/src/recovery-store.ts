@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Prisma, type PrismaClient } from "./generated/prisma/client.js";
 import type { HealthScope } from "./health-ownership.js";
 
@@ -5,6 +6,26 @@ export const recoveryPolicy = Object.freeze({ windowMs: 15 * 60_000, limit: 3, c
 export type RecoveryScope = Pick<HealthScope, "workspaceId" | "projectId" | "deploymentId">;
 export type RecoveryRuntimeScope = RecoveryScope & { runtimeInstanceId: string };
 type Transaction = Prisma.TransactionClient;
+
+/**
+ * Deterministic, idempotent recovery key for automatic recovery.
+ *
+ * Derived from the runtime identity, health generation and health
+ * version (the eligibility epoch). The same unhealthy generation
+ * always maps to the same key, so duplicate scheduler evaluations
+ * and concurrent workers cannot create duplicate reservations. A
+ * successful or failed recovery advances the health version (and a
+ * success advances the generation), so a legitimate future recovery
+ * is never permanently blocked.
+ */
+export function automaticRecoveryKey(runtimeInstanceId: string, generation: number, healthVersion: number): string {
+  const digest = createHash("sha256")
+    .update(`cloudpilot:auto-recovery:${runtimeInstanceId}:${generation}:${healthVersion}`)
+    .digest("hex");
+  // Format the first 128 bits as a canonical UUID (version 4, RFC 4122).
+  const hex = digest.slice(0, 32);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
 
 export function recoveryRuntimeWhere(scope: RecoveryRuntimeScope) {
   const { workspaceId, projectId, deploymentId, runtimeInstanceId } = scope;
@@ -76,13 +97,53 @@ export async function recoverySchemaReady(db: Pick<PrismaClient, "$queryRaw">): 
 export async function reserveManualRecovery(
   db: PrismaClient, scope: RecoveryScope, actorId: string, idempotencyKey: string,
 ): Promise<ReserveResult> {
-  const replay = (tx: Transaction) => tx.deploymentRecoveryAttempt.findFirst({
-    where: { ...scope, idempotencyKey }, select: dispatchSelect,
+  return reserveRecovery(db, scope, { trigger: "MANUAL", actorId, idempotencyKey });
+}
+
+/**
+ * Atomically reserve an AUTOMATIC recovery for a discovered candidate.
+ *
+ * Revalidates every safety condition inside the reservation
+ * transaction (PostgreSQL time, runtime + health locks, ownership,
+ * generation, fresh unhealthy observation, shared budget, cooldown,
+ * active/conflicting operations). The idempotency key is derived
+ * deterministically from the eligibility epoch so duplicate
+ * evaluation or concurrent workers cannot double-schedule, while a
+ * later generation/version still permits a legitimate retry.
+ *
+ * This only persists a REQUESTED attempt; it never enqueues a job or
+ * touches Docker. Publication is handled separately and must be
+ * reconciled from this durable record.
+ */
+export async function reserveAutomaticRecovery(
+  db: PrismaClient, scope: RecoveryScope, runtimeInstanceId: string,
+): Promise<ReserveResult> {
+  return reserveRecovery(db, scope, { trigger: "AUTOMATIC", actorId: null, idempotencyKey: "", expectedRuntimeId: runtimeInstanceId });
+}
+
+type ReserveOptions = {
+  trigger: "MANUAL" | "AUTOMATIC";
+  actorId: string | null;
+  idempotencyKey: string;
+  expectedRuntimeId?: string;
+};
+
+async function reserveRecovery(
+  db: PrismaClient, scope: RecoveryScope, options: ReserveOptions,
+): Promise<ReserveResult> {
+  const { trigger } = options;
+  // Manual uses a client-provided key for replay; automatic derives the
+  // key from the eligibility epoch inside the transaction.
+  const replayByKey = (tx: Transaction, key: string) => tx.deploymentRecoveryAttempt.findFirst({
+    where: { ...scope, idempotencyKey: key }, select: dispatchSelect,
   });
+  let derivedKey: string | undefined;
   try {
     return await db.$transaction(async (tx): Promise<ReserveResult> => {
-      const existing = await replay(tx);
-      if (existing) return { kind: "replay", attempt: existing };
+      if (trigger === "MANUAL") {
+        const existing = await replayByKey(tx, options.idempotencyKey);
+        if (existing) return { kind: "replay", attempt: existing };
+      }
       const candidate = await currentRecoveryRuntime(tx, scope);
       if (!candidate) {
         const deployment = await tx.deployment.findFirst({
@@ -90,10 +151,13 @@ export async function reserveManualRecovery(
         });
         return { kind: deployment ? "ineligible" : "not_found" };
       }
+      if (options.expectedRuntimeId && candidate.id !== options.expectedRuntimeId) return { kind: "ineligible" };
       const runtimeScope = { ...scope, runtimeInstanceId: candidate.id };
       if (!await lockRecoveryRuntime(tx, runtimeScope)) return { kind: "ineligible" };
-      const repeated = await replay(tx);
-      if (repeated) return { kind: "replay", attempt: repeated };
+      if (trigger === "MANUAL") {
+        const repeated = await replayByKey(tx, options.idempotencyKey);
+        if (repeated) return { kind: "replay", attempt: repeated };
+      }
       const runtime = await currentRecoveryRuntime(tx, scope);
       if (!isRecoveryRuntimeEligible(runtime) || runtime.id !== candidate.id) return { kind: "ineligible" };
 
@@ -106,6 +170,20 @@ export async function reserveManualRecovery(
         where: runtimeScope, orderBy: { generation: "desc" },
       });
       if (!health || health.status !== "UNHEALTHY" || !health.nextCheckAt) return { kind: "ineligible" };
+      // Automatic recovery requires a fresh unhealthy observation so a
+      // stale, lagging health state can never authorize a restart.
+      if (trigger === "AUTOMATIC" &&
+        (!health.lastCheckedAt || now.getTime() - health.lastCheckedAt.getTime() > 30_000)) {
+        return { kind: "ineligible" };
+      }
+      const idempotencyKey = trigger === "AUTOMATIC"
+        ? automaticRecoveryKey(runtime.id, health.generation, health.version)
+        : options.idempotencyKey;
+      if (trigger === "AUTOMATIC") {
+        derivedKey = idempotencyKey;
+        const derived = await replayByKey(tx, idempotencyKey);
+        if (derived) return { kind: "replay", attempt: derived };
+      }
       const healthKey = { ...runtimeScope, generation: health.generation, version: health.version };
       const recent = await tx.deploymentRecoveryAttempt.findMany({
         where: { ...scope, createdAt: { gt: new Date(now.getTime() - recoveryPolicy.windowMs) } },
@@ -131,19 +209,20 @@ export async function reserveManualRecovery(
       const attempt = await tx.deploymentRecoveryAttempt.create({
         data: {
           ...runtimeScope, generation: health.generation, healthVersion: health.version + 1,
-          action: "RESTART", trigger: "MANUAL", idempotencyKey, createdAt: now,
+          action: "RESTART", trigger, idempotencyKey, createdAt: now,
         },
         select: dispatchSelect,
       });
       await tx.auditLog.create({ data: {
-        workspaceId: scope.workspaceId, actorId, entityType: "Deployment", entityId: scope.deploymentId,
-        action: "DEPLOYMENT_RECOVERY_REQUESTED", metadata: { recoveryId: attempt.id, runtimeInstanceId: runtime.id },
+        workspaceId: scope.workspaceId, actorId: options.actorId, entityType: "Deployment", entityId: scope.deploymentId,
+        action: "DEPLOYMENT_RECOVERY_REQUESTED", metadata: { recoveryId: attempt.id, runtimeInstanceId: runtime.id, trigger },
       } });
       return { kind: "reserved", attempt };
     });
   } catch (error) {
     if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== "P2002") throw error;
-    const attempt = await replay(db);
+    const key = trigger === "AUTOMATIC" ? derivedKey : options.idempotencyKey;
+    const attempt = key ? await replayByKey(db, key) : null;
     return attempt ? { kind: "replay", attempt } : { kind: "busy" };
   }
 }
