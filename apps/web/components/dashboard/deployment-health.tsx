@@ -12,8 +12,9 @@ import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, Di
 import { Skeleton } from "@/components/ui/skeleton";
 import { ApiError, apiFetch } from "@/lib/api";
 import {
-  checkOutcome, failureMessage, formatHealthTime, formatRecoveryDuration, isRecoveryActive,
-  recoveryBlockMessage, recoverySubmissionError, type DeploymentHealth, type HealthCheck, type Recovery,
+  checkOutcome, failureMessage, formatChartTooltipTime, formatHealthTime, formatRecoveryDuration,
+  isRecoveryActive, monitoringMessage, recoveryBlockMessage, recoverySubmissionError,
+  type DeploymentHealth, type HealthCheck, type Recovery,
 } from "./deployment-health-data";
 
 const statusColors = {
@@ -103,7 +104,7 @@ function LatencyChart({ checks }: { checks: HealthCheck[] }) {
             <CartesianGrid vertical={false} />
             <XAxis dataKey="time" tick={{ fill: "var(--muted-foreground)" }} tickFormatter={shortTime} minTickGap={32} tickLine={false} axisLine={false} />
             <YAxis unit=" ms" width={56} tick={{ fill: "var(--muted-foreground)" }} tickLine={false} axisLine={false} allowDecimals={false} />
-            <ChartTooltip content={<ChartTooltipContent labelFormatter={(time) => formatHealthTime(Number(time))} />} />
+            <ChartTooltip content={<ChartTooltipContent labelFormatter={(_, items) => formatChartTooltipTime(items)} />} />
             <Line type="linear" dataKey="passed" stroke="var(--color-passed)" strokeWidth={2} dot={{ r: 2 }} connectNulls={false} isAnimationActive={false} />
             <Line dataKey="failed" stroke="none" dot={{ r: 4, fill: "var(--color-failed)" }} connectNulls={false} isAnimationActive={false} />
           </LineChart>
@@ -298,6 +299,8 @@ export default function DeploymentHealthPanel({ workspaceId, projectId, deployme
   const state = summary?.state;
   const checks = summary?.checks ?? [];
   const latestCheck = state ? checks.find((check) => check.generation === state.generation) : undefined;
+  const lastChecked = state?.lastCheckedAt ? Date.parse(state.lastCheckedAt) : NaN;
+  const healthStale = Number.isFinite(lastChecked) && health.dataUpdatedAt - lastChecked > 300_000;
   const blockedReason = !roleAllowsRecovery ? recoveryBlockMessage("FORBIDDEN") :
     active && (!retryable || recoveryRunning) ? recoveryBlockMessage("ACTIVE") :
       recoveries.isError && capabilities?.allowed ? "Recovery history could not be verified." :
@@ -349,7 +352,8 @@ export default function DeploymentHealthPanel({ workspaceId, projectId, deployme
                 <Metric name="Health generation">{state?.generation ?? "Unavailable"}</Metric>
               </dl>
               {state?.lastFailureReason && <div className="rounded-md border p-3"><p className="mb-1 text-xs text-muted-foreground">Latest failure</p><Failure code={state.lastFailureReason} /></div>}
-              <p className="text-xs text-muted-foreground">The backend does not report whether monitoring is enabled.</p>
+              <p className="text-xs text-muted-foreground">{monitoringMessage(summary?.monitoring)}</p>
+              {healthStale && <p role="status" className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-800 dark:text-amber-300">The most recent health check is older than expected. Monitoring may be delayed or stale.</p>}
             </>}
             {blockedReason && <p className="border-t pt-3 text-sm text-muted-foreground">{blockedReason}</p>}
           </>}

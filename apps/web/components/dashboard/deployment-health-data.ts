@@ -16,9 +16,21 @@ export type HealthCheck = {
   checkedAt: string;
 };
 
-type RecoveryBlock =
+export type RecoveryBlock =
   | "FORBIDDEN" | "DISABLED" | "SCHEMA_UNAVAILABLE" | "RUNTIME_NOT_RUNNING"
   | "NOT_UNHEALTHY" | "ACTIVE" | "COOLDOWN" | "EXHAUSTED";
+
+export type MonitoringStatus =
+  | "ENABLED" | "DISABLED" | "UNAVAILABLE" | "STALE" | "UNKNOWN";
+
+export type MonitoringReport = {
+  status: MonitoringStatus;
+  workerCount: number;
+  reportingCount: number;
+  availableCount: number;
+  enabledCount: number;
+  lastHeartbeatAt: string | null;
+};
 
 export type DeploymentHealth = {
   schemaAvailable: boolean;
@@ -33,6 +45,7 @@ export type DeploymentHealth = {
     lastFailureReason: string | null;
   } | null;
   checks: HealthCheck[];
+  monitoring: MonitoringReport | null;
   recovery: { allowed: boolean; reason: RecoveryBlock | null };
 };
 
@@ -104,6 +117,38 @@ const displayTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", ti
 export function formatHealthTime(value: string | number | null | undefined) {
   const time = typeof value === "number" ? value : value ? Date.parse(value) : NaN;
   return Number.isFinite(time) ? displayTime.format(time) : "Unavailable";
+}
+
+/**
+ * Format the latency chart tooltip label from a recharts
+ * payload row. The chart's x-axis value is a numeric
+ * timestamp, but recharts passes the series config label
+ * (e.g. "Passed") to labelFormatter, which previously
+ * produced a misleading "Unavailable" header. Reading the
+ * timestamp from the payload row restores the correct time
+ * whenever valid health-check data exists.
+ */
+export function formatChartTooltipTime(
+  payload: ReadonlyArray<{ payload?: { time?: unknown } }> | undefined,
+): string {
+  const time = payload?.[0]?.payload?.time;
+  return typeof time === "number" ? formatHealthTime(time) : "Unavailable";
+}
+
+export function monitoringMessage(report: MonitoringReport | null | undefined) {
+  switch (report?.status) {
+    case "ENABLED":
+      return "Health monitoring is active on a connected worker.";
+    case "DISABLED":
+      return "A connected worker is not performing health monitoring (monitoring is disabled).";
+    case "STALE":
+      return "Health monitoring may be stale: no connected worker has a recent heartbeat.";
+    case "UNKNOWN":
+      return "Health monitoring status is unknown: the connected worker does not report monitoring capability.";
+    case "UNAVAILABLE":
+    default:
+      return "Health monitoring availability could not be confirmed from worker heartbeats.";
+  }
 }
 
 export function formatRecoveryDuration(start: string | null, finish: string | null) {

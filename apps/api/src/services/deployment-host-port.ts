@@ -29,6 +29,13 @@ export interface FixedPortAuthorizationInput {
  * fixed port is returned unchanged so an occupied port
  * fails authoritatively downstream instead of silently
  * falling back to dynamic allocation.
+ *
+ * The accepted range mirrors the API validator and the
+ * worker's `assertValidRequestedHostPort`: `0` or an
+ * integer in the non-privileged range 1024–65535.
+ * Privileged (1–1023), out-of-range, fractional and
+ * non-number values normalize to `0` (dynamic) so an
+ * invalid port can never be forwarded to the worker.
  */
 export function normalizeRequestedHostPort(snapshot: unknown): number {
   if (typeof snapshot !== "object" || snapshot === null) {
@@ -41,8 +48,10 @@ export function normalizeRequestedHostPort(snapshot: unknown): number {
   if (
     typeof value === "number" &&
     Number.isInteger(value) &&
-    value >= 0 &&
-    value <= REQUESTED_HOST_PORT_MAX
+    (
+      value === 0 ||
+      (value >= REQUESTED_HOST_PORT_MIN && value <= REQUESTED_HOST_PORT_MAX)
+    )
   ) {
     return value;
   }

@@ -11,6 +11,7 @@ import { env } from "../config/env.js";
 import { logger } from "../config/logger.js";
 import { deploymentOutboxRuntime } from "./deployment-outbox-runtime.js";
 import { queueEnv, queueManager, redisProducerConnection } from "./queue-producer.js";
+import { deriveMonitoringReport } from "./monitoring-observability.js";
 
 function workerSummary(workers: WorkerHeartbeat[]) {
   const availableWorkers = workers.filter((worker) => worker.available && !worker.draining);
@@ -149,6 +150,12 @@ export async function getDeploymentReadiness(workspaceId: string, projectId: str
   );
   const deploymentWorker = workerSummary(deploymentWorkers);
   const diagnosticWorker = workerSummary(diagnosticWorkers);
+  const monitoring = deriveMonitoringReport({
+    workers: deploymentWorkers,
+    now: Date.now(),
+    staleAfterMs: queueEnv.WORKER_HEARTBEAT_TTL_SECONDS * 1000,
+    reachable: redis.healthy,
+  });
   const outboxRuntime = deploymentOutboxRuntime.getStatus();
   const outboxPublisherAvailable = outboxRuntime.running
     && Boolean(outboxRuntime.lastSuccessfulRunAt)
@@ -181,6 +188,7 @@ export async function getDeploymentReadiness(workspaceId: string, projectId: str
       diagnostic: diagnosticWorker,
       deployment: deploymentWorker,
     },
+    monitoring,
     repository: { connected: repositoryConnected, trusted: repositoryTrusted },
     commitResolution: { available: repositoryConnected && sourceRetrievalAvailable },
     sourceRetrieval: {

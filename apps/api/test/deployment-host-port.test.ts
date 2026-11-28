@@ -192,6 +192,29 @@ test("absent or invalid snapshot yields dynamic (0)", () => {
   );
 });
 
+test("privileged and out-of-range snapshot ports normalize to dynamic (0)", () => {
+  // Consistency with the API validator and worker
+  // assertValidRequestedHostPort: privileged (1-1023),
+  // negative, fractional and >65535 must never be
+  // forwarded to the worker.
+  for (const value of [1, 80, 1_023, -1, 3.5, 65_536, 70_000]) {
+    assert.equal(
+      normalizeRequestedHostPort({ requestedHostPort: value }),
+      0,
+      `expected ${String(value)} to normalize to 0`,
+    );
+  }
+  // Lower/upper non-privileged bounds are preserved.
+  assert.equal(
+    normalizeRequestedHostPort({ requestedHostPort: 1_024 }),
+    1_024,
+  );
+  assert.equal(
+    normalizeRequestedHostPort({ requestedHostPort: 65_535 }),
+    65_535,
+  );
+});
+
 // ==================================================
 // Idempotency conflict for different ports
 // ==================================================

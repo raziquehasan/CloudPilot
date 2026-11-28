@@ -1123,6 +1123,21 @@ async function publishHeartbeat(
   const isDeploymentWorker =
     role === "deployment";
 
+  // Effective health-monitoring state: the worker only
+  // reports monitoring as active when the feature is fully
+  // configured (monitoring + persistence + runtime + trusted
+  // local) and the monitor has actually started. This is the
+  // worker's own authoritative report; readers must not infer
+  // availability from API environment variables or scheduled
+  // check timestamps.
+  const healthMonitoring =
+    isDeploymentWorker &&
+    workerEnv.HEALTH_MONITORING_ENABLED &&
+    workerEnv.HEALTH_PERSISTENCE_ENABLED &&
+    workerEnv.RUNTIME_ENABLED &&
+    workerEnv.RUNTIME_TRUSTED_LOCAL_ONLY &&
+    healthMonitor !== null;
+
   try {
     await publishWorkerHeartbeat(
       workerConnection,
@@ -1168,6 +1183,9 @@ async function publishHeartbeat(
           containerRuntime:
             isDeploymentWorker &&
             isRuntimeAvailable(),
+
+          // Phase 5.7.8 health-monitoring observability.
+          healthMonitoring,
         },
 
         startupAt,

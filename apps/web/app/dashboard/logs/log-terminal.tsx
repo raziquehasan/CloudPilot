@@ -958,10 +958,6 @@ function ScopedLogTerminal({
       generation === generationRef.current &&
       !accessDeniedRef.current;
 
-    setConnection("connecting");
-
-    setError("");
-
     // ==================================================
     // Fetch bounded retained history
     // ==================================================
@@ -1282,6 +1278,14 @@ function ScopedLogTerminal({
     // ==================================================
 
     async function initialize() {
+      if (!isCurrent()) {
+        return;
+      }
+
+      setConnection("connecting");
+
+      setError("");
+
       const loaded = await loadHistory(true);
 
       if (!isCurrent()) {

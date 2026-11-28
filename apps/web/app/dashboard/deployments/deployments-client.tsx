@@ -2349,6 +2349,11 @@ function WorkspaceDeployments({
 
     generationRef.current += 1;
 
+    const actionControllers =
+      actionControllersRef.current;
+
+    const actionLocks = actionLocksRef.current;
+
     const timer = window.setTimeout(
       () => {
         void load();
@@ -2372,13 +2377,13 @@ function WorkspaceDeployments({
       requestRef.current = null;
 
       for (const controller of
-        actionControllersRef.current.values()) {
+        actionControllers.values()) {
         controller.abort();
       }
 
-      actionControllersRef.current.clear();
+      actionControllers.clear();
 
-      actionLocksRef.current.clear();
+      actionLocks.clear();
 
       pendingRef.current = {};
 

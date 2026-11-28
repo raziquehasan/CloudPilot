@@ -93,6 +93,12 @@ const workerCapabilitiesSchema = z
     containerExecution: z.boolean(),
 
     containerRuntime: z.boolean(),
+
+    // Phase 5.7.8 reports whether this worker is actively
+    // performing deployment health monitoring. Optional for
+    // backward compatibility with older workers that do not
+    // report it; absence is treated as "unknown" by readers.
+    healthMonitoring: z.boolean().optional(),
   })
   .strict();
 
