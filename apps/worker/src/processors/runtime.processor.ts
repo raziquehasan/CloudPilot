@@ -47,6 +47,7 @@ import {
   assertLoopbackBind,
   assertValidContainerPort,
   assertValidImageId,
+  assertValidRequestedHostPort,
   assertValidResourceLimits,
   generateNetworkName,
 } from "../runtime/runtime-config.js";
@@ -931,7 +932,7 @@ export async function processRuntimeJob(
 
     const deployment = await prisma.deployment.findFirst({
       where: deploymentScope(runtimeScope(payload)),
-      select: { environment: true },
+      select: { environment: true, project: { select: { repository: { select: { fullName: true } } } } },
     });
 
     if (!deployment) {
@@ -940,6 +941,22 @@ export async function processRuntimeJob(
         "Deployment is unavailable.",
       );
     }
+
+    // Explicit host ports are honored only for authorized trusted
+    // local deployments. Dynamic allocation (0) remains the default
+    // and preserves existing behavior for every other deployment.
+    assertValidRequestedHostPort(payload.requestedHostPort ?? 0);
+    const trustedRepositories = workerEnv.BUILD_TRUSTED_REPOSITORIES.map(
+      (name) => name.trim().toLowerCase(),
+    );
+    const repositoryName = deployment.project.repository?.fullName?.toLowerCase();
+    const trustedLocal =
+      workerEnv.RUNTIME_TRUSTED_LOCAL_ONLY &&
+      !!repositoryName &&
+      trustedRepositories.includes(repositoryName);
+    const requestedHostPort = trustedLocal
+      ? payload.requestedHostPort ?? 0
+      : 0;
 
     stage = "runtime environment resolution";
     let env: Record<string, string> = {};
@@ -1026,7 +1043,7 @@ export async function processRuntimeJob(
         }),
         networkName,
         containerPort,
-        hostPort: 0,
+        hostPort: requestedHostPort,
         bindHost: workerEnv.RUNTIME_BIND_HOST,
         env,
         cpuLimit: workerEnv.RUNTIME_CPU_LIMIT,

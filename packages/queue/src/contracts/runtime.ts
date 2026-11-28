@@ -366,6 +366,22 @@ export const runtimeJobSchema = z
       .enum(runtimeJobActions)
       .default("deploy"),
 
+    /**
+     * Optional explicit host port for trusted local deployments.
+     *
+     * Zero (default) requests dynamic allocation and preserves
+     * existing behavior. A non-zero value is honored only for
+     * authorized trusted local deployments and must survive the
+     * worker-side validation and Docker bind (which is
+     * authoritative on allocation races).
+     */
+    requestedHostPort: z
+      .number()
+      .int()
+      .min(0)
+      .max(65_535)
+      .optional(),
+
     correlationId: identifierSchema,
   })
   .strict();

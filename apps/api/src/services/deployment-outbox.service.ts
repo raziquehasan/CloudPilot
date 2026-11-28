@@ -292,6 +292,31 @@ export class DeploymentOutboxPublisher {
       throw new Error("Runtime deployment has no verified build");
     }
 
+    // An explicit host port may be recorded on the deployment's
+    // build configuration snapshot for authorized trusted local
+    // deployments. It is optional; absence preserves dynamic
+    // allocation. The worker re-validates and enforces trust.
+    const deployment = await this.database.deployment.findFirst({
+      where: {
+        workspaceId: event.workspaceId,
+        projectId: event.projectId,
+        id: event.deploymentId,
+      },
+      select: { buildConfigurationSnapshot: true },
+    });
+    const snapshot = deployment?.buildConfigurationSnapshot as
+      | { requestedHostPort?: unknown }
+      | null
+      | undefined;
+    const rawPort = snapshot?.requestedHostPort;
+    const requestedHostPort =
+      typeof rawPort === "number" &&
+      Number.isInteger(rawPort) &&
+      rawPort >= 0 &&
+      rawPort <= 65_535
+        ? rawPort
+        : 0;
+
     const payload: RuntimeJob = {
       kind: "runtime",
       workspaceId: event.workspaceId,
@@ -300,6 +325,7 @@ export class DeploymentOutboxPublisher {
       runtimeInstanceId: event.id,
       buildId: build.id,
       action: "deploy",
+      requestedHostPort,
       correlationId: event.id,
     };
 

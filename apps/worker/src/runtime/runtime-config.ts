@@ -378,3 +378,31 @@ export function assertLoopbackBind(
     );
   }
 }
+
+/**
+ * Validate an explicitly requested host port.
+ *
+ * Zero requests dynamic allocation and is always allowed to
+ * preserve existing behavior. A non-zero value must be an
+ * integer in the non-privileged range; privileged ports are
+ * rejected because the managed runtime runs as an unprivileged
+ * user and must never silently gain elevated privileges.
+ *
+ * This is a configuration check only. The Docker bind remains
+ * authoritative when an allocation race makes the port busy.
+ */
+export function assertValidRequestedHostPort(
+  value: unknown,
+): asserts value is number {
+  if (typeof value !== "number" || !Number.isInteger(value)) {
+    throw invalidConfiguration(
+      "The requested host port is invalid.",
+    );
+  }
+  if (value === 0) return;
+  if (value < 1_024 || value > 65_535) {
+    throw invalidConfiguration(
+      "The requested host port must be in the non-privileged range.",
+    );
+  }
+}
