@@ -50,3 +50,20 @@ See the [Phase 5.9.1 validation report](../../docs/phase-5.9.1-prometheus-setup.
 Phase 5.9.2 adds an optional Compose overlay. Leave the base stack on self-scrape until both dedicated metrics listeners are enabled and verified. The overlay adds authenticated targets for host.docker.internal:9464 and :9465 without changing the monitoring project or data volume.
 
 Both application processes default to metrics disabled. When approval is granted, use one randomly generated bearer token stored outside the repository. Start the API and worker with METRICS_ENABLED=true and METRICS_TOKEN_FILE pointing to the private file. Pass the same path as CLOUDPILOT_METRICS_TOKEN_FILE in the Compose shell. See the [Phase 5.9.2 activation and rollback runbook](../../docs/phase-5.9.2-application-queue-metrics.md).
+
+## Container and infrastructure metrics
+
+Phase 5.9.3 adds an optional infrastructure overlay (`docker-compose.infrastructure.yml`) that mounts `prometheus/infrastructure-targets.yml` and a read-only bearer-token secret, adding three authenticated jobs: `cloudpilot-containers` (host.docker.internal:9470), `cloudpilot-postgres` (:9471) and `cloudpilot-redis` (:9472). It coexists with the application overlay and preserves the base self-scrape, retention and data volume.
+
+The targets are served by the host-run `@cloudpilot/infra-metrics` collector (loopback-only, bearer-authenticated). It reads managed containers through the existing Docker Desktop engine with fixed read-only GETs (no socket mounted into any container), and PostgreSQL/Redis through dedicated least-privilege identities. Configure it with private `CLOUDPILOT_INFRA_CONFIG` (JSON inventory + backend credentials) and `CLOUDPILOT_INFRA_TOKEN_FILE` files, then pass the token path as `CLOUDPILOT_INFRA_TOKEN_FILE` in the Compose shell. Apply all three overlays together:
+
+```powershell
+$base = 'infrastructure/monitoring/docker-compose.yml'
+$app  = 'infrastructure/monitoring/docker-compose.metrics.yml'
+$infra = 'infrastructure/monitoring/docker-compose.infrastructure.yml'
+docker compose -f $base -f $app -f $infra config --quiet
+docker compose -f $base -f $app -f $infra run --rm --no-deps --entrypoint /bin/promtool prometheus check config /etc/prometheus/prometheus.yml
+docker compose -f $base -f $app -f $infra up -d --wait --wait-timeout 90 prometheus
+```
+
+Rollback removes only the infrastructure overlay: `docker compose -f $base -f $app up -d --force-recreate --wait prometheus` (retains the application overlay and the TSDB volume). Do not use `down --volumes` on the primary project. See the [Phase 5.9.3 infrastructure metrics report](../../docs/phase-5.9.3-infrastructure-metrics.md) for the security model, metric inventory, PromQL and activation/rollback procedure. Primary activation requires explicit approval.

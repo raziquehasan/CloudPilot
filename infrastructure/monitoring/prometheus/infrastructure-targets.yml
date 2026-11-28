@@ -1,0 +1,18 @@
+scrape_configs:
+  - job_name: cloudpilot-containers
+    authorization:
+      credentials_file: /run/secrets/cloudpilot_infra_scrape_token
+    static_configs:
+      - targets: ["host.docker.internal:9470"]
+
+  - job_name: cloudpilot-postgres
+    authorization:
+      credentials_file: /run/secrets/cloudpilot_infra_scrape_token
+    static_configs:
+      - targets: ["host.docker.internal:9471"]
+
+  - job_name: cloudpilot-redis
+    authorization:
+      credentials_file: /run/secrets/cloudpilot_infra_scrape_token
+    static_configs:
+      - targets: ["host.docker.internal:9472"]

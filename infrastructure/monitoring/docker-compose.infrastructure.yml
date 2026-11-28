@@ -1,0 +1,10 @@
+services:
+  prometheus:
+    volumes:
+      - ./prometheus/infrastructure-targets.yml:/etc/prometheus/optional/infrastructure-targets.yml:ro
+    secrets:
+      - cloudpilot_infra_scrape_token
+
+secrets:
+  cloudpilot_infra_scrape_token:
+    file: ${CLOUDPILOT_INFRA_TOKEN_FILE:?Set CLOUDPILOT_INFRA_TOKEN_FILE to the private infrastructure scrape token}

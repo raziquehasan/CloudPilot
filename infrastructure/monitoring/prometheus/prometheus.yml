@@ -16,3 +16,4 @@ scrape_configs:
 
 scrape_config_files:
   - /etc/prometheus/optional/application-targets.yml
+  - /etc/prometheus/optional/infrastructure-targets.yml

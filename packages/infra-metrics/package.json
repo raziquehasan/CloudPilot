@@ -1,0 +1,16 @@
+{
+  "name": "@cloudpilot/infra-metrics",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test test/collectors.test.mjs"
+  },
+  "dependencies": {
+    "@cloudpilot/metrics": "*",
+    "@cloudpilot/queue": "*",
+    "ioredis": "6.1.0",
+    "pg": "8.23.1"
+  }
+}
