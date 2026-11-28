@@ -5,6 +5,7 @@ import { workerLogger } from "../config/logger.js";
 import { startHealthMonitor } from "./health-monitor.js";
 import type { HealthInspector } from "./probe-runtime.js";
 import { healthPersistenceReady, runRuntimeHealthCheck } from "./runtime-health.js";
+import { discoverAutoRecoveryCandidates, evaluateCandidateRows } from "./auto-recovery-candidates.js";
 
 export async function discoverDueHealthChecks(limit: number, deploymentId?: string): Promise<HealthScope[]> {
   if (!Number.isInteger(limit) || limit < 1 || limit > 128) throw new RangeError("Invalid health batch size");
@@ -69,6 +70,23 @@ export function startDeploymentHealthMonitor(inspect: HealthInspector, signal: A
     ready: healthPersistenceReady,
     discover: (limit) => discoverDueHealthChecks(limit, deploymentId),
     ...(deploymentId ? {} : { retain: pruneHealthHistory }),
+    async afterBatch() {
+      // Automatic recovery is disabled by default; skip discovery
+      // entirely (no DB query) when the flag is off.
+      if (!workerEnv.AUTO_RECOVERY_ENABLED) return;
+      const started = performance.now();
+      const rows = await discoverAutoRecoveryCandidates(workerEnv.HEALTH_MONITORING_BATCH_SIZE);
+      const { batch } = evaluateCandidateRows(rows);
+      workerLogger.info({
+        ownerId,
+        event: "auto_recovery",
+        evaluated: batch.evaluated,
+        eligible: batch.eligible,
+        rejected: batch.rejected,
+        reasons: Object.entries(batch.reasons).map(([k, v]) => `${k}:${v}`).join(","),
+        durationMs: Math.round(performance.now() - started),
+      }, "Automatic recovery candidate evaluation");
+    },
     async check(scope, checkSignal) {
       let dockerError = false;
       await runRuntimeHealthCheck(scope, ownerId, inspect, {

@@ -11,7 +11,9 @@ export interface HealthMonitorOptions {
   discover: (limit: number) => Promise<HealthScope[]>;
   check: (scope: HealthScope, signal: AbortSignal) => Promise<void>;
   retain?: () => Promise<number>;
-  emit: (event: "started" | "stopped" | "infrastructure_error" | "retained" | "batch", details?: Record<string, number | string>) => void;
+  // Optional read-only hook run after a successful batch (Phase 5.8.2).
+  afterBatch?: () => Promise<void>;
+  emit: (event: "started" | "stopped" | "infrastructure_error" | "retained" | "batch" | "auto_recovery", details?: Record<string, number | string>) => void;
   pollMs?: number;
 }
 
@@ -58,6 +60,14 @@ export function startHealthMonitor(options: HealthMonitorOptions) {
             dueCount: scopes.length,
             batchDurationMs: Math.round(performance.now() - batchStart),
           });
+          // Read-only automatic-recovery evaluation after persistence.
+          if (options.afterBatch && !signal.aborted) {
+            try {
+              await options.afterBatch();
+            } catch {
+              options.emit("auto_recovery", { error: 1 });
+            }
+          }
         } catch {
           if (signal.aborted) break;
           failures = Math.min(failures + 1, 10);
