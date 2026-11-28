@@ -99,6 +99,12 @@ const workerCapabilitiesSchema = z
     // backward compatibility with older workers that do not
     // report it; absence is treated as "unknown" by readers.
     healthMonitoring: z.boolean().optional(),
+    automaticRecovery: z.object({
+      configured: z.boolean(),
+      available: z.boolean(),
+      trustedRepositories: z.array(z.string()),
+      heartbeatIntervalMs: z.number().int().positive().optional(),
+    }).optional(),
   })
   .strict();
 
@@ -637,6 +643,7 @@ export async function listWorkerHeartbeats(
   options: WorkerRegistryOptions,
 
   role: WorkerHeartbeat["role"],
+  { cleanupExpired = true } = {},
 ): Promise<WorkerHeartbeat[]> {
   validateOptions(options);
 
@@ -782,13 +789,7 @@ export async function listWorkerHeartbeats(
         );
       }
 
-      await cleanupExpiredHeartbeats(
-        connection,
-
-        indexKey,
-
-        expired,
-      );
+      if (cleanupExpired) await cleanupExpiredHeartbeats(connection, indexKey, expired);
     }
   } while (cursor !== "0");
 

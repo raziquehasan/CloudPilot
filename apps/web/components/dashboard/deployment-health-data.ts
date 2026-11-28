@@ -32,6 +32,22 @@ export type MonitoringReport = {
   lastHeartbeatAt: string | null;
 };
 
+export type AutomaticRecovery = {
+  configured: boolean;
+  workerAvailability: "DISABLED" | "AVAILABLE" | "UNAVAILABLE" | "STALE" | "UNKNOWN" | "CONFLICTING";
+  circuitState: "CLOSED" | "OPEN" | "HALF_OPEN" | null;
+  eligible: boolean;
+  rejectionReason: string | null;
+  remainingBudget: number | null;
+  maxBudget: number | null;
+  consecutiveFailures: number | null;
+  cooldownRemainingMs: number | null;
+  nextEligibleAt: string | null;
+  manualInterventionRequired: boolean | null;
+  latestOutcome: Pick<Recovery, "status" | "trigger" | "failureReason" | "finishedAt"> | null;
+  snapshotAt: string | null;
+};
+
 export type DeploymentHealth = {
   schemaAvailable: boolean;
   runtimeStatus: string | null;
@@ -46,6 +62,7 @@ export type DeploymentHealth = {
   } | null;
   checks: HealthCheck[];
   monitoring: MonitoringReport | null;
+  automaticRecovery?: AutomaticRecovery;
   recovery: { allowed: boolean; reason: RecoveryBlock | null };
 };
 
@@ -178,4 +195,52 @@ export function recoverySubmissionError(error: unknown) {
     return { ambiguous: true, message: "The request outcome is unknown. Retry the pending request to reuse its idempotency key." };
   }
   return { ambiguous: false, message: "Recovery could not be requested. Refresh this deployment and try again." };
+}
+
+
+export const automaticWorkerLabels: Record<AutomaticRecovery["workerAvailability"], string> = {
+  AVAILABLE: "Available",
+  DISABLED: "Disabled",
+  UNAVAILABLE: "Unavailable",
+  STALE: "Stale heartbeat",
+  UNKNOWN: "Capability unknown",
+  CONFLICTING: "Conflicting worker capabilities",
+};
+
+const automaticRejections: Record<string, string> = {
+  AUTO_DISABLED: "Automatic recovery is disabled.",
+  WORKER_UNAVAILABLE: "No available worker confirms automatic recovery.",
+  WORKER_STALE: "Automatic recovery worker heartbeats are stale.",
+  WORKER_UNKNOWN: "The workers have not reported their automatic recovery capability.",
+  WORKER_CONFLICTING: "Workers report different automatic recovery capabilities.",
+  SCHEMA_UNAVAILABLE: "The recovery schema is unavailable.",
+  CIRCUIT_UNAVAILABLE: "The recovery circuit could not be read.",
+  INFRASTRUCTURE_UNAVAILABLE: "Recovery infrastructure is unavailable.",
+  DEPLOYMENT_NOT_RUNNING: "The deployment is not running.",
+  RUNTIME_NOT_RUNNING: "No running runtime is available to recover.",
+  RUNTIME_MISSING: "This deployment has no runtime.",
+  RUNTIME_INELIGIBLE: "The runtime is ineligible for trusted local recovery.",
+  HEALTH_NOT_UNHEALTHY: "Recovery requires an unhealthy runtime.",
+  HEALTH_UNAVAILABLE: "No current runtime health observation is available.",
+  HEALTH_STATE_MISSING: "No current runtime health observation is available.",
+  INSUFFICIENT_FAILURES: "Too few consecutive health checks have failed.",
+  STALE_HEALTH: "The latest health check is stale.",
+  ACTIVE_RECOVERY: "A recovery attempt is already active.",
+  CONFLICTING_OPERATION: "The runtime is busy with another operation.",
+  RESTART_UNCERTAIN: "A prior restart could not be verified.",
+  CIRCUIT_OPEN: "The circuit is open and automatic recovery is blocked.",
+  HALF_OPEN_IN_PROGRESS: "A half-open recovery trial is already active.",
+  LEGACY_TRIAL_UNCLASSIFIED: "A prior recovery trial could not be classified.",
+  BUDGET_EXHAUSTED: "The shared restart budget is exhausted.",
+  COOLDOWN: "The shared recovery cooldown is active.",
+};
+
+export function automaticRejectionMessage(reason: string | null) {
+  return reason && Object.hasOwn(automaticRejections, reason)
+    ? automaticRejections[reason]
+    : "Automatic recovery eligibility could not be confirmed.";
+}
+
+export function recoveryCooldownSeconds(remainingMs: number | null, elapsedMs: number) {
+  return remainingMs === null ? null : Math.max(0, Math.ceil((remainingMs - Math.max(0, elapsedMs)) / 1000));
 }

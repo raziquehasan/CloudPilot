@@ -1,58 +1,36 @@
-// ==================================================
-// Monitoring observability (Phase 5.7.8)
-// ==================================================
-//
-// Reads live worker heartbeats and derives an accurate
-// health-monitoring availability report. The pure
-// derivation lives in monitoring-report.ts so it can be
-// unit tested without side effects.
-// ==================================================
-
-import {
-  listWorkerHeartbeats,
-  type WorkerHeartbeat,
-} from "@cloudpilot/queue";
-
+import { listWorkerHeartbeats } from "@cloudpilot/queue";
 import { queueEnv, redisProducerConnection } from "./queue-producer.js";
-import {
-  deriveMonitoringReport,
-  type MonitoringReport,
-} from "./monitoring-report.js";
+import type { DeriveMonitoringInput } from "./monitoring-report.js";
 
-export type { MonitoringReport, MonitoringStatus } from "./monitoring-report.js";
-export { deriveMonitoringReport } from "./monitoring-report.js";
-
-/**
- * Read the current monitoring report from live worker
- * heartbeats. Never throws: an unreachable Redis or a
- * registry error yields an UNAVAILABLE report.
- */
-export async function readMonitoringReport(): Promise<MonitoringReport> {
+async function fetchHeartbeats(): Promise<DeriveMonitoringInput> {
   const staleAfterMs = queueEnv.WORKER_HEARTBEAT_TTL_SECONDS * 1000;
-
-  let workers: WorkerHeartbeat[] = [];
-
-  let reachable = false;
-
   try {
-    workers = await listWorkerHeartbeats(
-      redisProducerConnection,
-      {
-        prefix: queueEnv.QUEUE_PREFIX,
-        ttlSeconds: queueEnv.WORKER_HEARTBEAT_TTL_SECONDS,
-      },
-      "deployment",
-    );
-
-    reachable = true;
+    const workers = await listWorkerHeartbeats(redisProducerConnection, {
+      prefix: queueEnv.QUEUE_PREFIX,
+      ttlSeconds: queueEnv.WORKER_HEARTBEAT_TTL_SECONDS,
+    }, "deployment", { cleanupExpired: false });
+    return { workers, now: Date.now(), staleAfterMs, reachable: true };
   } catch {
-    reachable = false;
+    return { workers: [], now: Date.now(), staleAfterMs, reachable: false };
   }
-
-  return deriveMonitoringReport({
-    workers,
-    now: Date.now(),
-    staleAfterMs,
-    reachable,
-  });
 }
+
+let pending: Promise<DeriveMonitoringInput> | undefined;
+
+export async function readMonitoringHeartbeats(): Promise<DeriveMonitoringInput> {
+  if (!pending) pending = fetchHeartbeats().finally(() => { pending = undefined; });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      pending,
+      new Promise<DeriveMonitoringInput>((resolve) => {
+        timer = setTimeout(() => resolve({
+          workers: [], now: Date.now(), staleAfterMs: 0, reachable: false,
+        }), 1500);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+export { deriveMonitoringReport } from "./monitoring-report.js";

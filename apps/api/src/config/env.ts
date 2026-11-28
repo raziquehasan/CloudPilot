@@ -617,6 +617,7 @@ const envSchema = z.object({
   // ------------------------------------------------
 
   MANUAL_RECOVERY_ENABLED: booleanEnv(false),
+  AUTO_RECOVERY_ENABLED: booleanEnv(false),
   DEPLOYMENT_LOGS_ENABLED:
     booleanEnv(false),
 

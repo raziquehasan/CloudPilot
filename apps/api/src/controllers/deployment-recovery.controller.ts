@@ -9,7 +9,9 @@ import { requireAuth, requireCsrf } from "../middlewares/auth.middleware.js";
 import { enqueueRecoveryJob } from "../services/queue-producer.js";
 import { deploymentIdSchema } from "../validators/deployment.validator.js";
 import { canManage, resolveProject, sendError } from "./project-build-configuration.controller.js";
-import { readMonitoringReport } from "../services/monitoring-observability.js";
+import { readMonitoringHeartbeats } from "../services/monitoring-observability.js";
+import { deriveMonitoringReport } from "../services/monitoring-report.js";
+import { readAutomaticRecoverySnapshot } from "../services/automatic-recovery-snapshot.js";
 
 function recoveryResponse<T extends { failureReason: string | null }>(attempt: T) {
   return { ...attempt, failureMessage: attempt.failureReason === "RECOVERY_PORT_CHANGED"
@@ -153,10 +155,15 @@ async function readDeploymentHealth(req: Request, res: Response) {
     ]) : [null, []];
 
     const reason = await recoveryAvailability();
-    const monitoring = await readMonitoringReport();
+    const workers = await readMonitoringHeartbeats();
+    const monitoring = deriveMonitoringReport(workers);
+    const automaticRecovery = await readAutomaticRecoverySnapshot(
+      prisma, scope, env.AUTO_RECOVERY_ENABLED, workers,
+      runtime?.deployment.project.repository?.fullName ?? null, schemaAvailable,
+    );
     res.json({
       success: true,
-      data: { schemaAvailable, runtimeStatus, state, checks, monitoring, recovery: { allowed: reason === null, reason } },
+      data: { schemaAvailable, runtimeStatus, state, checks, monitoring, automaticRecovery, recovery: { allowed: reason === null, reason } },
     });
 
     async function recoveryAvailability() {

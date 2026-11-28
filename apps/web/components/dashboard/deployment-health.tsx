@@ -1,8 +1,8 @@
 "use client";
 
-import { useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Activity, ChevronRight, RefreshCw, RotateCcw } from "lucide-react";
+import { Activity, ChevronRight, Info, RefreshCw, RotateCcw, ShieldCheck } from "lucide-react";
 import { CartesianGrid, Line, LineChart, XAxis, YAxis } from "recharts";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -10,11 +10,12 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart";
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { ApiError, apiFetch } from "@/lib/api";
 import {
-  checkOutcome, failureMessage, formatChartTooltipTime, formatHealthTime, formatRecoveryDuration,
-  isRecoveryActive, monitoringMessage, recoveryBlockMessage, recoverySubmissionError,
-  type DeploymentHealth, type HealthCheck, type Recovery,
+  automaticRejectionMessage, automaticWorkerLabels, checkOutcome, failureMessage, formatChartTooltipTime, formatHealthTime, formatRecoveryDuration,
+  isRecoveryActive, monitoringMessage, recoveryBlockMessage, recoveryCooldownSeconds, recoverySubmissionError,
+  type AutomaticRecovery, type DeploymentHealth, type HealthCheck, type Recovery,
 } from "./deployment-health-data";
 
 const statusColors = {
@@ -27,10 +28,10 @@ const statusColors = {
 
 function Status({ value }: { value: string }) {
   let tone: keyof typeof statusColors = "neutral";
-  if (["HEALTHY", "SUCCEEDED", "PASSED"].includes(value)) tone = "good";
-  if (["UNHEALTHY", "FAILED"].includes(value)) tone = "bad";
-  if (value === "DEGRADED") tone = "warning";
-  if (["RECOVERING", "REQUESTED", "RUNNING", "STARTING"].includes(value)) tone = "active";
+  if (["HEALTHY", "SUCCEEDED", "PASSED", "CLOSED"].includes(value)) tone = "good";
+  if (["UNHEALTHY", "FAILED", "OPEN"].includes(value)) tone = "bad";
+  if (["DEGRADED", "HALF_OPEN"].includes(value)) tone = "warning";
+  if (["RECOVERING", "REQUESTED", "RUNNING", "STARTING", "AVAILABLE"].includes(value)) tone = "active";
   return <Badge variant="outline" className={`capitalize ${statusColors[tone]}`}>{value.toLowerCase().replaceAll("_", " ")}</Badge>;
 }
 
@@ -70,6 +71,55 @@ function LoadingRows({ label }: { label: string }) {
     <Skeleton className="h-7 w-full" />
     <Skeleton className="h-7 w-3/4" />
   </div>;
+}
+
+function AutomaticRecoveryDetails({ report, applicationStatus, updatedAt, refreshFailed }: {
+  report: AutomaticRecovery; applicationStatus: string | undefined; updatedAt: number; refreshFailed: boolean;
+}) {
+  const [elapsed, setElapsed] = useState(() => Math.max(0, Date.now() - updatedAt));
+  const hasCooldown = (report.cooldownRemainingMs ?? 0) > 0;
+  useEffect(() => {
+    const elapsedAtMount = Math.max(0, Date.now() - updatedAt);
+    const started = performance.now();
+    const timer = window.setInterval(() => setElapsed(elapsedAtMount + performance.now() - started), hasCooldown ? 1000 : 5000);
+    return () => window.clearInterval(timer);
+  }, [hasCooldown, updatedAt]);
+
+  const cooldown = recoveryCooldownSeconds(report.cooldownRemainingMs, elapsed);
+  const stale = refreshFailed || elapsed > 75_000;
+  const outcome = report.latestOutcome;
+  return <>
+    {stale && <p role="status" className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-sm">
+      This recovery snapshot may be stale. Eligibility is awaiting a fresh response.
+    </p>}
+    <dl className="grid grid-cols-1 gap-x-4 gap-y-4 sm:grid-cols-2 xl:grid-cols-4">
+      <Metric name="Application health"><Status value={applicationStatus ?? "UNKNOWN"} /></Metric>
+      <Metric name="Automatic recovery configuration">{report.configured ? "Enabled" : "Disabled"}</Metric>
+      <Metric name="Worker availability"><Status value={automaticWorkerLabels[report.workerAvailability] ?? "Unavailable"} /></Metric>
+      <Metric name="Circuit breaker"><Status value={report.circuitState ?? "UNAVAILABLE"} /></Metric>
+      <Metric name="Restart budget">{report.remainingBudget == null || report.maxBudget == null
+        ? "Unavailable" : report.remainingBudget + " of " + report.maxBudget + " remaining"}</Metric>
+      <Metric name="Consecutive failed recoveries">{report.consecutiveFailures ?? "Unavailable"}</Metric>
+      <Metric name="Cooldown remaining">{cooldown == null || stale ? "Unavailable" : cooldown === 0 ? "None" : cooldown + " s"}</Metric>
+      <Metric name="Circuit next eligible time">{formatHealthTime(report.nextEligibleAt)}</Metric>
+      <Metric name="Manual intervention">{report.manualInterventionRequired == null ? "Unavailable" :
+        report.manualInterventionRequired ? "Required" : "Not required"}</Metric>
+      <div className="sm:col-span-2">
+        <Metric name="Eligibility">{stale ? "Awaiting refresh" : report.eligible ? "Eligible at snapshot" : automaticRejectionMessage(report.rejectionReason)}</Metric>
+      </div>
+      <div className="sm:col-span-2">
+        <Metric name="Latest recovery">
+          {outcome ? <span className="flex flex-wrap items-center gap-2">
+            <Status value={outcome.status} />
+            <span className="capitalize">{outcome.trigger.toLowerCase()}</span>
+            <span className="text-xs text-muted-foreground">{formatHealthTime(outcome.finishedAt)}</span>
+          </span> : report.circuitState ? "No completed recoveries" : "Unavailable"}
+        </Metric>
+        {outcome?.failureReason && <div className="mt-2"><Failure code={outcome.failureReason} /></div>}
+      </div>
+    </dl>
+    <p className="text-xs text-muted-foreground">Snapshot recorded {report.snapshotAt ? formatHealthTime(report.snapshotAt) : "at an unavailable time"}</p>
+  </>;
 }
 
 const chartConfig = {
@@ -159,6 +209,7 @@ function RecoveryFields({ attempt }: { attempt: Recovery }) {
     <Metric name="Trigger"><span className="capitalize">{attempt.trigger.toLowerCase()}</span></Metric>
     <Metric name="Action"><span className="capitalize">{attempt.action.toLowerCase()}</span></Metric>
     <Metric name="Generation">{attempt.generation}</Metric>
+    <Metric name="Execution attempts">{attempt.attemptCount}</Metric>
     <Metric name="Requested">{formatHealthTime(attempt.createdAt)}</Metric>
     <Metric name="Started">{formatHealthTime(attempt.startedAt)}</Metric>
     <Metric name="Finished">{formatHealthTime(attempt.finishedAt)}</Metric>
@@ -239,10 +290,20 @@ export default function DeploymentHealthPanel({ workspaceId, projectId, deployme
         if (isRecoveryActive(submitted)) return recentRecovery([submitted]) ? 5_000 : 30_000;
       }
       if (attempts.some(isRecoveryActive)) return recentRecovery(attempts) ? 5_000 : 30_000;
-      return health.data?.recovery.reason === "ACTIVE" ? 30_000 : false;
+      const automatic = health.data?.automaticRecovery;
+      return health.data?.recovery.reason === "ACTIVE" || automatic?.workerAvailability === "AVAILABLE" ||
+        automatic?.rejectionReason === "ACTIVE_RECOVERY" ? 30_000 : false;
     },
     refetchIntervalInBackground: false,
   });
+  const healthAccessDenied = scopedError(health.error);
+  const latestFinishedAt = healthAccessDenied ? undefined : health.data?.automaticRecovery?.latestOutcome?.finishedAt;
+  useEffect(() => {
+    if (latestFinishedAt) void queryClient.invalidateQueries({
+      queryKey: ["deployment-health", workspaceId, projectId, deploymentId, "recoveries"],
+    });
+  }, [queryClient, workspaceId, projectId, deploymentId, latestFinishedAt]);
+
   const listed = recoveries.data ?? [];
   const tracked = submitted ? listed.find((attempt) => attempt.id === submitted.id) ?? submitted : null;
   const active = listed.some(isRecoveryActive) || isRecoveryActive(tracked);
@@ -367,6 +428,35 @@ export default function DeploymentHealthPanel({ workspaceId, projectId, deployme
       </CardContent>
     </Card>
 
+    <Card className="min-w-0">
+      <CardHeader>
+        <CardTitle className="text-base">
+          <h2 className="flex items-center gap-2">
+            <ShieldCheck className="size-4 text-blue-600 dark:text-blue-400" aria-hidden="true" />
+            Automatic recovery
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button type="button" aria-label="About circuit breaker states" className="rounded p-1 text-muted-foreground focus-visible:outline-2">
+                  <Info className="size-4" aria-hidden="true" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent>Closed permits normal automatic evaluation. Open blocks automatic recovery. Half-open may permit one trial.</TooltipContent>
+            </Tooltip>
+          </h2>
+        </CardTitle>
+        <CardDescription>Current circuit state and shared restart limits for this deployment.</CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {health.isPending ? <LoadingRows label="Loading automatic recovery" /> :
+          summary?.automaticRecovery && !healthAccessDenied ? <AutomaticRecoveryDetails
+            key={health.dataUpdatedAt} report={summary.automaticRecovery} applicationStatus={state?.status}
+            updatedAt={health.dataUpdatedAt} refreshFailed={health.isError}
+          /> : <p className="rounded-md border border-dashed p-3 text-sm text-muted-foreground">
+            Automatic recovery data is unavailable.
+          </p>}
+      </CardContent>
+    </Card>
+
     {summary?.schemaAvailable && !health.isError && <>
       {checks.length > 0 && <LatencyChart checks={checks} />}
       <CheckHistory checks={checks} />
@@ -375,14 +465,18 @@ export default function DeploymentHealthPanel({ workspaceId, projectId, deployme
     <Card>
       <CardHeader><CardTitle><h2>Recovery history</h2></CardTitle><CardDescription>Recent recovery attempts for this deployment.</CardDescription></CardHeader>
       <CardContent className="space-y-3">
-        {recoveries.isPending ? <LoadingRows label="Loading recovery history" /> : recoveries.isError ?
+        {healthAccessDenied ? <p className="text-sm text-muted-foreground">Recovery history is unavailable in your current workspace.</p> :
+          recoveries.isPending ? <LoadingRows label="Loading recovery history" /> : recoveries.isError ?
           <QueryProblem message={capabilities?.reason === "SCHEMA_UNAVAILABLE" ? "Recovery history is unavailable until the recovery schema is ready." : "Recovery history could not be loaded."} retry={() => void recoveries.refetch()} /> :
           listed.length === 0 ? <p className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">No recovery attempts have been recorded.</p> :
             <ul className="divide-y rounded-lg border">
               {listed.map((attempt) => <li key={attempt.id} className="min-w-0 p-3 sm:p-4">
                 <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
                   <div className="min-w-0 space-y-1.5">
-                    <Status value={attempt.status} /><p className="break-all font-mono text-xs text-muted-foreground">{attempt.id}</p>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Status value={attempt.status} /><Status value={attempt.trigger} />
+                    </div>
+                    <p className="break-all font-mono text-xs text-muted-foreground">{attempt.id}</p>
                   </div>
                   <RecoveryDetails prefix={prefix} scope={scope} attempt={attempt} />
                 </div>

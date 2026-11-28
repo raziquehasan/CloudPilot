@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { randomBytes, randomUUID } from "node:crypto";
 import test from "node:test";
-import { prisma, recoveryPolicy } from "@cloudpilot/database";
+import { publishWorkerHeartbeat } from "@cloudpilot/queue";
+import { disconnectDatabase, prisma, recoveryPolicy } from "@cloudpilot/database";
 import { createApp } from "../src/app.ts";
 import { hashSecret } from "../src/services/session.service.ts";
-import { disconnectQueueProducer, queueManager } from "../src/services/queue-producer.ts";
+import { disconnectQueueProducer, queueEnv, queueManager, redisProducerConnection } from "../src/services/queue-producer.ts";
 
 const recoveryIntegration = process.env.MANUAL_RECOVERY_ENABLED === "true" &&
   /^\/cloudpilot_health_test_574$/.test(new URL(process.env.DATABASE_URL ?? "http://localhost").pathname) &&
@@ -268,7 +269,7 @@ test("deployment API enforces workspace, role, CSRF, worker readiness, and atomi
     if (createdUsers.length) {
       await prisma.user.deleteMany({ where: { id: { in: createdUsers } } });
     }
-    if (recoveryIntegration) await disconnectQueueProducer();
+
   }
 });
 
@@ -342,6 +343,14 @@ test("deployment health endpoint enforces access, scope, read-only behavior, and
     assert.equal(typeof memberBody.data.schemaAvailable, "boolean");
     assert.ok(Array.isArray(memberBody.data.checks));
     assert.equal(typeof memberBody.data.recovery.allowed, "boolean");
+
+    const missingRuntime = (memberBody.data as typeof memberBody.data & {
+      automaticRecovery: { configured: boolean; circuitState: string | null; consecutiveFailures: number | null; rejectionReason: string };
+    }).automaticRecovery;
+    assert.equal(missingRuntime.configured, false);
+    assert.equal(missingRuntime.circuitState, null);
+    assert.equal(missingRuntime.consecutiveFailures, null);
+    assert.equal(missingRuntime.rejectionReason, "RUNTIME_MISSING");
 
     // GET requests do not mutate database state.
     const before = {
@@ -432,6 +441,52 @@ test("deployment health endpoint enforces access, scope, read-only behavior, and
       assert.ok(currentBody.data.checks.every((check) => check.id !== previousCheck.id));
       assert.ok(currentBody.data.checks.every((check) => check.generation === 0));
 
+      const automaticSnapshot = async () => {
+        const response = await fetch(ownHealth, { headers: { Cookie: ownerSession.cookie } });
+        assert.equal(response.status, 200);
+        const body = await response.json() as { data: { automaticRecovery: {
+          configured: boolean; workerAvailability: string; circuitState: string | null; eligible: boolean;
+          rejectionReason: string | null; remainingBudget: number | null; maxBudget: number | null;
+          consecutiveFailures: number | null; cooldownRemainingMs: number | null; nextEligibleAt: string | null;
+          manualInterventionRequired: boolean | null; latestOutcome: { trigger: string } | null; snapshotAt: string;
+        } } };
+        return body.data.automaticRecovery;
+      };
+      const stamp = new Date().toISOString();
+      await publishWorkerHeartbeat(redisProducerConnection, {
+        prefix: queueEnv.QUEUE_PREFIX, ttlSeconds: queueEnv.WORKER_HEARTBEAT_TTL_SECONDS,
+      }, {
+        workerId: randomUUID(), role: "deployment", version: "0.1.0", available: true, draining: false,
+        concurrency: 1, startupAt: stamp, lastHeartbeatAt: stamp,
+        capabilities: {
+          diagnostic: false, deploymentQueue: true, sourceRetrieval: true, workspaceStorage: true,
+          dockerBuild: true, containerExecution: true, containerRuntime: true, healthMonitoring: true,
+          automaticRecovery: { configured: false, available: false, trustedRepositories: ["example/health-endpoint-test"] },
+        },
+      });
+      const baseline = await automaticSnapshot();
+      assert.equal(baseline.configured, false);
+      assert.equal(baseline.workerAvailability, "DISABLED");
+      assert.equal(baseline.eligible, false);
+      assert.equal(baseline.rejectionReason, "AUTO_DISABLED");
+      assert.equal(baseline.circuitState, "CLOSED");
+      assert.equal(baseline.remainingBudget, recoveryPolicy.limit);
+      assert.equal(baseline.maxBudget, recoveryPolicy.limit);
+
+      const admin = await prisma.user.create({ data: { email: `health-admin-${suffix}@example.invalid` } });
+      createdUsers.push(admin.id);
+      await prisma.workspaceMember.create({ data: { workspaceId: workspace.id, userId: admin.id, role: "ADMIN" } });
+      const adminSession = await createTestSession(admin.id, workspace.id);
+      const adminRead = await fetch(ownHealth, { headers: { Cookie: adminSession.cookie } });
+      const adminBody = await adminRead.json() as { data: { recovery: { allowed: boolean } } };
+      assert.equal(adminRead.status, 200);
+      assert.equal(adminBody.data.recovery.allowed, true);
+      const memberRuntimeRead = await fetch(ownHealth, { headers: { Cookie: memberSession.cookie } });
+      const memberRuntimeBody = await memberRuntimeRead.json() as { data: { recovery: { allowed: boolean; reason: string } } };
+      assert.equal(memberRuntimeRead.status, 200);
+      assert.equal(memberRuntimeBody.data.recovery.reason, "FORBIDDEN");
+      assert.equal(memberBody.data.recovery.allowed, false);
+
       // Active recovery is reflected in availability.
       await prisma.deploymentRecoveryAttempt.create({ data: {
         ...healthScope, action: "RESTART", trigger: "MANUAL", idempotencyKey: randomUUID(), status: "REQUESTED",
@@ -449,6 +504,14 @@ test("deployment health endpoint enforces access, scope, read-only behavior, and
       const cooldownBody = await (await fetch(ownHealth, { headers: { Cookie: ownerSession.cookie } })).json() as { data: { recovery: { reason: string | null } } };
       assert.equal(cooldownBody.data.recovery.reason, "COOLDOWN");
 
+      const cooling = await automaticSnapshot();
+      assert.equal(cooling.circuitState, "OPEN");
+      assert.equal(cooling.remainingBudget, recoveryPolicy.limit - 1);
+      assert.equal(cooling.consecutiveFailures, 1);
+      assert.equal(cooling.latestOutcome?.trigger, "MANUAL");
+      assert.ok(cooling.cooldownRemainingMs && cooling.cooldownRemainingMs <= recoveryPolicy.cooldownMs);
+      assert.equal(Date.parse(cooling.nextEligibleAt!), Date.parse(cooling.snapshotAt) + cooling.cooldownRemainingMs);
+
       // Exhausted budget is reflected once the window is full.
       await prisma.deploymentRecoveryAttempt.deleteMany({ where: { deploymentId: deployment.id } });
       await prisma.deploymentRecoveryAttempt.createMany({ data: Array.from({ length: recoveryPolicy.limit }, () => ({
@@ -458,6 +521,32 @@ test("deployment health endpoint enforces access, scope, read-only behavior, and
       })) });
       const exhaustedBody = await (await fetch(ownHealth, { headers: { Cookie: ownerSession.cookie } })).json() as { data: { recovery: { reason: string | null } } };
       assert.equal(exhaustedBody.data.recovery.reason, "EXHAUSTED");
+
+      assert.equal((await automaticSnapshot()).remainingBudget, 0);
+      await prisma.deploymentRecoveryAttempt.updateMany({
+        where: { deploymentId: deployment.id }, data: { createdAt: new Date(Date.now() - recoveryPolicy.windowMs - 5_000) },
+      });
+      const halfOpen = await automaticSnapshot();
+      assert.equal(halfOpen.circuitState, "HALF_OPEN");
+      assert.equal(halfOpen.consecutiveFailures, 3);
+      assert.equal(halfOpen.remainingBudget, recoveryPolicy.limit);
+
+      const authorization = await prisma.deploymentRecoveryAttempt.create({ data: {
+        ...healthScope, action: "RESTART", trigger: "AUTOMATIC", status: "REQUESTED", idempotencyKey: randomUUID(),
+      } });
+      await prisma.auditLog.create({ data: {
+        workspaceId: workspace.id, entityId: deployment.id, entityType: "Deployment", action: "DEPLOYMENT_RECOVERY_REQUESTED",
+        metadata: { recoveryId: authorization.id, automaticCircuitState: "HALF_OPEN" },
+      } });
+      const reserved = await automaticSnapshot();
+      assert.equal(reserved.circuitState, "HALF_OPEN");
+      assert.equal(reserved.nextEligibleAt, null);
+      const history = await fetch(ownHealth.replace(/\/health$/, "/recoveries"), { headers: { Cookie: memberSession.cookie } });
+      assert.equal(history.status, 200);
+      const historyBody = await history.json() as { data: Array<{ trigger: string; status: string }> };
+      assert.ok(historyBody.data.some(({ trigger, status }) => trigger === "AUTOMATIC" && status === "REQUESTED"));
+      assert.ok(historyBody.data.some(({ trigger, status }) => trigger === "MANUAL" && status === "FAILED"));
+      assert.equal(await queueManager.getQueue("runtime").getJob(`recovery-${authorization.id}`), undefined);
 
       // A healthy runtime is not eligible for recovery.
       await prisma.deploymentRecoveryAttempt.deleteMany({ where: { deploymentId: deployment.id } });
@@ -482,6 +571,11 @@ test("deployment health endpoint enforces access, scope, read-only behavior, and
     if (createdUsers.length) {
       await prisma.user.deleteMany({ where: { id: { in: createdUsers } } });
     }
-    if (recoveryIntegration) await disconnectQueueProducer();
+
   }
+});
+test.after(async () => {
+  await disconnectQueueProducer();
+  redisProducerConnection.disconnect();
+  await disconnectDatabase();
 });

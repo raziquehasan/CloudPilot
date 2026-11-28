@@ -3,7 +3,7 @@ import { Prisma, type PrismaClient } from "./generated/prisma/client.js";
 import type { HealthScope } from "./health-ownership.js";
 import { evaluateCircuit, type CircuitState } from "./auto-recovery-circuit.js";
 
-export const recoveryPolicy = Object.freeze({ windowMs: 15 * 60_000, limit: 3, cooldownMs: 15_000, leaseMs: 120_000 });
+export const recoveryPolicy = Object.freeze({ windowMs: 15 * 60_000, limit: 3, cooldownMs: 15_000, leaseMs: 120_000, automaticFreshnessMs: 30_000, automaticFailureThreshold: 3 });
 export type RecoveryScope = Pick<HealthScope, "workspaceId" | "projectId" | "deploymentId">;
 export type RecoveryRuntimeScope = RecoveryScope & { runtimeInstanceId: string };
 type Transaction = Prisma.TransactionClient;
@@ -276,8 +276,8 @@ async function reserveRecovery(
       // Automatic recovery requires a fresh unhealthy observation so a
       // stale, lagging health state can never authorize a restart.
       if (trigger === "AUTOMATIC" &&
-        (!health.lastCheckedAt || health.lastCheckedAt > now || now.getTime() - health.lastCheckedAt.getTime() > 30_000 ||
-          health.consecutiveFailures < 3)) {
+        (!health.lastCheckedAt || health.lastCheckedAt > now || now.getTime() - health.lastCheckedAt.getTime() > recoveryPolicy.automaticFreshnessMs ||
+          health.consecutiveFailures < recoveryPolicy.automaticFailureThreshold)) {
         return { kind: "ineligible" };
       }
       const idempotencyKey = trigger === "AUTOMATIC"

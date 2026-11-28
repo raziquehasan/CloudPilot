@@ -1187,6 +1187,15 @@ async function publishHeartbeat(
 
           // Phase 5.7.8 health-monitoring observability.
           healthMonitoring,
+          ...(isDeploymentWorker && {
+            automaticRecovery: {
+              configured: workerEnv.AUTO_RECOVERY_ENABLED,
+              available: workerEnv.AUTO_RECOVERY_ENABLED && healthMonitoring &&
+                isRuntimeAvailable() && runtimeQueueManager !== null && workerEnv.BUILD_TRUSTED_REPOSITORIES.length > 0,
+              trustedRepositories: workerEnv.BUILD_TRUSTED_REPOSITORIES.map((repository) => repository.trim().toLowerCase()),
+              heartbeatIntervalMs: workerEnv.WORKER_HEARTBEAT_INTERVAL_MS,
+            },
+          }),
         },
 
         startupAt,
