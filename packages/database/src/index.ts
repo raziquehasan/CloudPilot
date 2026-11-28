@@ -15,6 +15,7 @@ export type {
 } from "./generated/prisma/enums.js";
 export * from "./health-ownership.js";
 export * from "./recovery-store.js";
+export * from "./auto-recovery-circuit.js";
 
 config({ path: fileURLToPath(new URL("../../../.env", import.meta.url)) });
 

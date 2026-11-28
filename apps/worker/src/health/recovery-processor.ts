@@ -242,11 +242,11 @@ async function cancelUnstartedAutomatic(job: RuntimeJob): Promise<boolean> {
       where: { ...scope, id: job.correlationId, trigger: "AUTOMATIC", action: "RESTART" },
     });
     if (!attempt) return true;
-    if (attempt.status === "RUNNING" || attempt.restartIssuedAt) return false;
-    if (attempt.status !== "REQUESTED") return true;
+    if (attempt.restartIssuedAt) return false;
+    if (attempt.status !== "REQUESTED" && attempt.status !== "RUNNING") return true;
     const now = await recoveryNow(tx);
     await tx.deploymentRecoveryAttempt.updateMany({
-      where: { id: attempt.id, ...scope, status: "REQUESTED" },
+      where: { id: attempt.id, ...scope, status: attempt.status === "RUNNING" ? "RUNNING" : "REQUESTED" },
       data: { ...cleared, status: "CANCELLED", failureReason: "RECOVERY_STALE", finishedAt: now },
     });
     if (attempt.healthVersion !== null) {

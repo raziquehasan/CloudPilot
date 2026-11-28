@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { Prisma, type PrismaClient } from "./generated/prisma/client.js";
 import type { HealthScope } from "./health-ownership.js";
+import { evaluateCircuit, type CircuitState } from "./auto-recovery-circuit.js";
 
 export const recoveryPolicy = Object.freeze({ windowMs: 15 * 60_000, limit: 3, cooldownMs: 15_000, leaseMs: 120_000 });
 export type RecoveryScope = Pick<HealthScope, "workspaceId" | "projectId" | "deploymentId">;
@@ -80,6 +81,57 @@ type ReserveResult =
   | { kind: "not_found" | "ineligible" | "busy" | "exhausted" | "cooldown" };
 
 const active = ["REQUESTED", "RUNNING"] as const;
+const circuitFailureThreshold = 3;
+
+async function readCircuitHistory(tx: Transaction, scope: RecoveryScope) {
+  const [history] = await tx.$queryRaw<Array<{
+    consecutiveFailures: number;
+    restartUncertain: boolean;
+    failedHalfOpenTrial: boolean;
+    legacyTrialUnclassified: boolean;
+  }>>`
+    WITH verified AS (
+      SELECT max("finishedAt") AS recovered_at
+      FROM "deployment_recovery_attempts"
+      WHERE "workspaceId" = ${scope.workspaceId}::uuid AND "projectId" = ${scope.projectId}::uuid
+        AND "deploymentId" = ${scope.deploymentId}::uuid AND status = 'SUCCEEDED'
+    ), failures AS MATERIALIZED (
+      SELECT attempt.*
+      FROM "deployment_recovery_attempts" attempt CROSS JOIN verified
+      WHERE "workspaceId" = ${scope.workspaceId}::uuid AND "projectId" = ${scope.projectId}::uuid
+        AND "deploymentId" = ${scope.deploymentId}::uuid AND status = 'FAILED'
+        AND (verified.recovered_at IS NULL OR "finishedAt" >= verified.recovered_at)
+    ), classified AS (
+      SELECT f.*, (
+        SELECT audit.metadata->>'automaticCircuitState'
+        FROM "audit_logs" audit
+        WHERE audit."workspaceId" = f."workspaceId" AND audit."entityId" = f."deploymentId"
+          AND audit."entityType" = 'Deployment' AND audit.action = 'DEPLOYMENT_RECOVERY_REQUESTED'
+          AND audit.metadata->>'recoveryId' = f.id::text
+          AND audit.metadata->>'automaticCircuitState' IN ('CLOSED', 'HALF_OPEN')
+        LIMIT 1
+      ) AS circuit_state
+      FROM failures f WHERE f.trigger = 'AUTOMATIC'
+    )
+    SELECT
+      (SELECT count(*)::integer FROM failures) AS "consecutiveFailures",
+      EXISTS (
+        SELECT 1 FROM failures WHERE "failureReason" = 'RECOVERY_RESTART_UNCERTAIN'
+          OR ("restartIssuedAt" IS NOT NULL AND "failureReason" IN
+            ('RECOVERY_TIMEOUT', 'RECOVERY_STALE', 'RECOVERY_DOCKER_UNAVAILABLE'))
+      ) AS "restartUncertain",
+      EXISTS (SELECT 1 FROM classified WHERE circuit_state = 'HALF_OPEN') AS "failedHalfOpenTrial",
+      EXISTS (
+        SELECT 1 FROM classified legacy
+        WHERE legacy.circuit_state IS NULL AND (
+          SELECT count(*) FROM failures earlier
+          WHERE earlier.id <> legacy.id AND earlier."finishedAt" <= legacy."createdAt"
+        ) >= ${circuitFailureThreshold}::integer
+      ) AS "legacyTrialUnclassified"
+  `;
+  if (!history) throw new Error("Recovery circuit history unavailable");
+  return history;
+}
 
 export async function recoverySchemaReady(db: Pick<PrismaClient, "$queryRaw">): Promise<boolean> {
   const [table] = await db.$queryRaw<Array<{ ready: boolean }>>`
@@ -202,6 +254,29 @@ async function reserveRecovery(
         now.getTime() < last.finishedAt.getTime() + recoveryPolicy.cooldownMs * 2 ** (recent.length - 1)) {
         return { kind: "cooldown" };
       }
+      let automaticCircuitState: CircuitState | undefined;
+      if (trigger === "AUTOMATIC") {
+        const history = await readCircuitHistory(tx, scope);
+        const circuit = evaluateCircuit({
+          ...history,
+          failureThreshold: circuitFailureThreshold,
+          failedAttemptsInWindow: recent.filter((attempt) => attempt.status === "FAILED").length,
+          attemptsInWindow: recent.length,
+          recoveryLimit: recoveryPolicy.limit,
+          cooldownRemainingMs: 0,
+          now: now.getTime(),
+          // The history starts at the last verified success. The deployment-wide
+          // active-attempt guard above already excludes an in-progress trial.
+          verifiedRecoverySinceOpen: false,
+          halfOpenInProgress: false,
+        });
+        // Older attempts have no admission marker. When they could have
+        // consumed a trial, require a verified recovery instead of guessing.
+        if (history.legacyTrialUnclassified || circuit.reason !== null || circuit.state === "OPEN") {
+          return { kind: "ineligible" };
+        }
+        automaticCircuitState = circuit.state;
+      }
       const reserved = await tx.deploymentHealthState.updateMany({
         where: healthKey, data: { ...unleased, status: "RECOVERING" },
       });
@@ -215,7 +290,10 @@ async function reserveRecovery(
       });
       await tx.auditLog.create({ data: {
         workspaceId: scope.workspaceId, actorId: options.actorId, entityType: "Deployment", entityId: scope.deploymentId,
-        action: "DEPLOYMENT_RECOVERY_REQUESTED", metadata: { recoveryId: attempt.id, runtimeInstanceId: runtime.id, trigger },
+        action: "DEPLOYMENT_RECOVERY_REQUESTED", metadata: {
+          recoveryId: attempt.id, runtimeInstanceId: runtime.id, trigger,
+          ...(automaticCircuitState === undefined ? {} : { automaticCircuitState }),
+        },
       } });
       return { kind: "reserved", attempt };
     });
