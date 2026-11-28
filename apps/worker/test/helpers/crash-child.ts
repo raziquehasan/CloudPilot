@@ -26,9 +26,12 @@ executor.inspectOwnedContainer = async () => ({
 });
 executor.restartOwnedContainer = async () => { startedAt = input.restartedEpoch; };
 
+const maxMs = Number(process.env.CLOUDPILOT_CRASH_MAX_MS ?? "0");
+const signal = maxMs > 0 ? AbortSignal.timeout(maxMs) : new AbortController().signal;
+
 await processRecoveryJob(
   `recovery-${input.job.correlationId}`,
   input.job,
   executor,
-  new AbortController().signal,
+  signal,
 );

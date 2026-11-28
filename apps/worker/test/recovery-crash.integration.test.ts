@@ -26,15 +26,16 @@ const restartedEpoch = "2026-11-27T01:01:00.987654321Z";
 const containerId = "a".repeat(64);
 const imageId = `sha256:${"b".repeat(64)}`;
 
-function runChild(input: unknown, crashAfter: string, nodeEnv = "test"): Promise<number> {
+function runChild(input: unknown, crashAfter: string, nodeEnv = "test", timeoutMs = 60_000, maxRunMs = 12_000): Promise<number> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ["--import", "tsx", "test/helpers/crash-child.ts"], {
       cwd: process.cwd(),
-      env: { ...process.env, NODE_ENV: nodeEnv, CLOUDPILOT_RECOVERY_CRASH_TEST: "1", CLOUDPILOT_RECOVERY_CRASH_AFTER: crashAfter, CLOUDPILOT_CRASH_INPUT: JSON.stringify(input) },
+      env: { ...process.env, NODE_ENV: nodeEnv, CLOUDPILOT_RECOVERY_CRASH_TEST: "1", CLOUDPILOT_RECOVERY_CRASH_AFTER: crashAfter, CLOUDPILOT_CRASH_MAX_MS: String(maxRunMs), CLOUDPILOT_CRASH_INPUT: JSON.stringify(input) },
       stdio: "ignore",
     });
-    child.once("error", reject);
-    child.once("exit", (code) => resolve(code ?? -1));
+    const timer = setTimeout(() => { child.kill(); resolve(124); }, timeoutMs);
+    child.once("error", (error) => { clearTimeout(timer); reject(error); });
+    child.once("exit", (code) => { clearTimeout(timer); resolve(code ?? -1); });
   });
 }
 
@@ -110,6 +111,92 @@ test("E: crash after durable intent (before restart) reconciles conservatively w
   }));
 
 test.after(async () => { if (enabled) await disconnectDatabase(); });
+
+async function expireLease(runtimeId: string, attemptId: string) {
+  const past = new Date(Date.now() - 1_000);
+  await prisma.deploymentRecoveryAttempt.update({ where: { id: attemptId }, data: { leaseExpiresAt: past } });
+  await prisma.deploymentRuntimeInstance.update({ where: { id: runtimeId }, data: { executionLeaseExpiresAt: past } });
+}
+
+function replacementExecutor(port: number, startedAt: string, onRestart: () => void) {
+  let current = startedAt;
+  const executor = new DockerRuntimeExecutor();
+  executor.inspectOwnedContainer = async () => ({ ownershipVerified: true, inspection: {
+    exists: true, running: true, containerId, imageId, state: "running", startedAt: current,
+    restartCount: 0, exitCode: null, hostPort: port } });
+  executor.restartOwnedContainer = async () => { current = restartedEpoch; onRestart(); };
+  return executor;
+}
+
+test("E2: crash after lease acquisition (before intent) → replacement issues exactly one restart", { skip: !enabled, timeout: 90000 }, () =>
+  withFixture(async (f) => {
+    const reserve = await reserveManualRecovery(prisma, f.scope, f.actorId, randomUUID());
+    if (reserve.kind !== "reserved") return assert.fail(reserve.kind);
+    const job = jobFor(f, reserve.attempt.id);
+    assert.equal(await runChild({ job, containerId, imageId, port: f.port, restartedEpoch }, "after-claim"), 1);
+    const crashed = await prisma.deploymentRecoveryAttempt.findUniqueOrThrow({ where: { id: reserve.attempt.id } });
+    assert.equal(crashed.restartIssuedAt, null, "no intent persisted before the crash");
+    await expireLease(f.runtimeId, reserve.attempt.id);
+    let restarts = 0;
+    const outcome = await processRecoveryJob(`recovery-${job.correlationId}`, job, replacementExecutor(f.port, sourceEpoch, () => { restarts += 1; }), new AbortController().signal);
+    assert.equal(outcome.status, "succeeded");
+    assert.equal(restarts, 1);
+    assert.equal((await prisma.deploymentRecoveryAttempt.findUniqueOrThrow({ where: { id: reserve.attempt.id } })).status, "SUCCEEDED");
+    assert.equal((await prisma.deploymentHealthState.findFirstOrThrow({ where: f.scope, orderBy: { generation: "desc" } })).generation, 1);
+  }));
+
+test("E3: crash after Docker restart (before finalize) → replacement does not restart twice", { skip: !enabled, timeout: 90000 }, () =>
+  withFixture(async (f) => {
+    const reserve = await reserveManualRecovery(prisma, f.scope, f.actorId, randomUUID());
+    if (reserve.kind !== "reserved") return assert.fail(reserve.kind);
+    const job = jobFor(f, reserve.attempt.id);
+    assert.equal(await runChild({ job, containerId, imageId, port: f.port, restartedEpoch }, "after-restart"), 1);
+    const crashed = await prisma.deploymentRecoveryAttempt.findUniqueOrThrow({ where: { id: reserve.attempt.id } });
+    assert.ok(crashed.restartIssuedAt, "intent persisted before the restart");
+    await expireLease(f.runtimeId, reserve.attempt.id);
+    let restarts = 0;
+    // The container was already restarted by the crashed worker.
+    const outcome = await processRecoveryJob(`recovery-${job.correlationId}`, job, replacementExecutor(f.port, restartedEpoch, () => { restarts += 1; }), new AbortController().signal);
+    assert.equal(outcome.status, "succeeded");
+    assert.equal(restarts, 0, "no unsafe duplicate restart");
+    assert.equal((await prisma.deploymentRecoveryAttempt.findUniqueOrThrow({ where: { id: reserve.attempt.id } })).status, "SUCCEEDED");
+    assert.equal((await prisma.deploymentHealthState.findFirstOrThrow({ where: f.scope, orderBy: { generation: "desc" } })).generation, 1);
+  }));
+
+test("E4: crash after finalization (before ack) → redelivery is a no-op", { skip: !enabled, timeout: 90000 }, () =>
+  withFixture(async (f) => {
+    const reserve = await reserveManualRecovery(prisma, f.scope, f.actorId, randomUUID());
+    if (reserve.kind !== "reserved") return assert.fail(reserve.kind);
+    const job = jobFor(f, reserve.attempt.id);
+    assert.equal(await runChild({ job, containerId, imageId, port: f.port, restartedEpoch }, "after-finish"), 1);
+    assert.equal((await prisma.deploymentRecoveryAttempt.findUniqueOrThrow({ where: { id: reserve.attempt.id } })).status, "SUCCEEDED");
+    let restarts = 0;
+    const outcome = await processRecoveryJob(`recovery-${job.correlationId}`, job, replacementExecutor(f.port, restartedEpoch, () => { restarts += 1; }), new AbortController().signal);
+    assert.equal(outcome.status, "skipped");
+    assert.equal(restarts, 0);
+    assert.equal(await prisma.deploymentHealthState.count({ where: f.scope }), 2, "no duplicate generation");
+  }));
+
+test("M1: sustained multi-worker contention yields one success, no duplicate generation", { skip: !enabled, timeout: 120000 }, () =>
+  withFixture(async (f) => {
+    const reserve = await reserveManualRecovery(prisma, f.scope, f.actorId, randomUUID());
+    if (reserve.kind !== "reserved") return assert.fail(reserve.kind);
+    const job = jobFor(f, reserve.attempt.id);
+    const input = { job, containerId, imageId, port: f.port, restartedEpoch };
+    const codes = await Promise.all([
+      runChild(input, "none", "test", 45_000),
+      runChild(input, "none", "test", 45_000),
+    ]);
+    assert.ok(codes.every((c) => c === 0 || c === 1), `workers exited cleanly: ${codes}`);
+    const record = await prisma.deploymentRecoveryAttempt.findUniqueOrThrow({ where: { id: reserve.attempt.id } });
+    assert.equal(record.status, "SUCCEEDED");
+    assert.equal(record.attemptCount, 1);
+    assert.equal(await prisma.deploymentHealthState.count({ where: f.scope }), 2);
+    assert.equal(await prisma.deploymentHealthCheck.count({ where: f.scope }), 1);
+    const runtime = await prisma.deploymentRuntimeInstance.findUniqueOrThrow({ where: { id: f.runtimeId } });
+    assert.equal(runtime.restartCount, 1, "exactly one restart across all workers");
+    assert.equal(runtime.executionLeaseToken, null);
+  }));
 
 test("crash hook is inert outside NODE_ENV=test even with both crash env vars set", { skip: !enabled, timeout: 90000 }, async () => {
   for (const nodeEnv of ["production", "development"]) {
